@@ -1,0 +1,6869 @@
+mod auth;
+mod bootstrap;
+mod catalog;
+mod crash;
+mod ely;
+mod ely_legacy;
+mod notices;
+mod support;
+mod vault;
+
+use eframe::egui::{
+    self, Align2, Color32, ComboBox, Context, Id, Margin, Pos2, Rect, RichText, Sense, Stroke,
+    TextureHandle, TextureOptions, Vec2,
+};
+use minecraft_java_rs_core::{
+    launcher::{
+        Launcher,
+        events::LaunchEvent,
+        options::{JavaOptions, LaunchOptions, LoaderConfig, MemoryConfig, ScreenConfig},
+    },
+    models::loader::LoaderType,
+    models::minecraft::{Authenticator, MojangVersionManifest, XboxAccount},
+    utils::auth::offline_uuid,
+};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
+    thread,
+    time::{Duration, SystemTime},
+};
+
+const EN_US: &str = include_str!("../assets/lang/lang_en_US.properties");
+const FALLBACK_VERSIONS: &[&str] = &["26.3", "1.21.11", "1.21.10", "1.20.1", "1.8.9"];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedSettings {
+    accounts: Vec<String>,
+    offline_account_uuids: HashMap<String, String>,
+    offline_ely_skins: HashMap<String, bool>,
+    microsoft_accounts: Vec<MicrosoftAccountProfile>,
+    ely_accounts: Vec<ElyAccountProfile>,
+    ely_legacy_accounts: Vec<ElyLegacyAccountProfile>,
+    selected_account: Option<String>,
+    selected_version: String,
+    auto_login: bool,
+    feedback_acknowledged: bool,
+    force_update: bool,
+    client_id: String,
+    notices_enabled: bool,
+    promoted_notices_enabled: bool,
+    promoted_servers_in_game: bool,
+    remove_undesirable_mods: bool,
+    delete_patchy: bool,
+    launcher_window_width: u32,
+    launcher_window_height: u32,
+    hidden_notices_until: HashMap<String, u64>,
+    servers: Vec<SavedServer>,
+    servers_cache_root: String,
+    game_directory: String,
+    legacy_profiles_path: String,
+    legacy_config_path: String,
+    min_memory: String,
+    max_memory: String,
+    java_path: String,
+    java_mode: String,
+    java_runtime_directory: String,
+    optimized_java_args: String,
+    use_current_trust_store: bool,
+    wrapper_command: String,
+    screen_width: u32,
+    screen_height: u32,
+    fullscreen: bool,
+    gpu_preference: String,
+    windows_gpu_performance: bool,
+    jvm_args: String,
+    game_args: String,
+    loader_type: String,
+    loader_build: String,
+    #[serde(default, deserialize_with = "deserialize_separate_dirs")]
+    separate_game_directories: SeparateDirs,
+    launch_action: String,
+    version_only_installed: bool,
+    version_include_remote: bool,
+    version_show_old_releases: bool,
+    version_catalog_types: HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SeparateDirs {
+    Family,
+    Version,
+    #[default]
+    None,
+}
+
+fn deserialize_separate_dirs<'de, D>(deserializer: D) -> Result<SeparateDirs, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        // Java's legacy boolean migration maps `true` to FAMILY.
+        serde_json::Value::Bool(true) => SeparateDirs::Family,
+        serde_json::Value::Bool(false) => SeparateDirs::None,
+        serde_json::Value::String(value) => match value.to_ascii_lowercase().as_str() {
+            "family" => SeparateDirs::Family,
+            "version" => SeparateDirs::Version,
+            _ => SeparateDirs::None,
+        },
+        _ => SeparateDirs::None,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MicrosoftAccountProfile {
+    id: String,
+    username: String,
+    uuid: String,
+    xuid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ElyLegacyAccountProfile {
+    id: String,
+    username: String,
+    display_name: String,
+    uuid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ElyAccountProfile {
+    id: String,
+    account_id: i64,
+    username: String,
+    display_name: String,
+    uuid: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedServer {
+    name: String,
+    address: String,
+    #[serde(default)]
+    hide_address: bool,
+    #[serde(default)]
+    accept_textures: Option<bool>,
+}
+
+#[derive(Clone)]
+struct PendingPromotedServerLaunch {
+    server: SavedServer,
+    current_version: String,
+    family_versions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct MinecraftServerList {
+    servers: Vec<MinecraftServerRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MinecraftServerRecord {
+    name: String,
+    #[serde(rename = "ip")]
+    address: String,
+    #[serde(default, rename = "hideAddress")]
+    hide_address: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "acceptTextures"
+    )]
+    accept_textures: Option<bool>,
+}
+
+#[derive(Default)]
+struct LegacyImportSummary {
+    offline: usize,
+    microsoft: usize,
+    ely: usize,
+    ely_legacy: usize,
+    mojang_migrated: usize,
+    skipped: usize,
+}
+
+#[derive(Default)]
+struct LegacySettingsImportSummary {
+    applied: usize,
+    skipped: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CrashReport {
+    path: Option<PathBuf>,
+    game_directory: PathBuf,
+    summary: String,
+    suggestions: Vec<crash::CrashSuggestion>,
+    log: String,
+}
+
+impl MicrosoftAccountProfile {
+    fn storage_key(&self) -> String {
+        format!("microsoft:{}", self.uuid)
+    }
+}
+
+impl ElyLegacyAccountProfile {
+    fn storage_key(&self) -> String {
+        format!("ely-legacy:{}", self.uuid)
+    }
+}
+
+impl ElyAccountProfile {
+    fn storage_key(&self) -> String {
+        format!("ely:{}", self.uuid)
+    }
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self {
+            accounts: Vec::new(),
+            offline_account_uuids: HashMap::new(),
+            offline_ely_skins: HashMap::new(),
+            microsoft_accounts: Vec::new(),
+            ely_accounts: Vec::new(),
+            ely_legacy_accounts: Vec::new(),
+            selected_account: None,
+            selected_version: "26.3".to_owned(),
+            auto_login: false,
+            feedback_acknowledged: false,
+            force_update: false,
+            client_id: uuid::Uuid::new_v4().to_string(),
+            notices_enabled: true,
+            promoted_notices_enabled: true,
+            promoted_servers_in_game: true,
+            remove_undesirable_mods: true,
+            delete_patchy: true,
+            launcher_window_width: 1000,
+            launcher_window_height: 600,
+            hidden_notices_until: HashMap::new(),
+            servers: Vec::new(),
+            servers_cache_root: String::new(),
+            game_directory: default_game_directory().to_string_lossy().into_owned(),
+            legacy_profiles_path: String::new(),
+            legacy_config_path: default_legacy_config_path().to_string_lossy().into_owned(),
+            min_memory: "512M".to_owned(),
+            max_memory: "2G".to_owned(),
+            java_path: String::new(),
+            java_mode: "recommended".to_owned(),
+            java_runtime_directory: String::new(),
+            optimized_java_args: "default".to_owned(),
+            use_current_trust_store: true,
+            wrapper_command: String::new(),
+            screen_width: 925,
+            screen_height: 530,
+            fullscreen: false,
+            gpu_preference: "discrete".to_owned(),
+            windows_gpu_performance: true,
+            jvm_args: String::new(),
+            game_args: String::new(),
+            loader_type: "none".to_owned(),
+            loader_build: "latest".to_owned(),
+            separate_game_directories: SeparateDirs::None,
+            launch_action: "hide".to_owned(),
+            version_only_installed: false,
+            version_include_remote: true,
+            version_show_old_releases: true,
+            version_catalog_types: default_version_catalog_types(),
+        }
+    }
+}
+
+struct Assets {
+    background: TextureHandle,
+    support: TextureHandle,
+    folder: TextureHandle,
+    refresh: TextureHandle,
+    settings: TextureHandle,
+}
+
+#[derive(Default)]
+struct LauncherApp {
+    settings: SavedSettings,
+    assets: Option<Assets>,
+    version_manifest: Option<MojangVersionManifest>,
+    version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
+    version_catalog_loading: bool,
+    version_search: String,
+    version_kind_filter: String,
+    confirm_remove_version: Option<String>,
+    auto_launch_pending: bool,
+    show_account_dialog: bool,
+    new_account: String,
+    new_account_allow_invalid: bool,
+    new_account_ely_skins: bool,
+    editing_account: Option<String>,
+    show_ely_legacy_dialog: bool,
+    ely_legacy_username: String,
+    ely_legacy_password: String,
+    ely_legacy_signin_events:
+        Option<Receiver<Result<(ely_legacy::Profile, ely_legacy::Credentials), String>>>,
+    ely_legacy_signin_pending: bool,
+    show_ely_dialog: bool,
+    ely_signin_events: Option<Receiver<Result<(ely::Profile, ely::Credentials), String>>>,
+    ely_signin_pending: bool,
+    show_folder_menu: bool,
+    folder_menu_pos: Pos2,
+    show_support_menu: bool,
+    support_menu_pos: Pos2,
+    show_support_window: bool,
+    show_diagnostic_consent: bool,
+    diagnostic_send_enabled: bool,
+    diagnostic_events: Option<Receiver<Result<String, String>>>,
+    diagnostic_pending: bool,
+    diagnostic_payload: Option<String>,
+    diagnostic_result_url: Option<String>,
+    diagnostic_error: Option<String>,
+    show_log_window: bool,
+    selected_log_path: Option<PathBuf>,
+    show_settings_menu: bool,
+    settings_menu_pos: Pos2,
+    show_notices_window: bool,
+    pending_promoted_server: Option<PendingPromotedServerLaunch>,
+    new_server_name: String,
+    new_server_address: String,
+    bootstrap_events: Option<Receiver<Result<bootstrap::Configuration, String>>>,
+    bootstrap_loading: bool,
+    bootstrap_error: Option<String>,
+    bootstrap_notice_list: Vec<notices::Notice>,
+    personal_notice_list: Vec<notices::Notice>,
+    bootstrap_promoted_servers: Vec<notices::NoticeAction>,
+    bootstrap_notification: Option<bootstrap::Notification>,
+    bootstrap_notification_texture: Option<TextureHandle>,
+    bootstrap_feedback_url: Option<String>,
+    show_feedback_dialog: bool,
+    notice_events: Option<Receiver<Result<Vec<notices::Notice>, String>>>,
+    notices_loading: bool,
+    notice_error: Option<String>,
+    notice_list: Vec<notices::Notice>,
+    notice_images: HashMap<String, TextureHandle>,
+    notice_index: usize,
+    server_list: Vec<SavedServer>,
+    server_list_root: Option<PathBuf>,
+    settings_page: Option<&'static str>,
+    status: String,
+    launching: bool,
+    launch_progress: Option<f32>,
+    launch_events: Option<Receiver<String>>,
+    microsoft_signin_events: Option<Receiver<Result<auth::SignInOutcome, String>>>,
+    microsoft_signin_pending: bool,
+    profile_creation_events: Option<Receiver<Result<auth::AuthenticatedMicrosoftAccount, String>>>,
+    profile_creation_pending: bool,
+    pending_minecraft_profile: Option<auth::PendingMinecraftProfile>,
+    show_minecraft_profile_dialog: bool,
+    new_minecraft_profile_name: String,
+    game_log: Arc<Mutex<VecDeque<String>>>,
+    pending_crash_report: Arc<Mutex<Option<CrashReport>>>,
+    crash_report: Option<CrashReport>,
+    cancel_requested: Arc<AtomicBool>,
+    hidden_for_game: bool,
+}
+
+impl LauncherApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let assets = Assets {
+            background: load_texture(
+                &cc.egui_ctx,
+                "background",
+                include_bytes!("../assets/plains.jpg"),
+                false,
+            ),
+            support: load_texture(
+                &cc.egui_ctx,
+                "support",
+                include_bytes!("../assets/icons/comments-o.png"),
+                true,
+            ),
+            folder: load_texture(
+                &cc.egui_ctx,
+                "folder",
+                include_bytes!("../assets/icons/folder-open.png"),
+                true,
+            ),
+            refresh: load_texture(
+                &cc.egui_ctx,
+                "refresh",
+                include_bytes!("../assets/icons/refresh.png"),
+                true,
+            ),
+            settings: load_texture(
+                &cc.egui_ctx,
+                "settings",
+                include_bytes!("../assets/icons/bars.png"),
+                true,
+            ),
+        };
+        let settings = load_settings();
+        let auto_launch_pending = settings.auto_login && settings.selected_account.is_some();
+        let notice_events = settings
+            .notices_enabled
+            .then(|| spawn_notice_fetch(settings.client_id.clone()));
+        let notices_loading = settings.notices_enabled;
+        Self {
+            settings,
+            assets: Some(assets),
+            version_catalog_events: Some(spawn_catalog_fetch()),
+            version_catalog_loading: true,
+            bootstrap_events: Some(spawn_bootstrap_fetch()),
+            bootstrap_loading: true,
+            notice_events,
+            notices_loading,
+            version_kind_filter: "all".to_owned(),
+            auto_launch_pending,
+            ..Default::default()
+        }
+    }
+
+    fn persist(&self) {
+        let path = settings_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&self.settings) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    fn game_dir_path(&self) -> PathBuf {
+        let configured = PathBuf::from(self.settings.game_directory.trim());
+        if configured.is_absolute() {
+            configured
+        } else {
+            default_game_directory()
+        }
+    }
+
+    fn installation_roots(&self) -> Vec<PathBuf> {
+        let base = self.game_dir_path();
+        let mut roots = vec![base.clone()];
+        if let Ok(entries) = fs::read_dir(base.join("home")) {
+            roots.extend(entries.flatten().filter_map(|entry| {
+                entry.file_type().ok().filter(|kind| kind.is_dir())?;
+                Some(entry.path())
+            }));
+        }
+        // Retain installations created by earlier Rust builds that used `instances/`.
+        if let Ok(entries) = fs::read_dir(base.join("instances")) {
+            roots.extend(entries.flatten().filter_map(|entry| {
+                entry.file_type().ok().filter(|kind| kind.is_dir())?;
+                Some(entry.path())
+            }));
+        }
+        roots
+    }
+
+    fn installed_version_root(&self, version: &str) -> Option<PathBuf> {
+        if !valid_version_id(version) {
+            return None;
+        }
+        self.installation_roots().into_iter().find(|root| {
+            root.join("versions")
+                .join(version)
+                .join(format!("{version}.json"))
+                .is_file()
+        })
+    }
+
+    fn game_root_for_version(&self, version: &str) -> PathBuf {
+        self.installed_version_root(version).unwrap_or_else(|| {
+            let base = self.game_dir_path();
+            if !valid_version_id(version) {
+                return base;
+            }
+            match self.settings.separate_game_directories {
+                SeparateDirs::None => base,
+                SeparateDirs::Version => base.join("home").join(version),
+                SeparateDirs::Family => {
+                    let family = self.version_family(version);
+                    base.join("home").join(family)
+                }
+            }
+        })
+    }
+
+    fn game_data_directory_for_version(&self, version: &str) -> PathBuf {
+        let root = self.game_root_for_version(version);
+        instance_for_version(version, &self.settings)
+            .map(|instance| root.join("instances").join(instance))
+            .unwrap_or(root)
+    }
+
+    fn version_family(&self, version: &str) -> String {
+        for root in self.installation_roots() {
+            let path = root
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.json"));
+            if let Ok(bytes) = fs::read(path) {
+                if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(family) = metadata.get("family").and_then(|value| value.as_str()) {
+                        if !family.trim().is_empty() {
+                            return family.to_owned();
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(kind) = self.version_manifest.as_ref().and_then(|manifest| {
+            manifest
+                .versions
+                .iter()
+                .find(|entry| entry.id == version)
+                .map(|entry| entry.version_type.as_str())
+        }) {
+            if matches!(kind, "snapshot" | "old_beta" | "old_alpha") {
+                return kind.to_owned();
+            }
+        }
+
+        let chars: Vec<char> = version.chars().collect();
+        let start = chars
+            .iter()
+            .position(|character| character.is_ascii_digit())
+            .unwrap_or(0);
+        let mut end = start;
+        let mut dots = 0;
+        for character in chars.iter().skip(start) {
+            if character.is_ascii_digit() || (*character == '.' && dots < 1) {
+                if *character == '.' {
+                    dots += 1;
+                }
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let family = chars[start..end].iter().collect::<String>();
+        if family.matches('.').count() >= 1 {
+            let loader_prefix = match self.settings.loader_type.as_str() {
+                "forge" | "neoforge" => "Forge-",
+                "fabric" | "legacyfabric" => "Fabric-",
+                _ => "",
+            };
+            format!("{loader_prefix}{family}")
+        } else {
+            "unknown".to_owned()
+        }
+    }
+
+    fn promoted_version_family(&self, version: &str) -> Option<String> {
+        for root in self.installation_roots() {
+            let path = root
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.json"));
+            if let Ok(bytes) = fs::read(path) {
+                if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(family) = metadata
+                        .get("family")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|family| !family.is_empty())
+                    {
+                        return Some(family.to_owned());
+                    }
+                }
+            }
+        }
+        legacy_promoted_version_family(version)
+    }
+
+    fn promoted_family_versions(&self, families: &[String]) -> Vec<String> {
+        let mut result = Vec::new();
+        for family in families
+            .iter()
+            .map(|family| family.trim())
+            .filter(|family| !family.is_empty())
+        {
+            let mut candidates: HashMap<String, String> = HashMap::new();
+            if let Some(manifest) = &self.version_manifest {
+                for entry in manifest
+                    .versions
+                    .iter()
+                    .filter(|entry| !entry.version_type.eq_ignore_ascii_case("snapshot"))
+                {
+                    let matches = entry.id == family
+                        || self
+                            .promoted_version_family(&entry.id)
+                            .is_some_and(|candidate_family| candidate_family == family);
+                    if matches {
+                        candidates.insert(entry.id.clone(), entry.release_time.clone());
+                    }
+                }
+            }
+            for installed in self.installed_versions() {
+                if let Some(metadata) = self.installed_version_metadata(&installed) {
+                    if metadata
+                        .get("type")
+                        .or_else(|| metadata.get("releaseType"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("snapshot"))
+                    {
+                        continue;
+                    }
+                    let candidate_family = metadata
+                        .get("family")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| legacy_promoted_version_family(&installed));
+                    if installed == family || candidate_family.as_deref() == Some(family) {
+                        let release_time = metadata
+                            .get("releaseTime")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        candidates.insert(installed, release_time);
+                    }
+                }
+            }
+            let mut family_candidates = candidates.into_iter().collect::<Vec<_>>();
+            family_candidates.sort_by(|left, right| right.1.cmp(&left.1));
+            result.extend(
+                family_candidates
+                    .into_iter()
+                    .take(2)
+                    .map(|(version, _)| version),
+            );
+        }
+        let mut seen = HashSet::new();
+        result.retain(|version| seen.insert(version.clone()));
+        result
+    }
+
+    fn promoted_servers_for_version(&self, version: &str) -> Vec<SavedServer> {
+        let family = self.promoted_version_family(version);
+        let mut servers = Vec::new();
+        for notice in &self.notice_list {
+            if !notice.promoted {
+                continue;
+            }
+            let Some(notices::NoticeAction::Server {
+                label,
+                address,
+                families,
+                ..
+            }) = &notice.action
+            else {
+                continue;
+            };
+            append_promoted_server(
+                &mut servers,
+                version,
+                family.as_deref(),
+                label,
+                address,
+                families,
+            );
+        }
+        for action in &self.bootstrap_promoted_servers {
+            let notices::NoticeAction::Server {
+                label,
+                address,
+                families,
+                ..
+            } = action
+            else {
+                continue;
+            };
+            append_promoted_server(
+                &mut servers,
+                version,
+                family.as_deref(),
+                label,
+                address,
+                families,
+            );
+        }
+        servers
+    }
+
+    fn installed_version_metadata(&self, version: &str) -> Option<serde_json::Value> {
+        self.installation_roots().into_iter().find_map(|root| {
+            let path = root
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.json"));
+            fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        })
+    }
+
+    fn installed_versions(&self) -> Vec<String> {
+        let mut versions = Vec::new();
+        for root in self.installation_roots() {
+            if let Ok(entries) = fs::read_dir(root.join("versions")) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if entry.path().join(format!("{name}.json")).is_file() {
+                            versions.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        versions.sort();
+        versions.dedup();
+        versions
+    }
+
+    fn available_versions(&self) -> Vec<String> {
+        let mut versions: Vec<String> = self
+            .version_manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .versions
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                FALLBACK_VERSIONS
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect()
+            });
+        versions.extend(self.installed_versions());
+        let mut seen = HashSet::new();
+        versions.retain(|version| seen.insert(version.clone()));
+        versions
+    }
+
+    fn refresh_version_catalog(&mut self) {
+        if self.version_catalog_loading {
+            return;
+        }
+        self.version_catalog_events = Some(spawn_catalog_fetch());
+        self.version_catalog_loading = true;
+        self.status = "Refreshing Minecraft version catalog…".to_owned();
+    }
+
+    fn refresh_notices(&mut self) {
+        if self.notices_loading {
+            return;
+        }
+        if !self.settings.notices_enabled {
+            self.personal_notice_list.clear();
+            self.notice_list.clone_from(&self.bootstrap_notice_list);
+            self.notice_error = None;
+            self.status = "Notices are disabled in settings.".to_owned();
+            return;
+        }
+        self.notice_events = Some(spawn_notice_fetch(self.settings.client_id.clone()));
+        self.notices_loading = true;
+        self.notice_error = None;
+    }
+
+    fn rebuild_notice_list(&mut self, ctx: &Context) {
+        self.notice_list.clone_from(&self.bootstrap_notice_list);
+        self.notice_list
+            .extend(self.personal_notice_list.iter().cloned());
+        self.notice_list
+            .sort_by_key(|notice| (notice.order, notice.id.clone()));
+        self.notice_images.clear();
+        for notice in &self.notice_list {
+            let Some(bytes) = &notice.image else {
+                continue;
+            };
+            if let Some(texture) =
+                load_optional_texture(ctx, &format!("notice_image_{}", notice.id), bytes)
+            {
+                self.notice_images.insert(notice.id.clone(), texture);
+            }
+        }
+    }
+
+    fn diagnostic_report(&self) -> String {
+        let mut report = format!(
+            "Legacy Launcher Rust diagnostic report\nLauncher version: {}\nPlatform: {} {}\nMinecraft version: {}\nMod loader: {} {}\n\nRecent game output:\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            self.settings.selected_version,
+            self.settings.loader_type,
+            self.settings.loader_build,
+        );
+        let lines = self
+            .game_log
+            .lock()
+            .map(|lines| lines.iter().rev().take(1200).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for line in lines.into_iter().rev() {
+            let lower = line.to_ascii_lowercase();
+            if [
+                "token",
+                "secret",
+                "authorization",
+                "bearer ",
+                "xsts",
+                "xuid",
+            ]
+            .iter()
+            .any(|sensitive| lower.contains(sensitive))
+            {
+                report.push_str("[sensitive log line omitted]\n");
+            } else {
+                report.push_str(&line);
+                report.push('\n');
+            }
+            if report.len() >= 700_000 {
+                break;
+            }
+        }
+        report.chars().take(700_000).collect()
+    }
+
+    fn start_diagnostic_upload(&mut self) {
+        let report = self.diagnostic_report();
+        self.diagnostic_payload = Some(report.clone());
+        self.diagnostic_events = Some(spawn_diagnostic_upload(report));
+        self.diagnostic_pending = true;
+        self.diagnostic_result_url = None;
+        self.diagnostic_error = None;
+    }
+
+    fn save_diagnostic_report(&mut self) {
+        let Some(report) = self.diagnostic_payload.as_ref() else {
+            return;
+        };
+        let path = settings_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("diagnostic.log");
+        let result = path
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()
+            .and_then(|_| fs::write(&path, report));
+        match result {
+            Ok(()) => {
+                self.status = format!("Diagnostic report saved to {}", path.display());
+                self.show_diagnostic_consent = false;
+                self.diagnostic_error = None;
+            }
+            Err(error) => {
+                self.diagnostic_error = Some(format!("Could not save diagnostic report: {error}"));
+            }
+        }
+    }
+
+    fn visible_notice_indices(&self) -> Vec<usize> {
+        let now = unix_time_millis();
+        self.notice_list
+            .iter()
+            .enumerate()
+            .filter(|(_, notice)| {
+                (!notice.promoted || self.settings.promoted_notices_enabled)
+                    && self
+                        .settings
+                        .hidden_notices_until
+                        .get(&notice.id)
+                        .is_none_or(|expiry| *expiry <= now)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn hide_notice_for_week(&mut self, id: &str) {
+        const WEEK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+        self.settings
+            .hidden_notices_until
+            .insert(id.to_owned(), unix_time_millis().saturating_add(WEEK_MS));
+        self.notice_index = self.notice_index.saturating_add(1);
+        self.persist();
+    }
+
+    fn load_server_list(&mut self, game_root: PathBuf) {
+        let path = game_root.join("servers.dat");
+        let root_key = game_root.to_string_lossy().into_owned();
+        let cache_belongs_to_root = self.settings.servers_cache_root.is_empty()
+            || self
+                .settings
+                .servers_cache_root
+                .eq_ignore_ascii_case(&root_key);
+        match read_minecraft_server_list(&path) {
+            Ok(mut servers) => {
+                if !path.exists() && cache_belongs_to_root && !self.settings.servers.is_empty() {
+                    servers = self.settings.servers.clone();
+                    if let Err(error) = write_minecraft_server_list(&path, &servers) {
+                        self.status =
+                            format!("Could not migrate saved servers into servers.dat: {error}");
+                    }
+                }
+                self.server_list = servers;
+                self.settings.servers = self.server_list.clone();
+                self.settings.servers_cache_root = root_key;
+                self.persist();
+            }
+            Err(error) => {
+                self.server_list = self.settings.servers.clone();
+                self.status = format!("Could not read Minecraft servers.dat: {error}");
+            }
+        }
+        self.server_list_root = Some(game_root);
+    }
+
+    fn persist_server_list(&mut self) {
+        let Some(root) = self.server_list_root.clone() else {
+            return;
+        };
+        match write_minecraft_server_list(&root.join("servers.dat"), &self.server_list) {
+            Ok(()) => {
+                self.settings.servers = self.server_list.clone();
+                self.settings.servers_cache_root = root.to_string_lossy().into_owned();
+                self.persist();
+                self.status = "Minecraft server list saved.".to_owned();
+            }
+            Err(error) => {
+                self.status = format!("Could not save Minecraft server list: {error}");
+            }
+        }
+    }
+
+    fn perform_notice_action(&mut self, action: notices::NoticeAction, _ctx: &Context) {
+        match action {
+            notices::NoticeAction::Url { url, .. } => open_url(&url),
+            notices::NoticeAction::Server {
+                label,
+                address,
+                accounts,
+                families,
+            } => {
+                let name = label
+                    .strip_prefix("Join ")
+                    .unwrap_or("Promoted server")
+                    .to_owned();
+                if let Some(allowed_accounts) = accounts {
+                    let selected_type = self.settings.selected_account.as_ref().map(|selected| {
+                        if self.settings.accounts.iter().any(|name| name == selected) {
+                            "plain"
+                        } else if self
+                            .settings
+                            .microsoft_accounts
+                            .iter()
+                            .any(|account| &account.id == selected)
+                        {
+                            "minecraft"
+                        } else if self
+                            .settings
+                            .ely_accounts
+                            .iter()
+                            .any(|account| &account.id == selected)
+                        {
+                            "ely"
+                        } else if self
+                            .settings
+                            .ely_legacy_accounts
+                            .iter()
+                            .any(|account| &account.id == selected)
+                        {
+                            "ely_legacy"
+                        } else {
+                            "unknown"
+                        }
+                    });
+                    if selected_type
+                        .is_some_and(|kind| !allowed_accounts.iter().any(|allowed| allowed == kind))
+                    {
+                        self.status = format!(
+                            "This server requires one of these account types: {}.",
+                            allowed_accounts.join(", ")
+                        );
+                        self.settings_page = Some("Manage accounts");
+                        return;
+                    }
+                }
+                let server = SavedServer {
+                    name,
+                    address,
+                    ..Default::default()
+                };
+                let current_version = self.settings.selected_version.clone();
+                let family_versions = self
+                    .promoted_family_versions(&families)
+                    .into_iter()
+                    .filter(|version| version != &current_version)
+                    .collect();
+                self.pending_promoted_server = Some(PendingPromotedServerLaunch {
+                    server,
+                    current_version,
+                    family_versions,
+                });
+            }
+            notices::NoticeAction::Scene { scene, .. } => match scene.as_str() {
+                "settings" | "launcher-settings" => {
+                    self.settings_page = Some("Launcher & game preferences")
+                }
+                "versions" | "version-manager" => self.settings_page = Some("Manage versions"),
+                "accounts" | "account-manager" => self.settings_page = Some("Manage accounts"),
+                "notices" => self.show_notices_window = true,
+                "main" | "login" => {}
+                _ => {
+                    self.status =
+                        format!("This scene is not available in the Rust launcher: {scene}")
+                }
+            },
+            notices::NoticeAction::Launcher {
+                launcher,
+                download_url,
+                ..
+            } => {
+                if let Some(url) = download_url {
+                    open_url(&url);
+                } else {
+                    self.status =
+                        format!("Launcher version {launcher} is not installed in this clone.");
+                }
+            }
+        }
+    }
+
+    fn visible_catalog_entries(&self) -> Vec<(String, String)> {
+        let query = self.version_search.trim().to_ascii_lowercase();
+        let installed_versions = self.installed_versions();
+        let installed: HashSet<String> = installed_versions.iter().cloned().collect();
+        let mut entries: Vec<(String, String)> = self
+            .version_manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .versions
+                    .iter()
+                    .map(|entry| (entry.id.clone(), entry.version_type.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let known: HashSet<String> = entries.iter().map(|(id, _)| id.clone()).collect();
+        entries.extend(
+            installed_versions
+                .into_iter()
+                .filter(|version| !known.contains(version))
+                .map(|version| {
+                    let version_type = self
+                        .installed_version_type(&version)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    (version, version_type)
+                }),
+        );
+        entries
+            .into_iter()
+            .filter(|(id, kind)| {
+                let category = normalize_catalog_type(kind);
+                let enabled = match category.as_str() {
+                    "release" | "unknown" | "installed" => true,
+                    "snapshot" | "modified" | "old-beta" | "old-alpha" | "launcher" | "pending" => {
+                        self.settings
+                            .version_catalog_types
+                            .get(&category)
+                            .copied()
+                            .unwrap_or_else(|| default_version_type_enabled(&category))
+                    }
+                    _ => false,
+                };
+                let type_matches = match self.version_kind_filter.as_str() {
+                    "release" => kind == "release",
+                    "snapshot" => kind == "snapshot",
+                    "modified" => category == "modified",
+                    "old_beta" => category == "old-beta",
+                    "old_alpha" => category == "old-alpha",
+                    "launcher" => category == "launcher",
+                    "pending" => category == "pending",
+                    "old" => matches!(category.as_str(), "old-beta" | "old-alpha"),
+                    _ => true,
+                };
+                let only_installed_matches =
+                    !self.settings.version_only_installed || installed.contains(id);
+                let remote_matches = self.settings.version_include_remote || installed.contains(id);
+                let old_release_matches =
+                    self.settings.version_show_old_releases || !self.is_old_release(id);
+                enabled
+                    && type_matches
+                    && only_installed_matches
+                    && remote_matches
+                    && old_release_matches
+                    && (query.is_empty() || id.to_ascii_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
+    fn installed_version_type(&self, version: &str) -> Option<String> {
+        for root in self.installation_roots() {
+            let path = root
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.json"));
+            let Ok(bytes) = fs::read(path) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if let Some(kind) = metadata
+                .get("type")
+                .or_else(|| metadata.get("releaseType"))
+                .and_then(serde_json::Value::as_str)
+            {
+                return Some(kind.to_ascii_lowercase().replace('_', "-"));
+            }
+        }
+        None
+    }
+
+    fn is_old_release(&self, version: &str) -> bool {
+        let release_time = self
+            .version_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.versions.iter().find(|entry| entry.id == version))
+            .map(|entry| entry.release_time.clone())
+            .or_else(|| self.installed_version_release_time(version));
+        release_time.is_some_and(|time| time.as_str() < "2014-05-14T00:00:00")
+    }
+
+    fn installed_version_release_time(&self, version: &str) -> Option<String> {
+        for root in self.installation_roots() {
+            let path = root
+                .join("versions")
+                .join(version)
+                .join(format!("{version}.json"));
+            let Ok(bytes) = fs::read(path) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if let Some(time) = metadata
+                .get("releaseTime")
+                .or_else(|| metadata.get("time"))
+                .and_then(serde_json::Value::as_str)
+            {
+                return Some(time.to_owned());
+            }
+        }
+        None
+    }
+
+    fn version_is_installed(&self) -> bool {
+        self.installed_version_root(&self.settings.selected_version)
+            .is_some()
+    }
+
+    fn open_account_dialog(&mut self) {
+        self.new_account.clear();
+        self.new_account_allow_invalid = false;
+        self.new_account_ely_skins = true;
+        self.editing_account = None;
+        self.show_account_dialog = true;
+    }
+
+    fn open_edit_account_dialog(&mut self, account: String) {
+        self.new_account = account.clone();
+        self.new_account_allow_invalid = false;
+        self.new_account_ely_skins = offline_ely_skins_for(&self.settings, &account);
+        self.editing_account = Some(account);
+        self.show_account_dialog = true;
+    }
+
+    fn start_microsoft_sign_in(&mut self) {
+        if self.microsoft_signin_pending || self.launching {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.microsoft_signin_events = Some(receiver);
+        self.microsoft_signin_pending = true;
+        self.cancel_requested.store(false, Ordering::Release);
+        let cancel_requested = self.cancel_requested.clone();
+        self.status = "Waiting for Microsoft sign-in in your browser…".to_owned();
+        thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    tokio::select! {
+                        result = auth::sign_in(cancel_requested.clone()) => result,
+                        _ = wait_for_cancel(cancel_requested) => {
+                            Err("Microsoft sign-in was cancelled.".to_owned())
+                        }
+                    }
+                }),
+                Err(error) => Err(format!("Could not start Microsoft sign-in: {error}")),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    fn open_ely_legacy_dialog(&mut self) {
+        self.ely_legacy_username.clear();
+        self.ely_legacy_password.clear();
+        self.show_ely_legacy_dialog = true;
+    }
+
+    fn start_ely_legacy_sign_in(&mut self) {
+        if self.ely_legacy_signin_pending || self.launching {
+            return;
+        }
+        let username = self.ely_legacy_username.trim().to_owned();
+        let password = self.ely_legacy_password.clone();
+        if username.is_empty() || password.is_empty() {
+            self.status = "Enter your Ely.by username and password.".to_owned();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.ely_legacy_signin_events = Some(receiver);
+        self.ely_legacy_signin_pending = true;
+        self.cancel_requested.store(false, Ordering::Release);
+        let cancel_requested = self.cancel_requested.clone();
+        self.status = "Signing in to Ely.by…".to_owned();
+        thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(async {
+                    tokio::select! {
+                        result = ely_legacy::authenticate(&username, &password) => result,
+                        _ = wait_for_cancel(cancel_requested) => Err("Ely.by sign-in was cancelled.".to_owned()),
+                    }
+                }),
+                Err(error) => Err(format!("Could not start Ely.by sign-in: {error}")),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    fn save_ely_legacy_account(
+        &mut self,
+        result: Result<(ely_legacy::Profile, ely_legacy::Credentials), String>,
+    ) {
+        self.ely_legacy_signin_events = None;
+        self.ely_legacy_signin_pending = false;
+        match result {
+            Ok((profile, credentials)) => {
+                let account = ElyLegacyAccountProfile {
+                    id: format!("ely_legacy:{}", profile.uuid),
+                    username: profile.username,
+                    display_name: profile.display_name,
+                    uuid: profile.uuid,
+                };
+                let secret = match serde_json::to_string(&credentials) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.status = format!("Could not encode Ely.by credentials: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
+                    self.status =
+                        format!("Could not protect Ely.by credentials with DPAPI: {error}");
+                    return;
+                }
+                self.settings
+                    .ely_legacy_accounts
+                    .retain(|saved| saved.uuid != account.uuid);
+                self.settings.ely_legacy_accounts.push(account.clone());
+                self.settings.selected_account = Some(account.id);
+                self.show_ely_legacy_dialog = false;
+                self.ely_legacy_password.clear();
+                self.status = format!("Signed in to Ely.by as {}.", account.display_name);
+                self.persist();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn start_ely_sign_in(&mut self) {
+        if self.ely_signin_pending || self.launching {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.ely_signin_events = Some(receiver);
+        self.ely_signin_pending = true;
+        self.cancel_requested.store(false, Ordering::Release);
+        let cancel_requested = self.cancel_requested.clone();
+        self.status = "Waiting for Ely.by sign-in in your browser…".to_owned();
+        thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(ely::sign_in(cancel_requested.clone())),
+                Err(error) => Err(format!("Could not start Ely.by sign-in: {error}")),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    fn save_ely_account(&mut self, result: Result<(ely::Profile, ely::Credentials), String>) {
+        self.ely_signin_events = None;
+        self.ely_signin_pending = false;
+        match result {
+            Ok((profile, credentials)) => {
+                let account = ElyAccountProfile {
+                    id: format!("ely:{}", profile.uuid),
+                    account_id: profile.id,
+                    username: profile.username,
+                    display_name: profile.display_name,
+                    uuid: profile.uuid,
+                };
+                let secret = match serde_json::to_string(&credentials) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.status = format!("Could not encode Ely.by credentials: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
+                    self.status =
+                        format!("Could not protect Ely.by credentials with DPAPI: {error}");
+                    return;
+                }
+                self.settings
+                    .ely_accounts
+                    .retain(|saved| saved.uuid != account.uuid);
+                self.settings.ely_accounts.push(account.clone());
+                self.settings.selected_account = Some(account.id);
+                self.show_ely_dialog = false;
+                self.status = format!("Signed in to Ely.by as {}.", account.display_name);
+                self.persist();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn apply_microsoft_sign_in(&mut self, result: Result<auth::SignInOutcome, String>) {
+        self.microsoft_signin_pending = false;
+        self.microsoft_signin_events = None;
+        match result {
+            Ok(auth::SignInOutcome::Authenticated(account)) => {
+                self.save_microsoft_account(account);
+            }
+            Ok(auth::SignInOutcome::ProfileCreationRequired(pending)) => {
+                self.pending_minecraft_profile = Some(pending);
+                self.new_minecraft_profile_name.clear();
+                self.show_minecraft_profile_dialog = true;
+                self.status =
+                    "Choose a Minecraft profile name to finish adding this account.".to_owned();
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn save_microsoft_account(&mut self, account: auth::AuthenticatedMicrosoftAccount) {
+        let profile = MicrosoftAccountProfile {
+            id: format!("microsoft:{}", account.uuid),
+            username: account.username.clone(),
+            uuid: account.uuid,
+            xuid: account.xuid,
+        };
+        if let Err(error) =
+            vault::store_refresh_token(&profile.storage_key(), &account.refresh_token)
+        {
+            self.status = format!("Could not store Microsoft credentials securely: {error}");
+            return;
+        }
+        self.settings
+            .microsoft_accounts
+            .retain(|saved| saved.id != profile.id);
+        self.settings.microsoft_accounts.push(profile.clone());
+        self.settings.selected_account = Some(profile.id);
+        self.status = format!("Signed in as {}.", account.username);
+        self.pending_minecraft_profile = None;
+        self.show_minecraft_profile_dialog = false;
+        self.persist();
+    }
+
+    fn start_minecraft_profile_creation(&mut self) {
+        if self.profile_creation_pending {
+            return;
+        }
+        let Some(pending) = self.pending_minecraft_profile.clone() else {
+            self.show_minecraft_profile_dialog = false;
+            self.status = "Restart Microsoft sign-in to create a Minecraft profile.".to_owned();
+            return;
+        };
+        let name = self.new_minecraft_profile_name.trim().to_owned();
+        if !(3..=16).contains(&name.len())
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            self.status = "Use 3–16 letters, numbers, or underscores for a Minecraft profile name."
+                .to_owned();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.profile_creation_events = Some(receiver);
+        self.profile_creation_pending = true;
+        self.status = format!("Creating Minecraft profile {name}…");
+        thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(auth::create_minecraft_profile(pending, &name)),
+                Err(error) => Err(format!("Could not start profile creation: {error}")),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    fn selected_account_label(&self) -> String {
+        self.settings
+            .selected_account
+            .as_ref()
+            .and_then(|id| {
+                self.settings
+                    .microsoft_accounts
+                    .iter()
+                    .find(|account| &account.id == id)
+                    .map(|account| account.username.clone())
+            })
+            .or_else(|| {
+                self.settings
+                    .ely_accounts
+                    .iter()
+                    .find(|account| {
+                        Some(account.id.as_str()) == self.settings.selected_account.as_deref()
+                    })
+                    .map(|account| account.display_name.clone())
+            })
+            .or_else(|| {
+                self.settings
+                    .ely_legacy_accounts
+                    .iter()
+                    .find(|account| {
+                        Some(account.id.as_str()) == self.settings.selected_account.as_deref()
+                    })
+                    .map(|account| account.display_name.clone())
+            })
+            .or_else(|| self.settings.selected_account.clone())
+            .unwrap_or_else(|| tr("account.empty").to_owned())
+    }
+
+    fn first_account_key(&self) -> Option<String> {
+        self.settings
+            .accounts
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.settings
+                    .microsoft_accounts
+                    .first()
+                    .map(|account| account.id.clone())
+            })
+            .or_else(|| {
+                self.settings
+                    .ely_accounts
+                    .first()
+                    .map(|account| account.id.clone())
+            })
+            .or_else(|| {
+                self.settings
+                    .ely_legacy_accounts
+                    .first()
+                    .map(|account| account.id.clone())
+            })
+    }
+
+    fn start_selected_game(&mut self) {
+        self.start_selected_game_on_server(None);
+    }
+
+    fn start_selected_game_on_server(&mut self, server: Option<SavedServer>) {
+        if self.launching {
+            return;
+        }
+        if server
+            .as_ref()
+            .is_some_and(|server| parse_server_address(&server.address).is_none())
+        {
+            self.status = "Enter a valid Minecraft server address (host or host:port).".to_owned();
+            return;
+        }
+        let Some(selected_id) = self.settings.selected_account.clone() else {
+            self.open_account_dialog();
+            return;
+        };
+        let microsoft_account = self
+            .settings
+            .microsoft_accounts
+            .iter()
+            .find(|account| account.id == selected_id)
+            .cloned();
+        let ely_legacy_account = self
+            .settings
+            .ely_legacy_accounts
+            .iter()
+            .find(|account| account.id == selected_id)
+            .cloned();
+        let ely_account = self
+            .settings
+            .ely_accounts
+            .iter()
+            .find(|account| account.id == selected_id)
+            .cloned();
+        let offline_username = if microsoft_account.is_none()
+            && ely_account.is_none()
+            && ely_legacy_account.is_none()
+            && self
+                .settings
+                .accounts
+                .iter()
+                .any(|name| name == &selected_id)
+        {
+            Some(selected_id)
+        } else {
+            None
+        };
+        let offline_uuid = offline_username
+            .as_deref()
+            .and_then(|username| offline_account_uuid_for(&self.settings, username));
+        if microsoft_account.is_none()
+            && ely_account.is_none()
+            && ely_legacy_account.is_none()
+            && offline_username.is_none()
+        {
+            self.settings.selected_account = None;
+            self.open_account_dialog();
+            return;
+        }
+
+        let library_replace_type = if microsoft_account.is_some() {
+            Some("minecraft".to_owned())
+        } else if ely_account.is_some() || ely_legacy_account.is_some() {
+            Some("ely".to_owned())
+        } else {
+            offline_username.as_deref().map(|username| {
+                if offline_ely_skins_for(&self.settings, username) {
+                    "ely".to_owned()
+                } else {
+                    "plain".to_owned()
+                }
+            })
+        };
+        let mut library_replace_types = Vec::new();
+        if self.settings.delete_patchy {
+            library_replace_types.push("patchy".to_owned());
+        }
+        if let Some(replacement_type) = library_replace_type {
+            library_replace_types.push(replacement_type);
+        }
+
+        let version = self.settings.selected_version.clone();
+        if !valid_version_id(&version) {
+            self.status = "The selected Minecraft version ID is invalid.".to_owned();
+            return;
+        }
+        let force_update = self.settings.force_update;
+        let game_dir = self.game_root_for_version(&version);
+        let promoted_servers = if self.settings.promoted_servers_in_game {
+            self.promoted_servers_for_version(&version)
+        } else {
+            Vec::new()
+        };
+        let server_save_warning = match prepare_minecraft_server_list(
+            &game_dir.join("servers.dat"),
+            server.as_ref(),
+            &promoted_servers,
+            self.settings.promoted_servers_in_game,
+        ) {
+            Ok(()) => {
+                if let Ok(servers) = read_minecraft_server_list(&game_dir.join("servers.dat")) {
+                    self.settings.servers = servers.clone();
+                    self.settings.servers_cache_root = game_dir.to_string_lossy().into_owned();
+                    if self.server_list_root.as_deref() == Some(game_dir.as_path()) {
+                        self.server_list = servers;
+                    }
+                    self.persist();
+                }
+                None
+            }
+            Err(error) => Some(format!(
+                "Could not update servers.dat; continuing launch: {error}"
+            )),
+        };
+        let quick_play_supported = server
+            .as_ref()
+            .map(|_| selected_version_supports_quick_play(&version, &game_dir));
+        let quick_play_server = server;
+        let mods_directory = game_dir.join("mods");
+        let crash_game_dir = self.game_data_directory_for_version(&version);
+        let preferences = self.settings.clone();
+        let crash_version = version.clone();
+        let crash_loader = format!("{}-{}", preferences.loader_type, preferences.loader_build);
+        let version_manifest = self.version_manifest.clone();
+        let game_log = self.game_log.clone();
+        if let Ok(mut lines) = game_log.lock() {
+            lines.clear();
+        }
+        let pending_crash_report = self.pending_crash_report.clone();
+        if let Ok(mut report) = pending_crash_report.lock() {
+            *report = None;
+        }
+        let launch_started = SystemTime::now();
+        let (update_tx, update_rx) = mpsc::channel();
+        self.launch_events = Some(update_rx);
+        self.launching = true;
+        self.launch_progress = Some(0.0);
+        self.cancel_requested.store(false, Ordering::Release);
+        let cancel_requested = self.cancel_requested.clone();
+        self.status = format!("Preparing Minecraft {version}…");
+
+        thread::spawn(move || {
+            if let Some(warning) = server_save_warning {
+                let _ = update_tx.send(warning);
+            }
+            let done_tx = update_tx.clone();
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = update_tx.send(format!("Could not start runtime: {error}"));
+                    let _ = done_tx.send("__DONE__".to_owned());
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let authenticator = if let Some(account) = microsoft_account {
+                    tokio::select! {
+                        result = authenticate_microsoft_account(&account) => match result {
+                            Ok(authenticator) => authenticator,
+                            Err(error) => {
+                                let _ = update_tx.send(error);
+                                return;
+                            }
+                        },
+                        _ = wait_for_cancel(cancel_requested.clone()) => {
+                            let _ = update_tx.send("Sign-in cancelled.".to_owned());
+                            return;
+                        }
+                    }
+                } else if let Some(account) = ely_legacy_account {
+                    tokio::select! {
+                        result = authenticate_ely_legacy_account(&account) => match result {
+                            Ok(authenticator) => authenticator,
+                            Err(error) => {
+                                let _ = update_tx.send(error);
+                                return;
+                            }
+                        },
+                        _ = wait_for_cancel(cancel_requested.clone()) => {
+                            let _ = update_tx.send("Ely.by sign-in cancelled.".to_owned());
+                            return;
+                        }
+                    }
+                } else if let Some(account) = ely_account {
+                    tokio::select! {
+                        result = authenticate_ely_account(&account) => match result {
+                            Ok(authenticator) => authenticator,
+                            Err(error) => {
+                                let _ = update_tx.send(error);
+                                return;
+                            }
+                        },
+                        _ = wait_for_cancel(cancel_requested.clone()) => {
+                            let _ = update_tx.send("Ely.by sign-in cancelled.".to_owned());
+                            return;
+                        }
+                    }
+                } else {
+                    offline_authenticator_with_uuid(
+                        offline_username.unwrap_or_default(),
+                        offline_uuid.as_deref(),
+                    )
+                };
+                let mut preferences = preferences;
+                let java_mode = preferences.java_mode.clone();
+                match java_mode.as_str() {
+                    "recommended" => preferences.java_path.clear(),
+                    "current" => match tokio::task::spawn_blocking(detect_java).await {
+                        Ok(Ok((path, version))) => {
+                            preferences.java_path = path.to_string_lossy().into_owned();
+                            let _ = update_tx.send(format!("Using current Java: {version}"));
+                        }
+                        Ok(Err(error)) => {
+                            let _ = update_tx.send(error);
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = update_tx.send(format!("Java detection failed: {error}"));
+                            return;
+                        }
+                    },
+                    "custom" if preferences.java_path.trim().is_empty() => {
+                        let _ = update_tx.send(
+                            "Choose a custom Java executable or switch Java to Recommended."
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+                if java_mode != "recommended" {
+                    let java_path = PathBuf::from(preferences.java_path.trim());
+                    let check_result = tokio::select! {
+                        result = verify_java_compatibility(
+                            &java_path,
+                            &game_dir,
+                            &version,
+                            version_manifest.as_ref(),
+                        ) => {
+                            Some(result)
+                        }
+                        _ = wait_for_cancel(cancel_requested.clone()) => None,
+                    };
+                    let Some(check_result) = check_result else {
+                        let _ = update_tx.send("Java check cancelled.".to_owned());
+                        return;
+                    };
+                    match check_result {
+                        Ok(message) => {
+                            let _ = update_tx.send(message);
+                        }
+                        Err(error) => {
+                            let _ = update_tx.send(error);
+                            return;
+                        }
+                    }
+                }
+
+                let gpu_preference = preferences.gpu_preference.clone();
+                let gpu_preference_enabled = preferences.windows_gpu_performance;
+                let remove_undesirable_mods = preferences.remove_undesirable_mods;
+                let replacement_instance_version = version.clone();
+                let mut options = make_launch_options_with_authenticator(
+                    version,
+                    authenticator,
+                    game_dir,
+                    force_update,
+                    preferences,
+                );
+                if !library_replace_types.is_empty() {
+                    options.library_replace_types = library_replace_types.clone();
+                    options.skip_bundle_check = false;
+                    let replacement_profile = library_replace_types.join("-");
+                    options.instance = Some(match options.instance.take() {
+                        Some(instance) => {
+                            format!("{instance}-replace-{replacement_profile}-{replacement_instance_version}")
+                        }
+                        None => format!("legacylauncher-replace-{replacement_profile}-{replacement_instance_version}"),
+                    });
+                }
+                if let (Some(server), Some(supported)) = (quick_play_server, quick_play_supported) {
+                    append_server_launch_arguments(&mut options, &server.address, supported);
+                    let _ = update_tx.send(format!("Connecting to {}…", server.name));
+                }
+
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+                let progress_tx = update_tx.clone();
+                let listener_game_log = game_log.clone();
+                let listener = tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        let message = launch_event_message_or_record(&listener_game_log, event);
+                        if let Some(message) = message {
+                            let _ = progress_tx.send(message);
+                        }
+                    }
+                });
+
+                let mut launcher = Launcher::new(options);
+                let download_result = tokio::select! {
+                    result = launcher.download_game(event_tx.clone()) => Some(result),
+                    _ = wait_for_cancel(cancel_requested.clone()) => None,
+                };
+                match download_result {
+                    None => {
+                        let _ = update_tx.send("Game launch cancelled.".to_owned());
+                        drop(event_tx);
+                        let _ = listener.await;
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        let _ = update_tx.send(format!("Launch failed: {error}"));
+                        drop(event_tx);
+                        let _ = listener.await;
+                        return;
+                    }
+                    Some(Ok(())) => {}
+                }
+                if gpu_preference_enabled {
+                    if let Some(game_data) = launcher.game_data() {
+                        if let Err(error) =
+                            apply_gpu_preference(&game_data.minecraft_java.path, &gpu_preference)
+                        {
+                            let _ = update_tx.send(format!(
+                                "Could not apply the selected GPU preference: {error}"
+                            ));
+                        }
+                    }
+                }
+                if cancel_requested.load(Ordering::Acquire) {
+                    let _ = update_tx.send("Game launch cancelled.".to_owned());
+                    drop(event_tx);
+                    let _ = listener.await;
+                    return;
+                }
+                if remove_undesirable_mods {
+                    match remove_undesirable_mod_files(&mods_directory) {
+                        Ok(summary) => {
+                            if !summary.removed.is_empty() {
+                                let _ = update_tx.send(format!(
+                                    "Removed unwanted mod files: {}",
+                                    summary.removed.join(", ")
+                                ));
+                            }
+                            for (name, error) in summary.failed {
+                                let _ = update_tx.send(format!(
+                                    "Could not remove unwanted mod {name}: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = update_tx.send(format!(
+                                "Could not scan the mods folder for unwanted files: {error}"
+                            ));
+                        }
+                    }
+                }
+                match launcher.launch(event_tx.clone()).await {
+                    Ok(mut child) => {
+                        let wait_result = tokio::select! {
+                            result = child.wait() => Some(result),
+                            _ = wait_for_cancel(cancel_requested.clone()) => None,
+                        };
+                        match wait_result {
+                            Some(Ok(status)) => {
+                                let code = status.code().unwrap_or(-1);
+                                if !status.success() {
+                                    if let Some(report) = collect_crash_report(
+                                        &crash_game_dir,
+                                        &game_log,
+                                        launch_started,
+                                        &crash_version,
+                                        &crash_loader,
+                                    ) {
+                                        if let Ok(mut pending) = pending_crash_report.lock() {
+                                            *pending = Some(report);
+                                        }
+                                    }
+                                }
+                                let _ = event_tx.send(LaunchEvent::Close(code)).await;
+                            }
+                            Some(Err(error)) => {
+                                let _ =
+                                    update_tx.send(format!("Could not monitor Minecraft: {error}"));
+                            }
+                            None => {
+                                let _ = child.kill().await;
+                                let _ = child.wait().await;
+                                let _ = update_tx.send("Minecraft process stopped.".to_owned());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = update_tx.send(format!("Launch failed: {error}"));
+                    }
+                }
+                drop(event_tx);
+                let _ = listener.await;
+            });
+
+            let _ = done_tx.send("__DONE__".to_owned());
+        });
+    }
+
+    fn start_version_install(&mut self, version: String) {
+        if self.launching {
+            return;
+        }
+        self.settings.selected_version = version.clone();
+        self.persist();
+
+        if !valid_version_id(&version) {
+            self.status = "The selected Minecraft version ID is invalid.".to_owned();
+            return;
+        }
+        let game_dir = self.game_root_for_version(&version);
+        let preferences = self.settings.clone();
+        let (update_tx, update_rx) = mpsc::channel();
+        self.launch_events = Some(update_rx);
+        self.launching = true;
+        self.launch_progress = Some(0.0);
+        self.cancel_requested.store(false, Ordering::Release);
+        let cancel_requested = self.cancel_requested.clone();
+        self.status = format!("Installing Minecraft {version}…");
+
+        thread::spawn(move || {
+            let done_tx = update_tx.clone();
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = update_tx.send(format!("Could not start runtime: {error}"));
+                    let _ = done_tx.send("__DONE__".to_owned());
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let options = make_launch_options(
+                    version.clone(),
+                    "VersionManager".to_owned(),
+                    game_dir,
+                    true,
+                    preferences,
+                );
+                let mut launcher = Launcher::new(options);
+                let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+                let progress_tx = update_tx.clone();
+                let listener = tokio::spawn(async move {
+                    while let Some(event) = event_rx.recv().await {
+                        if let Some(message) = launch_event_message(event) {
+                            let _ = progress_tx.send(message);
+                        }
+                    }
+                });
+
+                let install_result = tokio::select! {
+                    result = launcher.download_game(event_tx.clone()) => Some(result),
+                    _ = wait_for_cancel(cancel_requested) => None,
+                };
+                match install_result {
+                    Some(Ok(())) => {
+                        let _ = update_tx.send(format!("Minecraft {version} is installed."));
+                    }
+                    Some(Err(error)) => {
+                        let _ = update_tx.send(format!("Install failed: {error}"));
+                    }
+                    None => {
+                        let _ = update_tx.send("Installation cancelled.".to_owned());
+                    }
+                }
+                drop(event_tx);
+                let _ = listener.await;
+            });
+
+            let _ = done_tx.send("__DONE__".to_owned());
+        });
+    }
+
+    fn show_version_manager(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Minecraft versions");
+            if ui
+                .add_enabled(
+                    !self.version_catalog_loading,
+                    egui::Button::new("Refresh catalog"),
+                )
+                .clicked()
+            {
+                self.refresh_version_catalog();
+            }
+            if self.version_catalog_loading {
+                ui.spinner();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Search");
+            ui.text_edit_singleline(&mut self.version_search);
+        });
+
+        let mut filter_settings_changed = false;
+        ui.horizontal_wrapped(|ui| {
+            for (kind, label) in [
+                ("snapshot", "Snapshots"),
+                ("modified", "Modified"),
+                ("old-beta", "Old Beta"),
+                ("old-alpha", "Old Alpha"),
+                ("launcher", "Launcher"),
+                ("pending", "Experimental"),
+            ] {
+                let enabled = self
+                    .settings
+                    .version_catalog_types
+                    .entry(kind.to_owned())
+                    .or_insert_with(|| default_version_type_enabled(kind));
+                filter_settings_changed |= ui.checkbox(enabled, label).changed();
+            }
+        });
+        ui.horizontal(|ui| {
+            filter_settings_changed |= ui
+                .checkbox(&mut self.settings.version_only_installed, "Only installed")
+                .changed();
+            filter_settings_changed |= ui
+                .checkbox(
+                    &mut self.settings.version_include_remote,
+                    "Show remote versions",
+                )
+                .changed();
+            filter_settings_changed |= ui
+                .checkbox(
+                    &mut self.settings.version_show_old_releases,
+                    "Show versions before 1.7.10",
+                )
+                .changed();
+        });
+        if filter_settings_changed {
+            self.persist();
+        }
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.version_kind_filter, "all".to_owned(), "All");
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "release".to_owned(),
+                "Release",
+            );
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "snapshot".to_owned(),
+                "Snapshot",
+            );
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "modified".to_owned(),
+                "Modified",
+            );
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "old".to_owned(),
+                "Old Beta/Alpha",
+            );
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "launcher".to_owned(),
+                "Launcher",
+            );
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "pending".to_owned(),
+                "Experimental",
+            );
+        });
+
+        if self.version_manifest.is_none() && !self.version_catalog_loading {
+            ui.colored_label(
+                Color32::from_rgb(238, 183, 85),
+                "The online catalog is unavailable. Installed versions remain listed below.",
+            );
+        }
+
+        let entries = self.visible_catalog_entries();
+        let installed: HashSet<String> = self.installed_versions().into_iter().collect();
+        let busy = self.launching;
+        egui::ScrollArea::vertical()
+            .max_height(330.0)
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.label("No matching versions.");
+                }
+                for (version, kind) in entries {
+                    let is_installed = installed.contains(&version);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&version).strong());
+                        ui.label(RichText::new(&kind).weak());
+                        if is_installed {
+                            ui.label(RichText::new("Installed").color(Color32::LIGHT_GREEN));
+                        }
+                        if ui.small_button("Select").clicked() {
+                            self.settings.selected_version = version.clone();
+                            self.persist();
+                        }
+                        let install_label = if is_installed { "Repair" } else { "Install" };
+                        if ui
+                            .add_enabled(!busy, egui::Button::new(install_label).small())
+                            .clicked()
+                        {
+                            self.start_version_install(version.clone());
+                        }
+                        if is_installed
+                            && ui
+                                .add_enabled(!busy, egui::Button::new("Remove").small())
+                                .clicked()
+                        {
+                            self.confirm_remove_version = Some(version.clone());
+                        }
+                    });
+                }
+            });
+    }
+}
+
+impl eframe::App for LauncherApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx();
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.settings.feedback_acknowledged
+            && self.bootstrap_feedback_url.is_some()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.settings.feedback_acknowledged = true;
+            self.persist();
+            self.show_feedback_dialog = true;
+        }
+        if self.auto_launch_pending {
+            self.auto_launch_pending = false;
+            self.start_selected_game();
+        }
+        let theme = ctx.theme();
+        let mut style = (*ctx.style_of(theme)).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.window_fill = Color32::from_rgb(31, 35, 38);
+        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(52, 57, 60);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(75, 80, 82);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(94, 101, 104);
+        style.visuals.widgets.active.bg_fill = Color32::from_rgb(64, 116, 144);
+        style.visuals.selection.bg_fill = Color32::from_rgb(54, 116, 153);
+        style.spacing.item_spacing = Vec2::new(0.0, 5.0);
+        style.spacing.interact_size.y = 22.0;
+        ctx.set_style_of(theme, style);
+
+        let mut updates = Vec::new();
+        let mut finished = false;
+        if let Some(receiver) = &self.launch_events {
+            while let Ok(message) = receiver.try_recv() {
+                if message == "__DONE__" {
+                    finished = true;
+                } else {
+                    updates.push(message);
+                }
+            }
+        }
+        for message in updates {
+            if let Some(progress) = parse_launch_progress(&message) {
+                self.launch_progress = Some(progress);
+            }
+            if message == "__GAME_STARTED__" {
+                self.status = "Minecraft is starting…".to_owned();
+                self.launch_progress = None;
+                match self.settings.launch_action.as_str() {
+                    "hide" => {
+                        self.hidden_for_game = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                    "exit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    _ => {}
+                }
+            } else {
+                self.status = message;
+            }
+        }
+        if finished {
+            self.launching = false;
+            self.launch_progress = None;
+            self.launch_events = None;
+            if self.hidden_for_game {
+                self.hidden_for_game = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+            if let Ok(mut pending) = self.pending_crash_report.lock() {
+                if let Some(report) = pending.take() {
+                    self.status = report.summary.clone();
+                    self.crash_report = Some(report);
+                }
+            }
+        }
+
+        let mut catalog_update = None;
+        if let Some(receiver) = &self.version_catalog_events {
+            if let Ok(result) = receiver.try_recv() {
+                catalog_update = Some(result);
+            }
+        }
+        if let Some(result) = catalog_update {
+            self.version_catalog_events = None;
+            self.version_catalog_loading = false;
+            match result {
+                Ok(manifest) => {
+                    let version_count = manifest.versions.len();
+                    self.version_manifest = Some(manifest);
+                    self.status = format!("Loaded {version_count} Minecraft versions.");
+                }
+                Err(error) => self.status = error,
+            }
+        }
+        let mut bootstrap_update = None;
+        if let Some(receiver) = &self.bootstrap_events {
+            if let Ok(result) = receiver.try_recv() {
+                bootstrap_update = Some(result);
+            }
+        }
+        if let Some(result) = bootstrap_update {
+            self.bootstrap_events = None;
+            self.bootstrap_loading = false;
+            match result {
+                Ok(configuration) => {
+                    self.bootstrap_notice_list = configuration.notices;
+                    self.bootstrap_promoted_servers = configuration.promoted_servers;
+                    self.bootstrap_feedback_url = configuration.feedback_url;
+                    self.bootstrap_notification_texture = configuration
+                        .notification
+                        .as_ref()
+                        .and_then(|notification| notification.image.as_ref())
+                        .and_then(|bytes| {
+                            load_optional_texture(ctx, "bootstrap_notification", bytes)
+                        });
+                    self.bootstrap_notification = configuration.notification;
+                    self.bootstrap_error = None;
+                    self.rebuild_notice_list(ctx);
+                }
+                Err(error) => self.bootstrap_error = Some(error),
+            }
+        }
+
+        let mut notice_update = None;
+        if let Some(receiver) = &self.notice_events {
+            if let Ok(result) = receiver.try_recv() {
+                notice_update = Some(result);
+            }
+        }
+        if let Some(result) = notice_update {
+            self.notice_events = None;
+            self.notices_loading = false;
+            match result {
+                Ok(notices) => {
+                    self.personal_notice_list = notices;
+                    self.notice_error = None;
+                }
+                Err(error) => {
+                    self.notice_error = Some(error);
+                    self.personal_notice_list.clear();
+                }
+            }
+            self.rebuild_notice_list(ctx);
+        }
+        let mut diagnostic_update = None;
+        if let Some(receiver) = &self.diagnostic_events {
+            if let Ok(result) = receiver.try_recv() {
+                diagnostic_update = Some(result);
+            }
+        }
+        if let Some(result) = diagnostic_update {
+            self.diagnostic_events = None;
+            self.diagnostic_pending = false;
+            match result {
+                Ok(url) => {
+                    self.diagnostic_result_url = Some(url);
+                    self.diagnostic_error = None;
+                }
+                Err(error) => self.diagnostic_error = Some(error),
+            }
+        }
+        let mut microsoft_signin_update = None;
+        if let Some(receiver) = &self.microsoft_signin_events {
+            if let Ok(result) = receiver.try_recv() {
+                microsoft_signin_update = Some(result);
+            }
+        }
+        if let Some(result) = microsoft_signin_update {
+            self.apply_microsoft_sign_in(result);
+        }
+        let mut ely_legacy_signin_update = None;
+        if let Some(receiver) = &self.ely_legacy_signin_events {
+            if let Ok(result) = receiver.try_recv() {
+                ely_legacy_signin_update = Some(result);
+            }
+        }
+        if let Some(result) = ely_legacy_signin_update {
+            self.save_ely_legacy_account(result);
+        }
+        let mut ely_signin_update = None;
+        if let Some(receiver) = &self.ely_signin_events {
+            if let Ok(result) = receiver.try_recv() {
+                ely_signin_update = Some(result);
+            }
+        }
+        if let Some(result) = ely_signin_update {
+            self.save_ely_account(result);
+        }
+        let mut profile_creation_update = None;
+        if let Some(receiver) = &self.profile_creation_events {
+            if let Ok(result) = receiver.try_recv() {
+                profile_creation_update = Some(result);
+            }
+        }
+        if let Some(result) = profile_creation_update {
+            self.profile_creation_events = None;
+            self.profile_creation_pending = false;
+            match result {
+                Ok(account) => self.save_microsoft_account(account),
+                Err(error) => self.status = error,
+            }
+        }
+        if self.launching {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        if self.version_catalog_loading
+            || self.notices_loading
+            || self.microsoft_signin_pending
+            || self.ely_signin_pending
+            || self.ely_legacy_signin_pending
+            || self.profile_creation_pending
+        {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+
+        let Some(assets) = &self.assets else { return };
+        let background = assets.background.clone();
+        let support_icon = assets.support.clone();
+        let folder_icon = assets.folder.clone();
+        let refresh_icon = assets.refresh.clone();
+        let settings_icon = assets.settings.clone();
+        let account_menu_label = self.selected_account_label();
+        let selected_version = self.settings.selected_version.clone();
+        let install_label = if self.launching {
+            "Installing and launching…"
+        } else if self.version_is_installed() {
+            tr("loginform.enter")
+        } else {
+            tr("loginform.enter.install")
+        };
+
+        let rect = ui.max_rect();
+        let uv = cover_uv(background.size_vec2(), rect.size());
+        ui.painter()
+            .image(background.id(), rect, uv, Color32::WHITE);
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_black_alpha(68));
+
+        // Match the original login panel's compact left-side placement.
+        let panel_pos = rect.min + Vec2::new(55.0, 22.0);
+        egui::Area::new(Id::unique("legacy_login_panel"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(panel_pos)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(23, 29, 34, 198))
+                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(16)))
+                    .inner_margin(Margin::symmetric(24, 28))
+                    .show(ui, |ui| {
+                        ui.set_width(236.0);
+                        let line_rect = ui
+                            .allocate_exact_size(Vec2::new(236.0, 1.0), Sense::hover())
+                            .0;
+                        ui.painter().line_segment(
+                            [line_rect.left_top(), line_rect.right_top()],
+                            Stroke::new(1.0, Color32::from_white_alpha(110)),
+                        );
+                        ui.add_space(5.0);
+
+                        ComboBox::from_id_salt("account_selector")
+                            .width(236.0)
+                            .selected_text(RichText::new(account_menu_label).size(12.0))
+                            .show_ui(ui, |ui| {
+                                if self.settings.accounts.is_empty()
+                                    && self.settings.microsoft_accounts.is_empty()
+                                    && self.settings.ely_accounts.is_empty()
+                                    && self.settings.ely_legacy_accounts.is_empty()
+                                {
+                                    ui.label(tr("account.empty"));
+                                }
+                                for account in &self.settings.accounts {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.selected_account,
+                                            Some(account.clone()),
+                                            account,
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                                for account in &self.settings.microsoft_accounts {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.selected_account,
+                                            Some(account.id.clone()),
+                                            &account.username,
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                                for account in &self.settings.ely_accounts {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.selected_account,
+                                            Some(account.id.clone()),
+                                            format!("{} (Ely.by)", account.display_name),
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                                for account in &self.settings.ely_legacy_accounts {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.selected_account,
+                                            Some(account.id.clone()),
+                                            format!("{} (Ely.by)", account.display_name),
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Add offline account…").clicked() {
+                                    self.open_account_dialog();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.microsoft_signin_pending
+                                            && !self.ely_signin_pending
+                                            && !self.ely_legacy_signin_pending
+                                            && !self.launching,
+                                        egui::Button::new("Add Microsoft account…"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_microsoft_sign_in();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.microsoft_signin_pending
+                                            && !self.ely_signin_pending
+                                            && !self.ely_legacy_signin_pending
+                                            && !self.launching,
+                                        egui::Button::new("Add Ely.by account…"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.show_ely_dialog = true;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.microsoft_signin_pending
+                                            && !self.ely_signin_pending
+                                            && !self.ely_legacy_signin_pending
+                                            && !self.launching,
+                                        egui::Button::new("Add Ely.by Legacy account…"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_ely_legacy_dialog();
+                                }
+                            });
+
+                        ComboBox::from_id_salt("version_selector")
+                            .width(236.0)
+                            .selected_text(RichText::new(selected_version).size(12.0))
+                            .show_ui(ui, |ui| {
+                                for version in self.available_versions() {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.selected_version,
+                                            version.clone(),
+                                            &version,
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                            });
+
+                        ui.add_space(5.0);
+                        if ui
+                            .checkbox(
+                                &mut self.settings.auto_login,
+                                tr("loginform.checkbox.autologin"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.settings.force_update,
+                                tr("loginform.checkbox.forceupdate"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.add_space(3.0);
+
+                        let play_button =
+                            egui::Button::new(RichText::new(install_label).size(18.0).strong())
+                                .fill(Color32::from_rgb(73, 78, 80))
+                                .stroke(Stroke::new(1.0, Color32::from_white_alpha(36)))
+                                .corner_radius(2.0);
+                        if ui
+                            .add_enabled(
+                                !self.launching,
+                                play_button.min_size(Vec2::new(236.0, 46.0)),
+                            )
+                            .clicked()
+                        {
+                            self.start_selected_game();
+                        }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let support = icon_button(ui, "support", &support_icon);
+                            if support.clicked() {
+                                self.show_support_menu = !self.show_support_menu;
+                                self.support_menu_pos =
+                                    support.rect.left_bottom() + Vec2::new(-54.0, 1.0);
+                            }
+                            support.on_hover_text(tr("loginform.button.support"));
+
+                            let folder = icon_button(ui, "folder", &folder_icon);
+                            if folder.clicked() {
+                                self.show_folder_menu = !self.show_folder_menu;
+                                self.folder_menu_pos =
+                                    folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
+                            }
+                            folder.on_hover_text(tr("loginform.button.folder"));
+
+                            let refresh = icon_button(ui, "refresh", &refresh_icon);
+                            if refresh.clicked() {
+                                let count = self.installed_versions().len();
+                                self.refresh_version_catalog();
+                                self.status =
+                                    format!("Refreshing catalog; {count} local version(s) found.");
+                            }
+                            refresh.on_hover_text(tr("loginform.button.refresh"));
+
+                            let settings = icon_button(ui, "settings", &settings_icon);
+                            if settings.clicked() {
+                                self.show_settings_menu = !self.show_settings_menu;
+                                self.settings_menu_pos =
+                                    settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
+                            }
+                            settings.on_hover_text(tr("loginform.button.settings"));
+                        });
+                    });
+            });
+
+        if let Some(notification) = self.bootstrap_notification.clone() {
+            let notification_texture = self.bootstrap_notification_texture.clone();
+            let clicked = egui::Area::new(Id::unique((
+                "bootstrap_notification",
+                notification.id.as_str(),
+            )))
+            .anchor(Align2::RIGHT_TOP, Vec2::new(-12.0, 12.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(Margin::same(6))
+                    .show(ui, |ui| {
+                        let response = if let Some(texture) = notification_texture {
+                            ui.add(
+                                egui::Image::new((texture.id(), Vec2::splat(36.0)))
+                                    .sense(Sense::click()),
+                            )
+                        } else {
+                            ui.add_sized(Vec2::splat(36.0), egui::Button::new("!"))
+                        };
+                        response
+                            .on_hover_text(tr("bootstrap.notification.open"))
+                            .clicked()
+                    })
+                    .inner
+            })
+            .inner;
+            if clicked {
+                open_url(&notification.url);
+                self.bootstrap_notification = None;
+                self.bootstrap_notification_texture = None;
+            }
+        }
+
+        if self.show_folder_menu {
+            egui::Area::new(Id::unique("folder_popup"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(self.folder_menu_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        if self.settings.separate_game_directories != SeparateDirs::None {
+                            let folder_name = self
+                                .game_root_for_version(&self.settings.selected_version)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| self.settings.selected_version.clone());
+                            let label =
+                                tr("loginform.button.folder.family").replace("%0", &folder_name);
+                            if ui.button(label).clicked() {
+                                open_path(
+                                    &self.game_root_for_version(&self.settings.selected_version),
+                                );
+                                self.show_folder_menu = false;
+                            }
+                        }
+                        if self.settings.loader_type != "none"
+                            && ui.button(tr("loginform.button.folder.mods")).clicked()
+                        {
+                            let mods = self
+                                .game_data_directory_for_version(&self.settings.selected_version)
+                                .join("mods");
+                            match fs::create_dir_all(&mods) {
+                                Ok(()) => open_path(&mods),
+                                Err(error) => {
+                                    self.status =
+                                        format!("Could not open the mods folder: {error}");
+                                }
+                            }
+                            self.show_folder_menu = false;
+                        }
+                        if ui.button(tr("loginform.button.folder.logs")).clicked() {
+                            self.selected_log_path = None;
+                            self.show_log_window = true;
+                            self.show_folder_menu = false;
+                        }
+                        if ui.button(tr("loginform.button.folder.root")).clicked() {
+                            open_path(&self.game_dir_path());
+                            self.show_folder_menu = false;
+                        }
+                        if ui.small_button("Close").clicked() {
+                            self.show_folder_menu = false;
+                        }
+                    });
+                });
+        }
+
+        if self.show_support_menu {
+            egui::Area::new(Id::unique("support_popup"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(self.support_menu_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        if ui.button(tr("loginform.button.support.discord")).clicked() {
+                            open_url("https://llaun.ch/discord/intl");
+                            self.show_support_menu = false;
+                        }
+                        ui.separator();
+                        if ui.button(tr("loginform.button.support")).clicked() {
+                            self.show_support_window = true;
+                            self.show_support_menu = false;
+                        }
+                    });
+                });
+        }
+
+        if self.show_support_window {
+            let mut open = true;
+            let mut open_diagnostic_consent = false;
+            egui::Window::new(tr("support.contact.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(tr("support.contact.body"));
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("support.contact.buttons.discord")).clicked() {
+                            open_url("https://llaun.ch/support/discord/intl");
+                        }
+                        if ui.button(tr("support.contact.buttons.mail")).clicked() {
+                            open_url("mailto:support@llaun.ch");
+                        }
+                    });
+                    if ui.button(tr("support.pre.diag.send")).clicked() {
+                        open_diagnostic_consent = true;
+                    }
+                });
+            if open_diagnostic_consent {
+                open = false;
+                self.show_diagnostic_consent = true;
+                self.diagnostic_send_enabled = true;
+                self.diagnostic_error = None;
+            }
+            self.show_support_window = open;
+        }
+
+        if self.show_diagnostic_consent
+            || self.diagnostic_pending
+            || self.diagnostic_result_url.is_some()
+            || self.diagnostic_error.is_some()
+        {
+            let mut open = true;
+            let diagnostic_result_url = self.diagnostic_result_url.clone();
+            let diagnostic_error = self.diagnostic_error.clone();
+            let title = if self.diagnostic_pending {
+                tr("support.sending.title")
+            } else if diagnostic_result_url.is_some() {
+                tr("support.sending.success.title")
+            } else if diagnostic_error.is_some() {
+                tr("support.sending.error.title")
+            } else {
+                tr("support.pre.title")
+            };
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if self.diagnostic_pending {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tr("support.sending.head"));
+                        });
+                    } else if let Some(url) = &diagnostic_result_url {
+                        ui.label(tr("support.sending.success"));
+                        ui.hyperlink(url);
+                        ui.horizontal(|ui| {
+                            if ui.button(tr("support.sending.open")).clicked() {
+                                open_url(url);
+                            }
+                            if ui.button(tr("support.sending.copy")).clicked() {
+                                ctx.copy_text(url.clone());
+                            }
+                            if ui.button(tr("support.button.close")).clicked() {
+                                self.diagnostic_result_url = None;
+                                self.diagnostic_payload = None;
+                            }
+                        });
+                    } else if let Some(error) = &diagnostic_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                        ui.horizontal(|ui| {
+                            if ui.button(tr("support.sending.save")).clicked() {
+                                self.save_diagnostic_report();
+                            }
+                            if ui.button(tr("support.sending.retry")).clicked() {
+                                self.start_diagnostic_upload();
+                            }
+                            if ui.button(tr("support.button.close")).clicked() {
+                                self.diagnostic_error = None;
+                                self.diagnostic_payload = None;
+                            }
+                        });
+                    } else {
+                        ui.label(tr("support.pre.body"));
+                        if ui
+                            .checkbox(
+                                &mut self.diagnostic_send_enabled,
+                                tr("support.pre.diag.checkbox"),
+                            )
+                            .changed()
+                        {
+                            // The user can opt out before continuing to the regular contact links.
+                        }
+                        if ui.button(tr("support.pre.diag.whatisit")).clicked() {
+                            open_url(tr("support.pre.diag.url"));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button(tr("support.pre.continue")).clicked() {
+                                self.show_diagnostic_consent = false;
+                                if self.diagnostic_send_enabled {
+                                    self.start_diagnostic_upload();
+                                } else {
+                                    self.show_support_window = true;
+                                }
+                            }
+                            if ui.button(tr("support.button.cancel")).clicked() {
+                                self.show_diagnostic_consent = false;
+                            }
+                        });
+                    }
+                });
+            if !open {
+                self.show_diagnostic_consent = false;
+                self.diagnostic_result_url = None;
+                self.diagnostic_error = None;
+                if !self.diagnostic_pending {
+                    self.diagnostic_payload = None;
+                }
+            }
+        }
+
+        if self.show_feedback_dialog {
+            let feedback_url = self.bootstrap_feedback_url.clone();
+            let mut open = true;
+            let mut close_launcher = false;
+            egui::Window::new(tr("feedback.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(tr("feedback.body"));
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("feedback.button.okay")).clicked() {
+                            if let Some(url) = &feedback_url {
+                                open_url(url);
+                            }
+                            close_launcher = true;
+                        }
+                        if ui.button(tr("feedback.button.no")).clicked() {
+                            close_launcher = true;
+                        }
+                    });
+                });
+            if !open || close_launcher {
+                self.show_feedback_dialog = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        if self.show_settings_menu {
+            egui::Area::new(Id::unique("settings_popup"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(self.settings_menu_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        if ui
+                            .button(tr("loginform.button.settings.launcher"))
+                            .clicked()
+                        {
+                            self.settings_page = Some("Launcher & game preferences");
+                            self.show_settings_menu = false;
+                        }
+                        if ui.button(tr("loginform.button.settings.version")).clicked() {
+                            self.settings_page = Some("Manage versions");
+                            self.show_settings_menu = false;
+                        }
+                        if ui.button(tr("loginform.button.settings.account")).clicked() {
+                            self.settings_page = Some("Manage accounts");
+                            self.show_settings_menu = false;
+                        }
+                        if ui.button("Manage servers").clicked() {
+                            self.settings_page = Some("Manage servers");
+                            self.server_list_root = None;
+                            self.show_settings_menu = false;
+                        }
+                        if ui.button(tr("loginform.button.settings.notices")).clicked() {
+                            self.show_notices_window = true;
+                            self.show_settings_menu = false;
+                            if self.notice_list.is_empty() && !self.notices_loading {
+                                self.refresh_notices();
+                            }
+                        }
+                    });
+                });
+        }
+
+        if self.settings.notices_enabled && !self.show_notices_window {
+            let visible = self.visible_notice_indices();
+            if let Some(index) = visible
+                .get(self.notice_index % visible.len().max(1))
+                .copied()
+            {
+                let notice = self.notice_list[index].clone();
+                let mut action = None;
+                egui::Area::new(Id::unique("legacy_notice_card"))
+                    .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-12.0, -48.0))
+                    .order(egui::Order::Middle)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_max_width(330.0);
+                                ui.horizontal(|ui| {
+                                    ui.strong(if notice.promoted {
+                                        "Suggested"
+                                    } else {
+                                        "Notice"
+                                    });
+                                    if ui.small_button("All notices").clicked() {
+                                        self.show_notices_window = true;
+                                    }
+                                });
+                                ui.separator();
+                                if let Some(texture) = self.notice_images.get(&notice.id) {
+                                    let size = texture.size_vec2();
+                                    if size.x > 0.0 && size.y > 0.0 {
+                                        let scale = (300.0 / size.x).min(120.0 / size.y).min(1.0);
+                                        ui.image((texture.id(), size * scale));
+                                    }
+                                }
+                                ui.label(&notice.text);
+                                ui.add_space(5.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(notice_action) = notice.action.clone() {
+                                        let label = match &notice_action {
+                                            notices::NoticeAction::Url { label, .. }
+                                            | notices::NoticeAction::Scene { label, .. }
+                                            | notices::NoticeAction::Launcher { label, .. }
+                                            | notices::NoticeAction::Server { label, .. } => label,
+                                        };
+                                        if ui.button(label).clicked() {
+                                            action = Some(notice_action);
+                                        }
+                                    }
+                                    if ui.small_button("Hide for a week").clicked() {
+                                        self.hide_notice_for_week(&notice.id);
+                                    }
+                                    if visible.len() > 1 && ui.small_button("Next").clicked() {
+                                        self.notice_index = self.notice_index.saturating_add(1);
+                                    }
+                                });
+                            });
+                    });
+                if let Some(action) = action {
+                    self.perform_notice_action(action, ctx);
+                }
+            } else if self.notices_loading || self.bootstrap_loading {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+
+        if self.show_notices_window {
+            let visible = self.visible_notice_indices();
+            let mut open = true;
+            let mut action = None;
+            egui::Window::new("Notices")
+                .open(&mut open)
+                .default_size([540.0, 430.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    let was_enabled = self.settings.notices_enabled;
+                    let notices_changed = ui
+                        .checkbox(&mut self.settings.notices_enabled, "Show notices")
+                        .changed();
+                    let mut changed = notices_changed;
+                    if notices_changed && !was_enabled && self.settings.notices_enabled {
+                        self.refresh_notices();
+                    }
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.promoted_notices_enabled,
+                            "Show promoted suggestions",
+                        )
+                        .changed();
+                    if changed {
+                        self.persist();
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!self.notices_loading, egui::Button::new("Refresh"))
+                            .clicked()
+                        {
+                            self.refresh_notices();
+                        }
+                        if self.notices_loading || self.bootstrap_loading {
+                            ui.spinner();
+                            ui.label("Loading notices…");
+                        }
+                        if ui.button("Restore hidden notices").clicked() {
+                            self.settings.hidden_notices_until.clear();
+                            self.notice_index = 0;
+                            self.persist();
+                        }
+                    });
+                    if let Some(error) = &self.notice_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                    if let Some(error) = &self.bootstrap_error {
+                        ui.colored_label(
+                            Color32::LIGHT_RED,
+                            tr("notices.bootstrap.error").replace("%0", error),
+                        );
+                    }
+                    ui.separator();
+                    if self.notice_list.is_empty()
+                        && !self.notices_loading
+                        && !self.bootstrap_loading
+                    {
+                        ui.label("No notices were returned for the US English locale.");
+                    }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for index in visible {
+                            let notice = self.notice_list[index].clone();
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(if notice.promoted {
+                                        "Suggested"
+                                    } else {
+                                        "Notice"
+                                    });
+                                    ui.label(format!("ID {}", notice.id));
+                                    if ui.small_button("Hide for a week").clicked() {
+                                        self.hide_notice_for_week(&notice.id);
+                                    }
+                                });
+                                if let Some(texture) = self.notice_images.get(&notice.id) {
+                                    let size = texture.size_vec2();
+                                    if size.x > 0.0 && size.y > 0.0 {
+                                        let scale = (420.0 / size.x).min(200.0 / size.y).min(1.0);
+                                        ui.image((texture.id(), size * scale));
+                                    }
+                                }
+                                ui.label(&notice.text);
+                                if let Some(notice_action) = notice.action.clone() {
+                                    let label = match &notice_action {
+                                        notices::NoticeAction::Url { label, .. }
+                                        | notices::NoticeAction::Scene { label, .. }
+                                        | notices::NoticeAction::Launcher { label, .. }
+                                        | notices::NoticeAction::Server { label, .. } => label,
+                                    };
+                                    if ui.button(label).clicked() {
+                                        action = Some(notice_action);
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            self.show_notices_window = open;
+            if let Some(action) = action {
+                self.perform_notice_action(action, ctx);
+            }
+        }
+
+        if let Some(pending) = self.pending_promoted_server.clone() {
+            let installed_versions: HashSet<String> =
+                self.installed_versions().into_iter().collect();
+            let mut open = true;
+            let mut cancelled = false;
+            let mut selected_version = None;
+            egui::Window::new("Choose a Minecraft version")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Choose a version for {}", pending.server.name));
+                    if ui
+                        .button(format!("Current version ({})", pending.current_version))
+                        .clicked()
+                    {
+                        selected_version = Some(pending.current_version.clone());
+                    }
+                    for version in &pending.family_versions {
+                        let suffix = if installed_versions.contains(version) {
+                            " (installed)"
+                        } else {
+                            ""
+                        };
+                        if ui.button(format!("{version}{suffix}")).clicked() {
+                            selected_version = Some(version.clone());
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            if !open || cancelled {
+                self.pending_promoted_server = None;
+            }
+            if let Some(version) = selected_version {
+                self.settings.selected_version = version;
+                self.persist();
+                self.pending_promoted_server = None;
+                self.start_selected_game_on_server(Some(pending.server));
+            }
+        }
+
+        if self.show_log_window {
+            let game_directory =
+                self.game_data_directory_for_version(&self.settings.selected_version);
+            let log_files = list_recent_logs(&game_directory);
+            if self
+                .selected_log_path
+                .as_ref()
+                .is_none_or(|path| !log_files.iter().any(|(candidate, _)| candidate == path))
+            {
+                self.selected_log_path = log_files.first().map(|(path, _)| path.clone());
+            }
+            let mut selected = self.selected_log_path.clone();
+            let mut open = true;
+            let mut copy_text = None;
+            egui::Window::new("Minecraft logs")
+                .open(&mut open)
+                .default_size([760.0, 520.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Open logs folder").clicked() {
+                            let directory = game_directory.join("logs");
+                            let _ = fs::create_dir_all(&directory);
+                            open_path(&directory);
+                        }
+                        if ui.button("Open crash reports folder").clicked() {
+                            let directory = game_directory.join("crash-reports");
+                            let _ = fs::create_dir_all(&directory);
+                            open_path(&directory);
+                        }
+                        ui.label(format!("{} file(s)", log_files.len()));
+                    });
+                    ui.separator();
+                    ui.columns(2, |columns| {
+                        columns[0].set_min_width(220.0);
+                        egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
+                            if log_files.is_empty() {
+                                ui.label("No log or crash report files were found.");
+                            }
+                            for (path, modified) in &log_files {
+                                let age = SystemTime::now()
+                                    .duration_since(*modified)
+                                    .unwrap_or_default();
+                                let age_label = if age.as_secs() < 60 {
+                                    format!("{}s ago", age.as_secs())
+                                } else if age.as_secs() < 3_600 {
+                                    format!("{}m ago", age.as_secs() / 60)
+                                } else if age.as_secs() < 86_400 {
+                                    format!("{}h ago", age.as_secs() / 3_600)
+                                } else {
+                                    format!("{}d ago", age.as_secs() / 86_400)
+                                };
+                                let label = format!(
+                                    "{}  ·  {age_label}",
+                                    path.file_name()
+                                        .map(|name| name.to_string_lossy())
+                                        .unwrap_or_default()
+                                );
+                                ui.selectable_value(&mut selected, Some(path.clone()), label);
+                            }
+                        });
+                        columns[1].vertical(|ui| {
+                            if let Some(path) = &selected {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                    );
+                                    if ui.small_button("Open file").clicked() {
+                                        open_path(path);
+                                    }
+                                    if ui.small_button("Copy log").clicked() {
+                                        copy_text = read_log_tail(path);
+                                    }
+                                });
+                                let mut text = read_log_tail(path)
+                                    .unwrap_or_else(|| "Could not read this log file.".to_owned());
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut text)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(24)
+                                            .interactive(false),
+                                    );
+                                });
+                            } else {
+                                ui.label("Select a log file to preview it.");
+                            }
+                        });
+                    });
+                });
+            self.show_log_window = open;
+            self.selected_log_path = selected;
+            if let Some(text) = copy_text {
+                ctx.copy_text(text);
+                self.status = "Copied the selected log to the clipboard.".to_owned();
+            }
+        }
+
+        if self.show_account_dialog {
+            let editing = self.editing_account.is_some();
+            let title = if editing {
+                "Edit offline account"
+            } else {
+                "Add offline account"
+            };
+            egui::Window::new(title)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Enter a player name for offline play.");
+                    ui.add_space(6.0);
+                    ui.text_edit_singleline(&mut self.new_account);
+                    if !valid_plain_name(self.new_account.trim()) {
+                        ui.checkbox(
+                            &mut self.new_account_allow_invalid,
+                            "Allow a non-standard player name",
+                        );
+                    }
+                    ui.checkbox(&mut self.new_account_ely_skins, "Use Ely.by skins");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.show_account_dialog = false;
+                            self.editing_account = None;
+                        }
+                        let save_label = if editing {
+                            "Save account"
+                        } else {
+                            "Add account"
+                        };
+                        if ui.button(save_label).clicked() {
+                            let name = self.new_account.trim().to_owned();
+                            if !name.is_empty()
+                                && (valid_plain_name(&name) || self.new_account_allow_invalid)
+                            {
+                                let old_name = self.editing_account.take();
+                                let collision = old_name.as_ref().is_some_and(|old_name| {
+                                    old_name != &name
+                                        && self.settings.accounts.iter().any(|saved| {
+                                            !saved.eq_ignore_ascii_case(old_name)
+                                                && saved.eq_ignore_ascii_case(&name)
+                                        })
+                                });
+                                if collision {
+                                    self.editing_account = old_name;
+                                    self.status =
+                                        "An offline account with that name already exists."
+                                            .to_owned();
+                                } else {
+                                    if let Some(old_name) = old_name {
+                                        if old_name != name {
+                                            let preserved_uuid =
+                                                offline_account_uuid_for(&self.settings, &old_name);
+                                            self.settings.offline_account_uuids.retain(
+                                                |saved, _| !saved.eq_ignore_ascii_case(&old_name),
+                                            );
+                                            self.settings.offline_ely_skins.retain(
+                                                |saved, _| !saved.eq_ignore_ascii_case(&old_name),
+                                            );
+                                            if let Some(uuid) = preserved_uuid {
+                                                self.settings
+                                                    .offline_account_uuids
+                                                    .insert(name.clone(), uuid);
+                                            }
+                                            self.settings
+                                                .offline_ely_skins
+                                                .insert(name.clone(), self.new_account_ely_skins);
+                                            if let Some(saved) =
+                                                self.settings.accounts.iter_mut().find(|saved| {
+                                                    saved.eq_ignore_ascii_case(&old_name)
+                                                })
+                                            {
+                                                *saved = name.clone();
+                                            }
+                                        }
+                                    } else if !self
+                                        .settings
+                                        .accounts
+                                        .iter()
+                                        .any(|account| account.eq_ignore_ascii_case(&name))
+                                    {
+                                        self.settings.accounts.push(name.clone());
+                                    }
+                                    self.settings
+                                        .offline_ely_skins
+                                        .insert(name.clone(), self.new_account_ely_skins);
+                                    self.settings.selected_account = Some(name);
+                                    self.show_account_dialog = false;
+                                    self.persist();
+                                }
+                            } else {
+                                self.status = if name.is_empty() {
+                                    "Enter a player name.".to_owned()
+                                } else {
+                                    "Enable non-standard names to use characters outside the usual Minecraft name format.".to_owned()
+                                };
+                            }
+                        }
+                    });
+                });
+        }
+
+        if self.show_ely_dialog {
+            let mut open = true;
+            egui::Window::new("Add Ely.by account")
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Continue in your browser to authorize Legacy Launcher with Ely.by.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let cancel_label = if self.ely_signin_pending {
+                            "Cancel sign-in"
+                        } else {
+                            "Cancel"
+                        };
+                        if ui.button(cancel_label).clicked() {
+                            if self.ely_signin_pending {
+                                self.cancel_requested.store(true, Ordering::Release);
+                                self.status = "Cancelling Ely.by sign-in…".to_owned();
+                            } else {
+                                self.show_ely_dialog = false;
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.ely_signin_pending
+                                    && !self.microsoft_signin_pending
+                                    && !self.ely_legacy_signin_pending
+                                    && !self.launching,
+                                egui::Button::new("Continue in browser"),
+                            )
+                            .clicked()
+                        {
+                            self.start_ely_sign_in();
+                        }
+                        if self.ely_signin_pending {
+                            ui.spinner();
+                        }
+                    });
+                });
+            if !open && self.ely_signin_pending {
+                self.cancel_requested.store(true, Ordering::Release);
+            } else if !open {
+                self.show_ely_dialog = false;
+            }
+        }
+
+        if self.show_ely_legacy_dialog {
+            let mut open = true;
+            egui::Window::new("Add Ely.by Legacy account")
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Sign in with your Ely.by username or e-mail and password.");
+                    ui.add_space(6.0);
+                    ui.label("Username or e-mail");
+                    ui.text_edit_singleline(&mut self.ely_legacy_username);
+                    ui.label("Password");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ely_legacy_password).password(true),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let cancel_label = if self.ely_legacy_signin_pending {
+                            "Cancel sign-in"
+                        } else {
+                            "Cancel"
+                        };
+                        if ui.button(cancel_label).clicked() {
+                            if self.ely_legacy_signin_pending {
+                                self.cancel_requested.store(true, Ordering::Release);
+                                self.status = "Cancelling Ely.by sign-in…".to_owned();
+                            } else {
+                                self.show_ely_legacy_dialog = false;
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.ely_legacy_signin_pending && !self.launching,
+                                egui::Button::new("Sign in"),
+                            )
+                            .clicked()
+                        {
+                            self.start_ely_legacy_sign_in();
+                        }
+                        if self.ely_legacy_signin_pending {
+                            ui.spinner();
+                        }
+                    });
+                });
+            if !open && self.ely_legacy_signin_pending {
+                self.cancel_requested.store(true, Ordering::Release);
+            } else if !open {
+                self.show_ely_legacy_dialog = false;
+            }
+        }
+
+        if self.show_minecraft_profile_dialog {
+            let mut open = true;
+            egui::Window::new("Create Minecraft profile")
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("This Microsoft account owns Minecraft but has no profile yet.");
+                    ui.label("Choose a unique Minecraft profile name to finish sign-in.");
+                    ui.add_space(6.0);
+                    ui.text_edit_singleline(&mut self.new_minecraft_profile_name);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.profile_creation_pending,
+                                egui::Button::new("Cancel"),
+                            )
+                            .clicked()
+                        {
+                            self.show_minecraft_profile_dialog = false;
+                            self.pending_minecraft_profile = None;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.profile_creation_pending,
+                                egui::Button::new("Create profile"),
+                            )
+                            .clicked()
+                        {
+                            self.start_minecraft_profile_creation();
+                        }
+                        if self.profile_creation_pending {
+                            ui.spinner();
+                        }
+                    });
+                });
+            if !open && !self.profile_creation_pending {
+                self.show_minecraft_profile_dialog = false;
+                self.pending_minecraft_profile = None;
+            }
+        }
+
+        if let Some(title) = self.settings_page {
+            if title == "Manage servers" {
+                let root = self.game_root_for_version(&self.settings.selected_version);
+                if self.server_list_root.as_deref() != Some(root.as_path()) {
+                    self.load_server_list(root);
+                }
+            }
+            let mut open = true;
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([520.0, 500.0])
+                .show(ctx, |ui| match title {
+                    "Launcher & game preferences" => {
+                        ui.label("Language: English (US)");
+                        ui.separator();
+                        ui.label("Minecraft folder");
+                        ui.horizontal(|ui| {
+                            let path = ui.text_edit_singleline(&mut self.settings.game_directory);
+                            if path.changed()
+                                && PathBuf::from(self.settings.game_directory.trim()).is_absolute()
+                            {
+                                self.persist();
+                            }
+                            if ui.small_button("Default").clicked() {
+                                self.settings.game_directory =
+                                    default_game_directory().to_string_lossy().into_owned();
+                                self.persist();
+                            }
+                            if ui.small_button("Open").clicked() {
+                                open_path(&self.game_dir_path());
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(tr("launcher.window.size"));
+                            let mut changed = false;
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.settings.launcher_window_width)
+                                        .range(540..=7680)
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                            ui.label("×");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.settings.launcher_window_height)
+                                        .range(360..=4320)
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                            if changed {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                    Vec2::new(
+                                        self.settings.launcher_window_width as f32,
+                                        self.settings.launcher_window_height as f32,
+                                    ),
+                                ));
+                                self.persist();
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.client.gamedir.separate.label"));
+                            ComboBox::from_id_salt("separate_game_directories")
+                                .selected_text(tr(match self.settings.separate_game_directories {
+                                    SeparateDirs::Family => {
+                                        "settings.client.gamedir.separatedirs.family"
+                                    }
+                                    SeparateDirs::Version => {
+                                        "settings.client.gamedir.separatedirs.version"
+                                    }
+                                    SeparateDirs::None => {
+                                        "settings.client.gamedir.separatedirs.none"
+                                    }
+                                }))
+                                .show_ui(ui, |ui| {
+                                    for (mode, key) in [
+                                        (
+                                            SeparateDirs::Family,
+                                            "settings.client.gamedir.separatedirs.family",
+                                        ),
+                                        (
+                                            SeparateDirs::Version,
+                                            "settings.client.gamedir.separatedirs.version",
+                                        ),
+                                        (
+                                            SeparateDirs::None,
+                                            "settings.client.gamedir.separatedirs.none",
+                                        ),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.separate_game_directories,
+                                                mode,
+                                                tr(key),
+                                            )
+                                            .changed()
+                                        {
+                                            self.persist();
+                                        }
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.launch-action.label"));
+                            ComboBox::from_id_salt("launch_action")
+                                .selected_text(tr(launch_action_label_key(
+                                    &self.settings.launch_action,
+                                )))
+                                .show_ui(ui, |ui| {
+                                    for (value, key) in [
+                                        ("hide", "settings.launch-action.hide"),
+                                        ("exit", "settings.launch-action.exit"),
+                                        ("nothing", "settings.launch-action.nothing"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.launch_action,
+                                                value.to_owned(),
+                                                tr(key),
+                                            )
+                                            .changed()
+                                        {
+                                            self.persist();
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.separator();
+                        if ui
+                            .checkbox(
+                                &mut self.settings.promoted_servers_in_game,
+                                tr("settings.promotion.ingame"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label(tr("settings.promotion.ingame.hint"));
+                        if ui
+                            .checkbox(
+                                &mut self.settings.remove_undesirable_mods,
+                                tr("settings.mods.remove-undesirable"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label(tr("settings.mods.remove-undesirable.hint"));
+                        if ui
+                            .checkbox(
+                                &mut self.settings.delete_patchy,
+                                tr("settings.patchy.fix"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label(tr("settings.patchy.fix.hint"));
+                        ui.separator();
+                        ui.label("Memory allocation");
+                        let mut memory_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Minimum");
+                            memory_changed |= ui
+                                .text_edit_singleline(&mut self.settings.min_memory)
+                                .changed();
+                            ui.label("Maximum");
+                            memory_changed |= ui
+                                .text_edit_singleline(&mut self.settings.max_memory)
+                                .changed();
+                        });
+                        let min_memory = parse_memory_size(&self.settings.min_memory);
+                        let max_memory = parse_memory_size(&self.settings.max_memory);
+                        if let (Some(min), Some(max)) = (min_memory, max_memory) {
+                            if min <= max {
+                                if memory_changed {
+                                    self.persist();
+                                }
+                            } else {
+                                ui.colored_label(
+                                    Color32::LIGHT_RED,
+                                    "Minimum memory must not exceed maximum memory.",
+                                );
+                            }
+                        } else {
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                "Use values such as 512M or 2G for memory.",
+                            );
+                        }
+
+                        ui.separator();
+                        if ui
+                            .checkbox(&mut self.settings.fullscreen, "Start in fullscreen")
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        let mut display_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Window size");
+                            display_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.settings.screen_width)
+                                        .range(320..=7680)
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                            ui.label("×");
+                            display_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.settings.screen_height)
+                                        .range(240..=4320)
+                                        .suffix(" px"),
+                                )
+                                .changed();
+                        });
+                        if display_changed {
+                            self.persist();
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.gpu.label"));
+                            ComboBox::from_id_salt("gpu_preference")
+                                .selected_text(tr(match self.settings.gpu_preference.as_str() {
+                                    "system" => "settings.gpu.default.label",
+                                    "integrated" => "settings.gpu.integrated.label",
+                                    _ => "settings.gpu.discrete.label",
+                                }))
+                                .show_ui(ui, |ui| {
+                                    for (preference, key) in [
+                                        ("system", "settings.gpu.default.label"),
+                                        ("integrated", "settings.gpu.integrated.label"),
+                                        ("discrete", "settings.gpu.discrete.label"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.gpu_preference,
+                                                preference.to_owned(),
+                                                tr(key),
+                                            )
+                                            .changed()
+                                        {
+                                            self.persist();
+                                        }
+                                    }
+                                });
+                        });
+                        if ui
+                            .checkbox(
+                                &mut self.settings.windows_gpu_performance,
+                                "Apply Windows per-app GPU preference",
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label(tr("settings.jre.window.configure.label"));
+                        ComboBox::from_id_salt("java_mode")
+                            .selected_text(tr(match self.settings.java_mode.as_str() {
+                                "current" => "settings.jre.window.select.current",
+                                "custom" => "settings.jre.window.select.custom",
+                                _ => "settings.jre.window.select.recommended",
+                            }))
+                            .show_ui(ui, |ui| {
+                                for (mode, key) in [
+                                    ("recommended", "settings.jre.window.select.recommended"),
+                                    ("current", "settings.jre.window.select.current"),
+                                    ("custom", "settings.jre.window.select.custom"),
+                                ] {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.java_mode,
+                                            mode.to_owned(),
+                                            tr(key),
+                                        )
+                                        .changed()
+                                    {
+                                        if mode == "recommended" {
+                                            self.settings.java_path.clear();
+                                        }
+                                        self.persist();
+                                    }
+                                }
+                            });
+                        match self.settings.java_mode.as_str() {
+                            "current" => {
+                                ui.label(tr("settings.jre.window.select.current.hint"));
+                                if ui.button("Check current system Java").clicked() {
+                                    match detect_java() {
+                                        Ok((path, version)) => {
+                                            self.status = format!(
+                                                "Found current system Java: {version} at {}",
+                                                path.display()
+                                            );
+                                        }
+                                        Err(error) => self.status = error,
+                                    }
+                                }
+                            }
+                            "custom" => {
+                                ui.label(tr(
+                                    "settings.jre.window.configure.path.custom.placeholder.windows",
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .text_edit_singleline(&mut self.settings.java_path)
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                    if ui.small_button("Detect Java").clicked() {
+                                        match detect_java() {
+                                            Ok((path, version)) => {
+                                                self.settings.java_path =
+                                                    path.to_string_lossy().into_owned();
+                                                self.status = format!(
+                                                    "Found {version} at {}",
+                                                    path.display()
+                                                );
+                                                self.persist();
+                                            }
+                                            Err(error) => self.status = error,
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.label(tr("settings.jre.window.select.recommended.hint"));
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.jre.window.configure.jvm-args.improved"));
+                            ComboBox::from_id_salt("optimized_java_args")
+                                .selected_text(tr(match self.settings.optimized_java_args.as_str() {
+                                    "none" => "settings.jre.window.configure.jvm-args.type.none",
+                                    "g1gc" => "settings.jre.window.configure.jvm-args.type.g1gc",
+                                    "shenandoah" => "settings.jre.window.configure.jvm-args.type.shenandoah",
+                                    "zgc" => "settings.jre.window.configure.jvm-args.type.zgc",
+                                    _ => "settings.jre.window.configure.jvm-args.type.default",
+                                }))
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in [
+                                        ("none", "settings.jre.window.configure.jvm-args.type.none"),
+                                        ("default", "settings.jre.window.configure.jvm-args.type.default"),
+                                        ("g1gc", "settings.jre.window.configure.jvm-args.type.g1gc"),
+                                        ("shenandoah", "settings.jre.window.configure.jvm-args.type.shenandoah"),
+                                        ("zgc", "settings.jre.window.configure.jvm-args.type.zgc"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.optimized_java_args,
+                                                value.to_owned(),
+                                                tr(label),
+                                            )
+                                            .changed()
+                                        {
+                                            self.persist();
+                                        }
+                                    }
+                                });
+                        });
+                        if ui
+                            .checkbox(
+                                &mut self.settings.use_current_trust_store,
+                                tr("settings.jre.window.configure.jvm-args.use-current-trust-store"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.jre.window.configure.wrapper-command"));
+                            if ui
+                                .text_edit_singleline(&mut self.settings.wrapper_command)
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
+                        ui.label(tr("settings.jre.window.configure.wrapper-command.hint"));
+                        ui.separator();
+                        ui.heading("Managed Java runtimes");
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.jre.window.configure.runtime-directory"));
+                            if ui
+                                .text_edit_singleline(&mut self.settings.java_runtime_directory)
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
+                        let game_root = self.game_root_for_version(&self.settings.selected_version);
+                        let runtime_root = if self.settings.java_runtime_directory.trim().is_empty() {
+                            game_root.join("runtime")
+                        } else {
+                            PathBuf::from(self.settings.java_runtime_directory.trim())
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(runtime_root.to_string_lossy());
+                            if ui.small_button("Open folder").clicked() {
+                                if let Err(error) = fs::create_dir_all(&runtime_root) {
+                                    self.status = format!("Could not open Java runtimes folder: {error}");
+                                } else {
+                                    open_path(&runtime_root);
+                                }
+                            }
+                        });
+                        let managed_runtimes = list_managed_java_runtimes(&runtime_root);
+                        if managed_runtimes.is_empty() {
+                            ui.label("No managed Java runtimes are installed yet. Recommended mode downloads the required runtime when you launch a game.");
+                        } else {
+                            ui.label(format!("{} runtime executable(s) found", managed_runtimes.len()));
+                            egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                                for java_path in managed_runtimes.iter().take(12) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(java_path.to_string_lossy()).small());
+                                        if ui.small_button("Use custom").clicked() {
+                                            self.settings.java_path = java_path.to_string_lossy().into_owned();
+                                            self.settings.java_mode = "custom".to_owned();
+                                            self.persist();
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        let installed_game_data = self
+                            .game_data_directory_for_version(&self.settings.selected_version)
+                            .join("gameData.json");
+                        if let Ok(bytes) = fs::read(installed_game_data)
+                            && let Ok(game_data) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                            && let Some(java_path) = game_data
+                                .get("minecraftJava")
+                                .and_then(|java| java.get("path"))
+                                .and_then(serde_json::Value::as_str)
+                        {
+                            let major = game_data
+                                .get("minecraftJava")
+                                .and_then(|java| java.get("majorVersion"))
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|major| major.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned());
+                            ui.label(
+                                tr("settings.jre.window.configure.path.recommended.actual.hint.0")
+                                    .replace("%0", &self.settings.selected_version)
+                                    .replace("%1", &major),
+                            );
+                            ui.label(RichText::new(java_path).small());
+                            ui.label(
+                                tr("settings.jre.window.configure.path.recommended.actual.hint.1"),
+                            );
+                        }
+                        ui.separator();
+                        ui.label("Mod loader");
+                        let loader_labels = [
+                            ("none", "Vanilla"),
+                            ("forge", "Forge"),
+                            ("neoforge", "NeoForge"),
+                            ("fabric", "Fabric"),
+                            ("legacyfabric", "LegacyFabric"),
+                            ("quilt", "Quilt"),
+                        ];
+                        ComboBox::from_id_salt("loader_type")
+                            .selected_text(
+                                loader_labels
+                                    .iter()
+                                    .find(|(value, _)| *value == self.settings.loader_type)
+                                    .map(|(_, label)| *label)
+                                    .unwrap_or("Vanilla"),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (value, label) in loader_labels {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.settings.loader_type,
+                                            value.to_owned(),
+                                            label,
+                                        )
+                                        .changed()
+                                    {
+                                        self.persist();
+                                    }
+                                }
+                            });
+                        if self.settings.loader_type != "none" {
+                            ui.horizontal(|ui| {
+                                ui.label("Loader build");
+                                if ui
+                                    .text_edit_singleline(&mut self.settings.loader_build)
+                                    .changed()
+                                {
+                                    self.persist();
+                                }
+                            });
+                            ui.label("Use latest, recommended, or an exact loader build.");
+                        }
+                        ui.separator();
+                        ui.label("JVM arguments");
+                        if ui
+                            .text_edit_singleline(&mut self.settings.jvm_args)
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label("Game arguments");
+                        if ui
+                            .text_edit_singleline(&mut self.settings.game_args)
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.separator();
+                        ui.heading("Import Java launcher settings");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .text_edit_singleline(&mut self.settings.legacy_config_path)
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                            if ui.small_button("Import settings").clicked() {
+                                let path = if self.settings.legacy_config_path.trim().is_empty() {
+                                    default_legacy_config_path()
+                                } else {
+                                    PathBuf::from(self.settings.legacy_config_path.trim())
+                                };
+                                match import_legacy_settings(&path, &mut self.settings) {
+                                    Ok(summary) => {
+                                        self.status = format!(
+                                            "Imported {} supported setting(s); {} value(s) could not be converted.",
+                                            summary.applied, summary.skipped
+                                        );
+                                        self.persist();
+                                    }
+                                    Err(error) => {
+                                        self.status = format!(
+                                            "Could not import Java launcher settings: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        if ui.small_button("Use default Java config path").clicked() {
+                            self.settings.legacy_config_path =
+                                default_legacy_config_path().to_string_lossy().into_owned();
+                            self.persist();
+                        }
+                        ui.label("Imports game folder, folder separation, launch action, display, GPU, Java and argument settings.");
+                    }
+                    "Manage versions" => {
+                        self.show_version_manager(ui);
+                    }
+                    "Manage accounts" => {
+                        ui.heading("Import accounts from the Java launcher");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.settings.legacy_profiles_path);
+                            if ui.small_button("Import").clicked() {
+                                let path = if self.settings.legacy_profiles_path.trim().is_empty() {
+                                    self.game_dir_path().join("tlauncher_profiles.json")
+                                } else {
+                                    PathBuf::from(self.settings.legacy_profiles_path.trim())
+                                };
+                                match import_legacy_accounts(&path, &mut self.settings) {
+                                    Ok(summary) => {
+                                        self.status = format!(
+                                            "Imported {} offline, {} Microsoft, {} Ely.by, and {} Ely.by Legacy account(s); migrated {} old Mojang profile(s) to offline play. Sign in with Microsoft for online play. Skipped {} unsupported or invalid account(s).",
+                                            summary.offline,
+                                            summary.microsoft,
+                                            summary.ely,
+                                            summary.ely_legacy,
+                                            summary.mojang_migrated,
+                                            summary.skipped
+                                        );
+                                        self.persist();
+                                    }
+                                    Err(error) => {
+                                        self.status = format!("Could not import accounts: {error}");
+                                    }
+                                }
+                            }
+                        });
+                        if self.settings.legacy_profiles_path.trim().is_empty() {
+                            ui.label(
+                                RichText::new("Default: <Minecraft folder>/tlauncher_profiles.json")
+                                    .small(),
+                            );
+                        }
+                        ui.separator();
+                        if self.settings.accounts.is_empty()
+                            && self.settings.microsoft_accounts.is_empty()
+                                            && self.settings.ely_accounts.is_empty()
+                            && self.settings.ely_legacy_accounts.is_empty()
+                        {
+                            ui.label(tr("account.empty"));
+                        }
+                        let accounts = self.settings.accounts.clone();
+                        let mut remove_account = None;
+                        for account in accounts {
+                            ui.horizontal(|ui| {
+                                ui.label(&account);
+                                if ui.small_button("Select").clicked() {
+                                    self.settings.selected_account = Some(account.clone());
+                                    self.persist();
+                                }
+                                if ui.small_button("Edit").clicked() {
+                                    self.open_edit_account_dialog(account.clone());
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_account = Some(account.clone());
+                                }
+                            });
+                        }
+                        if let Some(account) = remove_account {
+                            self.settings.accounts.retain(|saved| saved != &account);
+                            self.settings
+                                .offline_account_uuids
+                                .retain(|saved, _| !saved.eq_ignore_ascii_case(&account));
+                            self.settings
+                                .offline_ely_skins
+                                .retain(|saved, _| !saved.eq_ignore_ascii_case(&account));
+                            if self.settings.selected_account.as_deref() == Some(&account) {
+                                self.settings.selected_account = self.first_account_key();
+                            }
+                            self.persist();
+                        }
+                        let microsoft_accounts = self.settings.microsoft_accounts.clone();
+                        let mut remove_microsoft_account = None;
+                        for account in microsoft_accounts {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} (Microsoft)", account.username));
+                                if ui.small_button("Select").clicked() {
+                                    self.settings.selected_account = Some(account.id.clone());
+                                    self.persist();
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_microsoft_account = Some(account);
+                                }
+                            });
+                        }
+                        if let Some(account) = remove_microsoft_account {
+                            match vault::remove_account(&account.storage_key()) {
+                                Ok(()) => {
+                                    self.settings
+                                        .microsoft_accounts
+                                        .retain(|saved| saved.id != account.id);
+                                    if self.settings.selected_account.as_deref()
+                                        == Some(&account.id)
+                                    {
+                                        self.settings.selected_account = self.first_account_key();
+                                    }
+                                    self.persist();
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Could not remove saved Microsoft credentials: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        let ely_accounts = self.settings.ely_accounts.clone();
+                        let mut remove_ely_account = None;
+                        for account in ely_accounts {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} (Ely.by)", account.display_name));
+                                if ui.small_button("Select").clicked() {
+                                    self.settings.selected_account = Some(account.id.clone());
+                                    self.persist();
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_ely_account = Some(account);
+                                }
+                            });
+                        }
+                        if let Some(account) = remove_ely_account {
+                            match vault::remove_account(&account.storage_key()) {
+                                Ok(()) => {
+                                    self.settings
+                                        .ely_accounts
+                                        .retain(|saved| saved.id != account.id);
+                                    if self.settings.selected_account.as_deref()
+                                        == Some(&account.id)
+                                    {
+                                        self.settings.selected_account = self.first_account_key();
+                                    }
+                                    self.persist();
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Could not remove saved Ely.by credentials: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        let ely_legacy_accounts = self.settings.ely_legacy_accounts.clone();
+                        let mut remove_ely_legacy_account = None;
+                        for account in ely_legacy_accounts {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} (Ely.by Legacy)", account.display_name));
+                                if ui.small_button("Select").clicked() {
+                                    self.settings.selected_account = Some(account.id.clone());
+                                    self.persist();
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_ely_legacy_account = Some(account);
+                                }
+                            });
+                        }
+                        if let Some(account) = remove_ely_legacy_account {
+                            match vault::remove_account(&account.storage_key()) {
+                                Ok(()) => {
+                                    self.settings
+                                        .ely_legacy_accounts
+                                        .retain(|saved| saved.id != account.id);
+                                    if self.settings.selected_account.as_deref()
+                                        == Some(&account.id)
+                                    {
+                                        self.settings.selected_account = self.first_account_key();
+                                    }
+                                    self.persist();
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Could not remove saved Ely.by credentials: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        if ui.button("Add offline account…").clicked() {
+                            self.open_account_dialog();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.microsoft_signin_pending
+                                    && !self.ely_signin_pending
+                                    && !self.ely_legacy_signin_pending
+                                    && !self.launching,
+                                egui::Button::new("Add Microsoft account…"),
+                            )
+                            .clicked()
+                        {
+                            self.start_microsoft_sign_in();
+                        }
+                        if self.microsoft_signin_pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Complete sign-in in your browser…");
+                            });
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.microsoft_signin_pending
+                                    && !self.ely_signin_pending
+                                    && !self.ely_legacy_signin_pending
+                                    && !self.launching,
+                                egui::Button::new("Add Ely.by account…"),
+                            )
+                            .clicked()
+                        {
+                            self.show_ely_dialog = true;
+                        }
+                        if self.ely_signin_pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Complete Ely.by sign-in in your browser…");
+                            });
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.microsoft_signin_pending
+                                    && !self.ely_signin_pending
+                                    && !self.ely_legacy_signin_pending
+                                    && !self.launching,
+                                egui::Button::new("Add Ely.by Legacy account…"),
+                            )
+                            .clicked()
+                        {
+                            self.open_ely_legacy_dialog();
+                        }
+                        if self.ely_legacy_signin_pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Signing in to Ely.by…");
+                            });
+                        }
+                    }
+                    "Manage servers" => {
+                        ui.heading("Minecraft servers");
+                        ui.label("Save server addresses here, then use Quick play to connect with the selected Minecraft account.");
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut self.new_server_name);
+                            ui.label("Address");
+                            ui.text_edit_singleline(&mut self.new_server_address);
+                            if ui.button("Add server").clicked() {
+                                let name = self.new_server_name.trim().to_owned();
+                                let address = parse_server_address(&self.new_server_address)
+                                    .map(|(_, _, full_address)| full_address);
+                                if valid_server_name(&name) && address.is_some() {
+                                    let address = address.unwrap_or_default();
+                                    if !self.server_list.iter().any(|saved| {
+                                        parse_server_address(&saved.address)
+                                            .is_some_and(|(_, _, existing)| existing.eq_ignore_ascii_case(&address))
+                                    }) {
+                                        self.server_list.push(SavedServer {
+                                            name,
+                                            address,
+                                            ..Default::default()
+                                        });
+                                        self.new_server_name.clear();
+                                        self.new_server_address.clear();
+                                        self.persist_server_list();
+                                    } else {
+                                        self.status = "That server address is already saved.".to_owned();
+                                    }
+                                } else {
+                                    self.status = "Enter a server name and a valid host or host:port address.".to_owned();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if self.server_list.is_empty() {
+                            ui.label("No servers have been saved.");
+                        }
+                        let mut remove_server = None;
+                        let mut quick_play_server = None;
+                        let mut server_list_changed = false;
+                        for (index, server) in self.server_list.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                server_list_changed |= ui.text_edit_singleline(&mut server.name).changed();
+                                server_list_changed |= ui.text_edit_singleline(&mut server.address).changed();
+                                if ui.button("Quick play").clicked() {
+                                    quick_play_server = Some(server.clone());
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove_server = Some(index);
+                                }
+                            });
+                        }
+                        if server_list_changed {
+                            self.persist_server_list();
+                        }
+                        if let Some(index) = remove_server {
+                            self.server_list.remove(index);
+                            self.persist_server_list();
+                        }
+                        if let Some(server) = quick_play_server {
+                            self.start_selected_game_on_server(Some(server));
+                        }
+                    }
+                    _ => {}
+                });
+            if !open {
+                self.settings_page = None;
+            }
+        }
+
+        if let Some(version) = self.confirm_remove_version.clone() {
+            let mut close_dialog = false;
+            egui::Window::new("Remove Minecraft version?")
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Remove the installed files for {version}?"));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close_dialog = true;
+                        }
+                        if ui.button("Remove version").clicked() {
+                            let version_root = self
+                                .installed_version_root(&version)
+                                .unwrap_or_else(|| self.game_root_for_version(&version));
+                            match remove_installed_version(&version_root, &version) {
+                                Ok(()) => {
+                                    let invalidated =
+                                        invalidate_game_data_cache(&version_root, &version)
+                                            .unwrap_or(0);
+                                    self.status = if invalidated == 0 {
+                                        format!("Removed Minecraft {version}.")
+                                    } else {
+                                        format!(
+                                            "Removed Minecraft {version} and cleared {invalidated} stale launch cache(s)."
+                                        )
+                                    };
+                                    if self.settings.selected_version == version {
+                                        self.settings.selected_version = self
+                                            .available_versions()
+                                            .into_iter()
+                                            .find(|candidate| candidate != &version)
+                                            .unwrap_or_else(|| "latest_release".to_owned());
+                                        self.persist();
+                                    }
+                                }
+                                Err(error) => {
+                                    self.status = format!("Could not remove version: {error}");
+                                }
+                            }
+                            close_dialog = true;
+                        }
+                    });
+                });
+            if close_dialog {
+                self.confirm_remove_version = None;
+            }
+        }
+
+        if let Some(mut report) = self.crash_report.clone() {
+            let mut open = true;
+            let mut selected_action = None;
+            egui::Window::new("Minecraft crash report")
+                .open(&mut open)
+                .default_size([660.0, 520.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.colored_label(Color32::LIGHT_RED, &report.summary);
+                    if let Some(path) = &report.path {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Log: {}", path.display()));
+                            if ui.small_button("Open file").clicked() {
+                                open_path(path);
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if !report.suggestions.is_empty() {
+                        ui.heading("Crash signature matches");
+                        for suggestion in &report.suggestions {
+                            ui.group(|ui| {
+                                ui.strong(&suggestion.title);
+                                if !suggestion.body.is_empty() {
+                                    ui.label(&suggestion.body);
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    for action in &suggestion.actions {
+                                        match &action.kind {
+                                            crash::CrashActionKind::OpenUrl(url) => {
+                                                ui.hyperlink_to(&action.label, url);
+                                            }
+                                            kind => {
+                                                if ui.small_button(&action.label).clicked() {
+                                                    selected_action = Some(kind.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                        ui.separator();
+                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut report.log)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(18)
+                                    .interactive(false),
+                            );
+                        });
+                });
+            if !open {
+                self.crash_report = None;
+            }
+            if let Some(action) = selected_action {
+                match action {
+                    crash::CrashActionKind::OpenUrl(url) => open_url(&url),
+                    crash::CrashActionKind::OpenFolder(folder) => {
+                        open_crash_folder(&report.game_directory, &folder, &mut self.status);
+                    }
+                    crash::CrashActionKind::OpenLogs => {
+                        self.selected_log_path = report.path.clone();
+                        self.show_log_window = true;
+                    }
+                    crash::CrashActionKind::OpenSettings => {
+                        self.settings_page = Some("Launcher");
+                    }
+                    crash::CrashActionKind::ForceUpdate => {
+                        self.settings.force_update = true;
+                        self.persist();
+                        self.status = "Force update is enabled for the next launch.".to_owned();
+                    }
+                    crash::CrashActionKind::RecommendedJava => {
+                        self.settings.java_mode = "recommended".to_owned();
+                        self.settings.java_path.clear();
+                        self.persist();
+                        self.status =
+                            "Recommended Java will be used on the next launch.".to_owned();
+                    }
+                    crash::CrashActionKind::SetJvmArgument(argument) => {
+                        let current = split_arguments(&self.settings.jvm_args);
+                        if !current.iter().any(|saved| saved == &argument) {
+                            self.settings.jvm_args = if self.settings.jvm_args.trim().is_empty() {
+                                argument.clone()
+                            } else {
+                                format!("{} {argument}", self.settings.jvm_args.trim())
+                            };
+                            self.persist();
+                        }
+                        self.status = format!("Added {argument} to JVM arguments.");
+                    }
+                }
+            }
+        }
+
+        if !self.status.is_empty() {
+            let status = self.status.clone();
+            egui::Area::new(Id::unique("status_toast"))
+                .anchor(Align2::LEFT_BOTTOM, Vec2::new(12.0, -10.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(20, 24, 28, 215))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(status).size(12.0).color(Color32::WHITE));
+                                if (self.launching
+                                    || self.microsoft_signin_pending
+                                    || self.ely_legacy_signin_pending)
+                                    && !self.cancel_requested.load(Ordering::Acquire)
+                                    && ui.small_button("Cancel").clicked()
+                                {
+                                    self.cancel_requested.store(true, Ordering::Release);
+                                    self.status = "Cancelling current operation…".to_owned();
+                                }
+                            });
+                            if let Some(progress) = self.launch_progress {
+                                ui.add(
+                                    egui::ProgressBar::new(progress)
+                                        .desired_width(250.0)
+                                        .show_percentage(),
+                                );
+                            }
+                        });
+                });
+        }
+    }
+}
+
+fn spawn_catalog_fetch() -> Receiver<Result<MojangVersionManifest, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Could not start catalog request: {error}"))
+            .and_then(|runtime| {
+                runtime
+                    .block_on(catalog::fetch_manifest())
+                    .map_err(|error| error)
+            });
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn spawn_bootstrap_fetch() -> Receiver<Result<bootstrap::Configuration, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Could not start bootstrap request: {error}"))
+            .and_then(|runtime| runtime.block_on(bootstrap::fetch()));
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn spawn_diagnostic_upload(report: String) -> Receiver<Result<String, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Could not start diagnostic upload: {error}"))
+            .and_then(|runtime| runtime.block_on(support::upload_diagnostic_report(report)));
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn spawn_notice_fetch(client_id: String) -> Receiver<Result<Vec<notices::Notice>, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Could not start notice request: {error}"))
+            .and_then(|runtime| runtime.block_on(notices::fetch(&client_id)));
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+async fn wait_for_cancel(cancel_requested: Arc<AtomicBool>) {
+    while !cancel_requested.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn make_launch_options(
+    version: String,
+    username: String,
+    path: PathBuf,
+    force_update: bool,
+    preferences: SavedSettings,
+) -> LaunchOptions {
+    make_launch_options_with_authenticator(
+        version,
+        offline_authenticator(username),
+        path,
+        force_update,
+        preferences,
+    )
+}
+
+fn make_launch_options_with_authenticator(
+    version: String,
+    authenticator: Authenticator,
+    path: PathBuf,
+    force_update: bool,
+    preferences: SavedSettings,
+) -> LaunchOptions {
+    let instance = instance_for_version(&version, &preferences);
+    LaunchOptions {
+        path,
+        version,
+        authenticator,
+        timeout_secs: 30,
+        download_concurrency: 8,
+        verify_concurrency: 4,
+        memory: memory_config(&preferences),
+        java: JavaOptions {
+            path: if preferences.java_path.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(preferences.java_path.trim()))
+            },
+            runtime_dir: if preferences.java_runtime_directory.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(
+                    preferences.java_runtime_directory.trim().to_owned(),
+                ))
+            },
+            optimized_args_type: preferences.optimized_java_args.clone(),
+            use_current_trust_store: preferences.use_current_trust_store,
+            wrapper_command: if preferences.wrapper_command.trim().is_empty() {
+                None
+            } else {
+                Some(preferences.wrapper_command.clone())
+            },
+            ..JavaOptions::default()
+        },
+        loader: loader_config(&preferences),
+        screen: ScreenConfig {
+            width: Some(preferences.screen_width.clamp(320, 7680)),
+            height: Some(preferences.screen_height.clamp(240, 4320)),
+            fullscreen: preferences.fullscreen,
+        },
+        verify: force_update,
+        game_args: split_arguments(&preferences.game_args),
+        jvm_args: split_arguments(&preferences.jvm_args),
+        instance,
+        url: None,
+        mcp: None,
+        library_replace_type: None,
+        library_replace_types: vec![],
+        intel_enabled_mac: false,
+        bypass_offline: false,
+        skip_bundle_check: !force_update,
+        force_ipv4: false,
+        dns: None,
+    }
+}
+
+fn append_promoted_server(
+    servers: &mut Vec<SavedServer>,
+    version: &str,
+    family: Option<&str>,
+    label: &str,
+    address: &str,
+    families: &[String],
+) {
+    if !families.is_empty()
+        && !families
+            .iter()
+            .any(|candidate| candidate == version || Some(candidate.as_str()) == family)
+    {
+        return;
+    }
+    let name = label.strip_prefix("Join ").unwrap_or(label).trim();
+    if !valid_server_name(name) || parse_server_address(address).is_none() {
+        return;
+    }
+    if servers.iter().any(|server| {
+        parse_server_address(&server.address)
+            .zip(parse_server_address(address))
+            .is_some_and(|((_, _, left), (_, _, right))| left.eq_ignore_ascii_case(&right))
+    }) {
+        return;
+    }
+    servers.push(SavedServer {
+        name: if name.starts_with("§r") {
+            name.to_owned()
+        } else {
+            format!("§r{name}")
+        },
+        address: address.to_owned(),
+        ..Default::default()
+    });
+}
+
+fn legacy_promoted_version_family(version: &str) -> Option<String> {
+    let bytes = version.as_bytes();
+    let mut cursor = 0;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_lowercase) {
+        cursor += 1;
+    }
+    let major_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == major_start || bytes.get(cursor) != Some(&b'.') {
+        return None;
+    }
+    cursor += 1;
+    let minor_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == minor_start {
+        return None;
+    }
+    let family = &version[..cursor];
+    (family != "26.1").then(|| family.to_owned())
+}
+
+fn valid_server_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control)
+}
+
+fn parse_server_address(address: &str) -> Option<(String, u16, String)> {
+    let address = address.trim();
+    if address.is_empty()
+        || address.len() > 255
+        || address.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || matches!(character, '/' | '\\')
+        })
+    {
+        return None;
+    }
+
+    let (host, port) = if let Some(ipv6) = address.strip_prefix('[') {
+        let (host, suffix) = ipv6.split_once(']')?;
+        if host.is_empty() || !host.contains(':') {
+            return None;
+        }
+        let port = if suffix.is_empty() {
+            25565
+        } else {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?
+        };
+        if port == 0 {
+            return None;
+        }
+        (format!("[{host}]"), port)
+    } else if address.matches(':').count() == 1 {
+        let (host, port) = address.rsplit_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        if host.is_empty() || port == 0 {
+            return None;
+        }
+        (host.to_owned(), port)
+    } else if address.contains(':') {
+        (format!("[{address}]"), 25565)
+    } else {
+        (address.to_owned(), 25565)
+    };
+
+    let raw_host = host.trim_matches(['[', ']']);
+    if raw_host.is_empty()
+        || !raw_host.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':')
+        })
+    {
+        return None;
+    }
+    let full_address = if port == 25565 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    Some((host, port, full_address))
+}
+
+fn selected_version_supports_quick_play(version: &str, game_root: &std::path::Path) -> bool {
+    let version_json = game_root
+        .join("versions")
+        .join(version)
+        .join(format!("{version}.json"));
+    if let Ok(bytes) = fs::read(version_json)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    {
+        let supported = value
+            .get("arguments")
+            .and_then(|arguments| arguments.get("game"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arguments| {
+                arguments.iter().any(|argument| {
+                    argument
+                        .get("rules")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|rules| {
+                            rules.iter().any(|rule| {
+                                rule.get("features")
+                                    .and_then(|features| features.get("is_quick_play_multiplayer"))
+                                    .and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                            })
+                        })
+                })
+            });
+        return supported;
+    }
+
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let minor = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let patch = parts
+        .next()
+        .and_then(|value| {
+            value
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        })
+        .unwrap_or_default();
+    match (major, minor) {
+        (Some(major), _) if major > 1 => true,
+        (Some(1), Some(minor)) if minor > 20 => true,
+        (Some(1), Some(20)) => patch >= 5,
+        _ => false,
+    }
+}
+
+fn append_server_launch_arguments(
+    options: &mut LaunchOptions,
+    address: &str,
+    supports_quick_play: bool,
+) {
+    let Some((host, port, full_address)) = parse_server_address(address) else {
+        return;
+    };
+    if supports_quick_play {
+        options
+            .game_args
+            .extend(["--quickPlayMultiplayer".to_owned(), full_address]);
+    } else {
+        options.game_args.extend(["--server".to_owned(), host]);
+        if port != 25565 {
+            options
+                .game_args
+                .extend(["--port".to_owned(), port.to_string()]);
+        }
+    }
+}
+
+fn read_minecraft_server_list(path: &std::path::Path) -> Result<Vec<SavedServer>, String> {
+    const MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_NBT_BYTES: u64 = 16 * 1024 * 1024;
+    let compressed = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if compressed.len() as u64 > MAX_COMPRESSED_BYTES {
+        return Err("servers.dat is larger than 8 MiB".to_owned());
+    }
+    let decoder = flate2::read::GzDecoder::new(compressed.as_slice());
+    let mut nbt_bytes = Vec::new();
+    decoder
+        .take(MAX_NBT_BYTES + 1)
+        .read_to_end(&mut nbt_bytes)
+        .map_err(|error| format!("Could not decompress {}: {error}", path.display()))?;
+    if nbt_bytes.len() as u64 > MAX_NBT_BYTES {
+        return Err("decompressed servers.dat is larger than 16 MiB".to_owned());
+    }
+    let file: MinecraftServerList = fastnbt::from_bytes(&nbt_bytes)
+        .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+    Ok(file
+        .servers
+        .into_iter()
+        .filter(|server| {
+            valid_server_name(&server.name) && parse_server_address(&server.address).is_some()
+        })
+        .map(|server| SavedServer {
+            name: server.name,
+            address: server.address,
+            hide_address: server.hide_address,
+            accept_textures: server.accept_textures,
+        })
+        .collect())
+}
+
+fn write_minecraft_server_list(
+    path: &std::path::Path,
+    servers: &[SavedServer],
+) -> Result<(), String> {
+    let file = MinecraftServerList {
+        servers: servers
+            .iter()
+            .map(|server| MinecraftServerRecord {
+                name: server.name.clone(),
+                address: server.address.clone(),
+                hide_address: server.hide_address,
+                accept_textures: server.accept_textures,
+            })
+            .collect(),
+    };
+    let nbt_bytes = fastnbt::to_bytes(&file)
+        .map_err(|error| format!("Could not encode Minecraft server list: {error}"))?;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&nbt_bytes)
+        .map_err(|error| format!("Could not compress Minecraft server list: {error}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|error| format!("Could not finish server list compression: {error}"))?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Minecraft server list path has no parent".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    let temporary_path = path_with_suffix(path, ".tmp");
+    let backup_path = path_with_suffix(path, ".bak");
+    fs::write(&temporary_path, compressed)
+        .map_err(|error| format!("Could not write {}: {error}", temporary_path.display()))?;
+
+    let had_original = path.is_file();
+    if had_original {
+        if let Err(error) = fs::copy(path, &backup_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(format!("Could not back up {}: {error}", path.display()));
+        }
+        if let Err(error) = fs::remove_file(path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(format!("Could not replace {}: {error}", path.display()));
+        }
+    }
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        if had_original {
+            let _ = fs::copy(&backup_path, path);
+        }
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!("Could not install {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn prepare_minecraft_server_list(
+    path: &std::path::Path,
+    quick_play_server: Option<&SavedServer>,
+    promoted_servers: &[SavedServer],
+    add_promoted_servers: bool,
+) -> Result<(), String> {
+    let mut existing = read_minecraft_server_list(path).unwrap_or_default();
+    // The Java launcher tags its generated entries with the reset formatting
+    // code so stale promoted records can be removed before rebuilding the list.
+    existing.retain(|server| !server.name.starts_with("§r"));
+
+    let mut merged = Vec::new();
+    let mut seen_addresses = HashSet::new();
+    let mut add_once = |server: SavedServer| {
+        if let Some((_, _, normalized)) = parse_server_address(&server.address) {
+            if seen_addresses.insert(normalized.to_ascii_lowercase()) {
+                merged.push(server);
+            }
+        }
+    };
+
+    if let Some(server) = quick_play_server {
+        add_once(server.clone());
+    }
+    if add_promoted_servers {
+        for promoted in promoted_servers {
+            let Some((_, _, address)) = parse_server_address(&promoted.address) else {
+                continue;
+            };
+            if let Some(index) = existing.iter().position(|saved| {
+                parse_server_address(&saved.address).is_some_and(|(_, _, saved_address)| {
+                    saved_address.eq_ignore_ascii_case(&address)
+                })
+            }) {
+                add_once(existing.remove(index));
+            } else {
+                add_once(promoted.clone());
+            }
+        }
+    }
+    for server in existing {
+        add_once(server);
+    }
+    write_minecraft_server_list(path, &merged)
+}
+
+fn path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn instance_for_version(version: &str, preferences: &SavedSettings) -> Option<String> {
+    let loader = match preferences.loader_type.as_str() {
+        "forge" | "neoforge" | "fabric" | "legacyfabric" | "quilt" => {
+            preferences.loader_type.as_str()
+        }
+        _ => return None,
+    };
+    let version = safe_path_component(version, 48);
+    let build = safe_path_component(&preferences.loader_build, 48);
+    let build = if build.is_empty() {
+        "latest".to_owned()
+    } else {
+        build
+    };
+    Some(format!("{version}-{loader}-{build}"))
+}
+
+fn safe_path_component(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || "._+-".contains(*character))
+        .take(max_chars)
+        .collect()
+}
+
+fn offline_authenticator(username: String) -> Authenticator {
+    offline_authenticator_with_uuid(username, None)
+}
+
+fn offline_authenticator_with_uuid(
+    username: String,
+    preserved_uuid: Option<&str>,
+) -> Authenticator {
+    Authenticator {
+        access_token: "offline".to_owned(),
+        name: username.clone(),
+        uuid: preserved_uuid
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| offline_uuid(&username)),
+        xbox_account: None,
+        user_properties: None,
+        client_id: None,
+        client_token: None,
+    }
+}
+
+fn offline_account_uuid_for(settings: &SavedSettings, username: &str) -> Option<String> {
+    settings
+        .offline_account_uuids
+        .iter()
+        .find(|(saved, _)| saved.eq_ignore_ascii_case(username))
+        .map(|(_, uuid)| uuid.clone())
+}
+
+fn offline_ely_skins_for(settings: &SavedSettings, username: &str) -> bool {
+    settings
+        .offline_ely_skins
+        .iter()
+        .find(|(saved, _)| saved.eq_ignore_ascii_case(username))
+        .map(|(_, enabled)| *enabled)
+        .unwrap_or(true)
+}
+
+async fn authenticate_microsoft_account(
+    account: &MicrosoftAccountProfile,
+) -> Result<Authenticator, String> {
+    let refresh_token = vault::load_refresh_token(&account.storage_key())
+        .map_err(|error| format!("Could not read Microsoft credentials: {error}"))?
+        .ok_or_else(|| {
+            "Microsoft credentials are missing. Sign in to this account again.".to_owned()
+        })?;
+    let authenticated = auth::refresh_sign_in(&refresh_token).await?;
+    vault::store_refresh_token(&account.storage_key(), &authenticated.refresh_token)
+        .map_err(|error| format!("Could not save the refreshed Microsoft credentials: {error}"))?;
+    Ok(authenticated.authenticator)
+}
+
+async fn authenticate_ely_legacy_account(
+    account: &ElyLegacyAccountProfile,
+) -> Result<Authenticator, String> {
+    let stored = vault::load_refresh_token(&account.storage_key())
+        .map_err(|error| format!("Could not read Ely.by credentials: {error}"))?
+        .ok_or_else(|| {
+            "Ely.by credentials are missing. Sign in to this account again.".to_owned()
+        })?;
+    let credentials: ely_legacy::Credentials = serde_json::from_str(&stored)
+        .map_err(|error| format!("Saved Ely.by credentials are invalid: {error}"))?;
+    let (profile, refreshed) = ely_legacy::refresh(&account.username, &credentials).await?;
+    let serialized = serde_json::to_string(&refreshed)
+        .map_err(|error| format!("Could not encode refreshed Ely.by credentials: {error}"))?;
+    vault::store_refresh_token(&account.storage_key(), &serialized)
+        .map_err(|error| format!("Could not save refreshed Ely.by credentials: {error}"))?;
+
+    // LegacyLauncher's ElyLegacyUser exposes Ely's display name as its auth XUID and
+    // reports auth type "msa". The core derives that type from xbox_account presence.
+    Ok(Authenticator {
+        access_token: refreshed.access_token,
+        name: profile.display_name.clone(),
+        uuid: profile.uuid,
+        xbox_account: Some(XboxAccount {
+            xuid: profile.display_name,
+        }),
+        user_properties: None,
+        client_id: None,
+        client_token: Some(refreshed.client_token),
+    })
+}
+
+async fn authenticate_ely_account(account: &ElyAccountProfile) -> Result<Authenticator, String> {
+    let stored = vault::load_refresh_token(&account.storage_key())
+        .map_err(|error| format!("Could not read Ely.by credentials: {error}"))?
+        .ok_or_else(|| {
+            "Ely.by credentials are missing. Sign in to this account again.".to_owned()
+        })?;
+    let credentials: ely::Credentials = serde_json::from_str(&stored)
+        .map_err(|error| format!("Saved Ely.by credentials are invalid: {error}"))?;
+    let (profile, refreshed) = ely::refresh(&credentials).await?;
+    let serialized = serde_json::to_string(&refreshed)
+        .map_err(|error| format!("Could not encode refreshed Ely.by credentials: {error}"))?;
+    vault::store_refresh_token(&account.storage_key(), &serialized)
+        .map_err(|error| format!("Could not save refreshed Ely.by credentials: {error}"))?;
+    Ok(ely::authenticator(profile, refreshed))
+}
+
+fn launch_event_message(event: LaunchEvent) -> Option<String> {
+    match event {
+        LaunchEvent::Progress {
+            downloaded,
+            total,
+            kind,
+        } => {
+            let percent = if total == 0 {
+                0
+            } else {
+                downloaded.saturating_mul(100) / total
+            };
+            Some(format!("Downloading {kind}: {percent}%"))
+        }
+        LaunchEvent::Check {
+            current,
+            total,
+            kind,
+        } => Some(format!("Checking {kind}: {current}/{total}")),
+        LaunchEvent::GameDownloadFinished => Some("Game files ready.".to_owned()),
+        LaunchEvent::Extract(name) => Some(format!("Extracting {name}…")),
+        LaunchEvent::Patch(message) => Some(message),
+        LaunchEvent::Close(code) => Some(format!("Minecraft closed (exit code {code}).")),
+        LaunchEvent::Error(message) => Some(format!("Warning: {message}")),
+        LaunchEvent::Speed(bytes_per_second) => Some(format!(
+            "Download speed: {}",
+            format_data_rate(bytes_per_second)
+        )),
+        LaunchEvent::Estimated(seconds) => Some(format!(
+            "Estimated time remaining: {}",
+            format_duration(seconds)
+        )),
+        LaunchEvent::Data(_) => None,
+    }
+}
+
+fn launch_event_message_or_record(
+    buffer: &Arc<Mutex<VecDeque<String>>>,
+    event: LaunchEvent,
+) -> Option<String> {
+    match event {
+        LaunchEvent::GameDownloadFinished => Some("__GAME_STARTED__".to_owned()),
+        LaunchEvent::Data(line) => {
+            record_game_log_line(buffer, line);
+            None
+        }
+        event => launch_event_message(event),
+    }
+}
+
+fn launch_action_label_key(action: &str) -> &'static str {
+    match action {
+        "hide" => "settings.launch-action.hide",
+        "exit" => "settings.launch-action.exit",
+        _ => "settings.launch-action.nothing",
+    }
+}
+
+fn parse_launch_progress(message: &str) -> Option<f32> {
+    let (_, value) = message.rsplit_once(": ")?;
+    if let Some(percent) = value.strip_suffix('%') {
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|percent| percent.clamp(0.0, 100.0) / 100.0);
+    }
+    let (current, total) = value.split_once('/')?;
+    let current = current.trim().parse::<f32>().ok()?;
+    let total = total.trim().parse::<f32>().ok()?;
+    (total > 0.0).then(|| (current / total).clamp(0.0, 1.0))
+}
+
+fn format_data_rate(bytes_per_second: f64) -> String {
+    if !bytes_per_second.is_finite() || bytes_per_second < 0.0 {
+        return "unknown".to_owned();
+    }
+    if bytes_per_second >= 1024.0 * 1024.0 {
+        format!("{:.1} MiB/s", bytes_per_second / (1024.0 * 1024.0))
+    } else if bytes_per_second >= 1024.0 {
+        format!("{:.0} KiB/s", bytes_per_second / 1024.0)
+    } else {
+        format!("{bytes_per_second:.0} B/s")
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unknown".to_owned();
+    }
+    let seconds = seconds.round() as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn record_game_log_line(buffer: &Arc<Mutex<VecDeque<String>>>, line: String) {
+    if let Ok(mut lines) = buffer.lock() {
+        if lines.len() >= 2500 {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+}
+
+fn collect_crash_report(
+    game_dir: &std::path::Path,
+    game_log: &Arc<Mutex<VecDeque<String>>>,
+    launch_started: SystemTime,
+    version: &str,
+    loader: &str,
+) -> Option<CrashReport> {
+    let cutoff = launch_started
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let report_path = newest_recent_log(&game_dir.join("crash-reports"), cutoff, "txt")
+        .or_else(|| newest_recent_log(&game_dir.join("logs"), cutoff, "log"));
+    let disk_log = report_path.as_ref().and_then(|path| read_log_tail(path));
+    let log = disk_log.unwrap_or_else(|| {
+        game_log
+            .lock()
+            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    });
+    if log.trim().is_empty() {
+        return None;
+    }
+    let mut suggestions = crash::diagnose(&log, version, loader);
+    if suggestions.is_empty() {
+        suggestions = diagnose_crash_fallback(&log)
+            .into_iter()
+            .map(|body| crash::CrashSuggestion {
+                title: "Possible fix".to_owned(),
+                body,
+                actions: Vec::new(),
+            })
+            .collect();
+    }
+    let summary = if let Some(first) = suggestions.first() {
+        format!("Minecraft exited with an error. {}", first.title)
+    } else {
+        "Minecraft exited with an error. Review the captured log below.".to_owned()
+    };
+    Some(CrashReport {
+        path: report_path,
+        game_directory: game_dir.to_path_buf(),
+        summary,
+        suggestions,
+        log,
+    })
+}
+
+fn newest_recent_log(
+    directory: &std::path::Path,
+    cutoff: SystemTime,
+    extension: &str,
+) -> Option<PathBuf> {
+    fs::read_dir(directory)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
+            {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            (modified >= cutoff).then_some((path, modified))
+        })
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)
+}
+
+fn list_managed_java_runtimes(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = HashSet::new();
+    let mut pending = vec![(root.to_path_buf(), 0_u8)];
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > 6 {
+            continue;
+        }
+        if directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("bin"))
+        {
+            for executable in ["javaw.exe", "java.exe", "java"] {
+                let candidate = directory.join(executable);
+                if candidate.is_file() {
+                    found.insert(candidate);
+                    break;
+                }
+            }
+        }
+        if let Ok(entries) = fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push((entry.path(), depth.saturating_add(1)));
+                }
+            }
+        }
+    }
+    let mut runtimes = found.into_iter().collect::<Vec<_>>();
+    runtimes.sort();
+    runtimes
+}
+
+fn list_recent_logs(game_dir: &std::path::Path) -> Vec<(PathBuf, SystemTime)> {
+    let mut files = [game_dir.join("logs"), game_dir.join("crash-reports")]
+        .into_iter()
+        .filter_map(|directory| fs::read_dir(directory).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let extension = path.extension()?.to_string_lossy();
+            if !path.is_file()
+                || !(extension.eq_ignore_ascii_case("log") || extension.eq_ignore_ascii_case("txt"))
+            {
+                return None;
+            }
+            Some((path, entry.metadata().ok()?.modified().ok()?))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    files.truncate(100);
+    files
+}
+
+fn read_log_tail(path: &std::path::Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn diagnose_crash_fallback(log: &str) -> Vec<String> {
+    let lower = log.to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    if lower.contains("outofmemoryerror")
+        || lower.contains("could not reserve enough space for object heap")
+    {
+        suggestions.push(
+            "The game ran out of memory. Lower other applications' usage or adjust the memory allocation in settings.".to_owned(),
+        );
+    }
+    if lower.contains("unsupportedclassversionerror")
+        || lower.contains("unsupported major.minor version")
+    {
+        suggestions.push(
+            "The selected Java runtime is incompatible with this Minecraft version. Use managed Java or select the required Java release.".to_owned(),
+        );
+    }
+    if lower.contains("could not find or load main class")
+        || lower.contains("noclassdeffounderror")
+        || lower.contains("classnotfoundexception")
+    {
+        suggestions.push(
+            "A game or loader file may be missing. Repair the selected version from Version Manager.".to_owned(),
+        );
+    }
+    if lower.contains("glfw error") || lower.contains("failed to create window") {
+        suggestions.push(
+            "Minecraft could not create its graphics window. Update the graphics driver and try a smaller window size.".to_owned(),
+        );
+    }
+    if lower.contains("duplicate mods") || lower.contains("duplicate mod") {
+        suggestions.push(
+            "The mod folder contains duplicate or conflicting mods. Remove one copy and launch again.".to_owned(),
+        );
+    }
+    suggestions
+}
+
+fn icon_button(ui: &mut egui::Ui, name: &'static str, texture: &TextureHandle) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 31.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(102, 108, 110)
+    } else {
+        Color32::from_rgb(73, 78, 80)
+    };
+    ui.painter().rect_filled(rect, 2.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, Color32::from_white_alpha(24)),
+        egui::StrokeKind::Inside,
+    );
+    let size = Vec2::new(22.0, 22.0);
+    let icon_rect = Rect::from_center_size(rect.center(), size);
+    ui.painter().image(
+        texture.id(),
+        icon_rect,
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+    response.on_hover_text(name)
+}
+
+fn load_texture(ctx: &Context, name: &str, bytes: &[u8], recolor: bool) -> TextureHandle {
+    let decoded = image::load_from_memory(bytes).expect("embedded launcher image is valid");
+    let mut rgba = decoded.to_rgba8();
+    if recolor {
+        for pixel in rgba.pixels_mut() {
+            if pixel[3] > 0 {
+                pixel[0] = 226;
+                pixel[1] = 229;
+                pixel[2] = 231;
+            }
+        }
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    ctx.load_texture(name, image, TextureOptions::LINEAR)
+}
+
+fn load_optional_texture(ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+    if bytes.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if u64::from(dimensions.0).saturating_mul(u64::from(dimensions.1)) > 16_777_216 {
+        return None;
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    Some(ctx.load_texture(name, color_image, TextureOptions::LINEAR))
+}
+
+fn cover_uv(image_size: Vec2, view_size: Vec2) -> Rect {
+    let image_ratio = image_size.x / image_size.y;
+    let view_ratio = view_size.x / view_size.y.max(1.0);
+    if image_ratio > view_ratio {
+        let visible = view_ratio / image_ratio;
+        let offset = (1.0 - visible) * 0.5;
+        Rect::from_min_max(Pos2::new(offset, 0.0), Pos2::new(1.0 - offset, 1.0))
+    } else {
+        let visible = image_ratio / view_ratio;
+        let offset = (1.0 - visible) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, offset), Pos2::new(1.0, 1.0 - offset))
+    }
+}
+
+fn tr(key: &'static str) -> &'static str {
+    EN_US
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find_map(|line| {
+            let (candidate, value) = line.split_once('=')?;
+            (candidate.trim() == key).then_some(value.trim())
+        })
+        .unwrap_or(key)
+}
+
+fn settings_path() -> PathBuf {
+    let root = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    root.join("LegacyLauncher-Rust").join("config.json")
+}
+
+fn default_legacy_config_path() -> PathBuf {
+    let root = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    root.join(".tlauncher").join("legacy.properties")
+}
+
+fn default_game_directory() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(".minecraft")
+}
+
+fn load_settings() -> SavedSettings {
+    let mut settings: SavedSettings = fs::read(settings_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if settings.legacy_config_path.trim().is_empty() {
+        settings.legacy_config_path = default_legacy_config_path().to_string_lossy().into_owned();
+    }
+    settings.launcher_window_width = settings.launcher_window_width.clamp(540, 7680);
+    settings.launcher_window_height = settings.launcher_window_height.clamp(360, 4320);
+    if settings.launch_action == "stay" {
+        settings.launch_action = "nothing".to_owned();
+    }
+    if !matches!(settings.launch_action.as_str(), "hide" | "exit" | "nothing") {
+        settings.launch_action = "hide".to_owned();
+    }
+    if !matches!(
+        settings.gpu_preference.as_str(),
+        "system" | "integrated" | "discrete"
+    ) {
+        settings.gpu_preference = "discrete".to_owned();
+    }
+    if !matches!(
+        settings.java_mode.as_str(),
+        "recommended" | "current" | "custom"
+    ) {
+        settings.java_mode = if settings.java_path.trim().is_empty() {
+            "recommended".to_owned()
+        } else {
+            "custom".to_owned()
+        };
+    } else if settings.java_mode == "recommended" && !settings.java_path.trim().is_empty() {
+        // Migrate Java paths saved by earlier Rust builds, which used a path as
+        // an implicit custom-runtime selection.
+        settings.java_mode = "custom".to_owned();
+    }
+    if !matches!(
+        settings.optimized_java_args.as_str(),
+        "none" | "default" | "g1gc" | "shenandoah" | "zgc"
+    ) {
+        settings.optimized_java_args = "default".to_owned();
+    }
+    if uuid::Uuid::parse_str(settings.client_id.trim()).is_err() {
+        settings.client_id = uuid::Uuid::new_v4().to_string();
+    }
+    for (kind, enabled) in default_version_catalog_types() {
+        settings
+            .version_catalog_types
+            .entry(kind)
+            .or_insert(enabled);
+    }
+    settings
+}
+
+fn import_legacy_settings(
+    path: &std::path::Path,
+    settings: &mut SavedSettings,
+) -> Result<LegacySettingsImportSummary, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let properties = parse_java_properties(&String::from_utf8_lossy(&bytes));
+    if properties.is_empty() {
+        return Err("the properties file is empty or has no readable entries".to_owned());
+    }
+    let mut summary = LegacySettingsImportSummary::default();
+    let mut apply = |key: &str, result: Option<()>| {
+        if properties.contains_key(key) {
+            if result.is_some() {
+                summary.applied += 1;
+            } else {
+                summary.skipped += 1;
+            }
+        }
+    };
+
+    if let Some(value) = properties.get("minecraft.gamedir") {
+        let path = PathBuf::from(value.trim());
+        let valid = !value.trim().is_empty() && path.is_absolute();
+        if valid {
+            settings.game_directory = path.to_string_lossy().into_owned();
+        }
+        apply("minecraft.gamedir", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("minecraft.gamedir.separate") {
+        let mode = match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "false" => Some(SeparateDirs::None),
+            "family" | "true" => Some(SeparateDirs::Family),
+            "version" => Some(SeparateDirs::Version),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            settings.separate_game_directories = mode;
+        }
+        apply("minecraft.gamedir.separate", mode.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.onlaunch") {
+        let action = value.trim().to_ascii_lowercase();
+        let valid = matches!(action.as_str(), "hide" | "exit" | "nothing");
+        if valid {
+            settings.launch_action = action;
+        }
+        apply("minecraft.onlaunch", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("login.auto") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.auto_login = enabled;
+        }
+        apply("login.auto", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("feedback") {
+        let acknowledged = parse_legacy_bool(value);
+        if let Some(acknowledged) = acknowledged {
+            settings.feedback_acknowledged = acknowledged;
+        }
+        apply("feedback", acknowledged.map(|_| ()));
+    }
+    if let Some(value) = properties.get("gui.size") {
+        let dimensions = value
+            .split(|character: char| matches!(character, 'x' | 'X' | '×' | ',' | ';' | ' '))
+            .filter_map(|part| part.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        let valid = dimensions.len() >= 2
+            && (540..=7680).contains(&dimensions[0])
+            && (360..=4320).contains(&dimensions[1]);
+        if valid {
+            settings.launcher_window_width = dimensions[0];
+            settings.launcher_window_height = dimensions[1];
+        }
+        apply("gui.size", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("minecraft.size") {
+        let dimensions = value
+            .split(|character: char| matches!(character, 'x' | 'X' | '×' | ',' | ';' | ' '))
+            .filter_map(|part| part.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        let valid = dimensions.len() >= 2
+            && (320..=7680).contains(&dimensions[0])
+            && (240..=4320).contains(&dimensions[1]);
+        if valid {
+            settings.screen_width = dimensions[0];
+            settings.screen_height = dimensions[1];
+        }
+        apply("minecraft.size", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("minecraft.fullscreen") {
+        let setting = parse_legacy_bool(value);
+        if let Some(setting) = setting {
+            settings.fullscreen = setting;
+        }
+        apply("minecraft.fullscreen", setting.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.gpu") {
+        let preference = match value.trim().to_ascii_lowercase().as_str() {
+            "system" | "default" => Some("system"),
+            "integrated" => Some("integrated"),
+            "discrete" => Some("discrete"),
+            _ => None,
+        };
+        if let Some(preference) = preference {
+            settings.gpu_preference = preference.to_owned();
+        }
+        apply("minecraft.gpu", preference.map(|_| ()));
+    }
+    if let Some(value) = properties.get("windows.gpuperf") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.windows_gpu_performance = enabled;
+        }
+        apply("windows.gpuperf", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.jre.dir") {
+        let directory = value.trim();
+        let valid = !directory.is_empty();
+        if valid {
+            settings.java_runtime_directory = directory.to_owned();
+        }
+        apply("minecraft.jre.dir", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("minecraft.improvedargs.type") {
+        let optimized_type = value.trim().to_ascii_lowercase();
+        let valid = matches!(
+            optimized_type.as_str(),
+            "none" | "default" | "g1gc" | "shenandoah" | "zgc"
+        );
+        if valid {
+            settings.optimized_java_args = optimized_type;
+        }
+        apply("minecraft.improvedargs.type", valid.then_some(()));
+    } else if let Some(value) = properties.get("minecraft.improvedargs") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.optimized_java_args = if enabled { "default" } else { "none" }.to_owned();
+        }
+        apply("minecraft.improvedargs", enabled.map(|_| ()))
+    }
+    if let Some(value) = properties.get("minecraft.jre.change-trust-store") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.use_current_trust_store = enabled;
+        }
+        apply("minecraft.jre.change-trust-store", enabled.map(|_| ()))
+    }
+    if let Some(value) = properties.get("minecraft.wrapper-command") {
+        settings.wrapper_command = value.trim().to_owned();
+        apply("minecraft.wrapper-command", Some(()));
+    }
+    if let Some(value) = properties.get("minecraft.jre.type") {
+        let mode = value.trim().to_ascii_lowercase();
+        let valid = matches!(mode.as_str(), "recommended" | "current" | "custom");
+        if valid {
+            settings.java_mode = mode;
+            if settings.java_mode == "recommended" {
+                settings.java_path.clear();
+            }
+        }
+        apply("minecraft.jre.type", valid.then_some(()));
+    }
+    let imported_jre_type = properties
+        .get("minecraft.jre.type")
+        .map(|value| value.trim().to_ascii_lowercase());
+    let custom_java_path = match imported_jre_type.as_deref() {
+        Some("custom") => properties.get("minecraft.jre.custom.path"),
+        Some(_) => None,
+        None => properties.get("minecraft.cmd"),
+    };
+    if let Some(value) = custom_java_path {
+        let path = value.trim();
+        let valid = !path.is_empty();
+        if valid {
+            settings.java_mode = "custom".to_owned();
+            settings.java_path = path.to_owned();
+        }
+        if imported_jre_type.as_deref() == Some("custom") {
+            apply("minecraft.jre.custom.path", valid.then_some(()));
+        } else {
+            apply("minecraft.cmd", valid.then_some(()));
+        }
+    }
+    for (key, destination) in [
+        ("minecraft.javaargs", &mut settings.jvm_args),
+        ("minecraft.args", &mut settings.game_args),
+    ] {
+        if let Some(value) = properties.get(key) {
+            *destination = value.trim().to_owned();
+            apply(key, Some(()));
+        }
+    }
+    if let Some((key, value)) = properties
+        .get("minecraft.xmx")
+        .map(|value| ("minecraft.xmx", value))
+        .or_else(|| {
+            properties
+                .get("minecraft.memory")
+                .map(|value| ("minecraft.memory", value))
+        })
+    {
+        let memory = value.trim();
+        let megabytes = if memory.eq_ignore_ascii_case("auto") {
+            None
+        } else {
+            memory
+                .parse::<u32>()
+                .ok()
+                .filter(|value| (256..=262_144).contains(value))
+        };
+        if let Some(megabytes) = megabytes {
+            settings.max_memory = format!("{megabytes}M");
+            settings.min_memory = format!("{}M", (megabytes / 2).clamp(128, 1024));
+            apply(key, Some(()));
+        } else {
+            apply(key, None);
+        }
+    }
+
+    for (source_key, kind) in [
+        ("minecraft.versions.snapshot", "snapshot"),
+        ("minecraft.versions.modified", "modified"),
+        ("minecraft.versions.old_beta", "old-beta"),
+        ("minecraft.versions.old_alpha", "old-alpha"),
+        ("minecraft.versions.launcher", "launcher"),
+        ("minecraft.versions.pending", "pending"),
+    ] {
+        if let Some(value) = properties.get(source_key) {
+            let enabled = parse_legacy_bool(value);
+            if let Some(enabled) = enabled {
+                settings
+                    .version_catalog_types
+                    .insert(kind.to_owned(), enabled);
+            }
+            apply(source_key, enabled.map(|_| ()));
+        }
+    }
+    if let Some(value) = properties.get("minecraft.versions.sub.old_release") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.version_show_old_releases = enabled;
+        }
+        apply("minecraft.versions.sub.old_release", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.versions.only-installed") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.version_only_installed = enabled;
+        }
+        apply("minecraft.versions.only-installed", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.versions.sub.remote") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.version_include_remote = enabled;
+        }
+        apply("minecraft.versions.sub.remote", enabled.map(|_| ()));
+    }
+
+    for key in ["notice.enabled", "gui.notices.enabled"] {
+        if let Some(value) = properties.get(key) {
+            let enabled = parse_legacy_bool(value);
+            if let Some(enabled) = enabled {
+                settings.notices_enabled = enabled;
+            }
+            apply(key, enabled.map(|_| ()));
+        }
+    }
+    if let Some(value) = properties.get("notice.promoted") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.promoted_notices_enabled = enabled;
+        }
+        apply("notice.promoted", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.servers.promoted.ingame") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.promoted_servers_in_game = enabled;
+        }
+        apply("minecraft.servers.promoted.ingame", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.mods.removeUndesirable") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.remove_undesirable_mods = enabled;
+        }
+        apply("minecraft.mods.removeUndesirable", enabled.map(|_| ()));
+    } else if let Some(value) = properties.get("minecraft.deleteTlSkinCape") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.remove_undesirable_mods = enabled;
+        }
+        apply("minecraft.deleteTlSkinCape", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("minecraft.deletePatchy") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.delete_patchy = enabled;
+        }
+        apply("minecraft.deletePatchy", enabled.map(|_| ()));
+    }
+    for (key, value) in &properties {
+        let Some(id) = key.strip_prefix("notice.id.") else {
+            continue;
+        };
+        if let Ok(expiry) = value.trim().parse::<u64>() {
+            settings.hidden_notices_until.insert(id.to_owned(), expiry);
+            summary.applied += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    Ok(summary)
+}
+
+#[derive(Default)]
+struct ModCleanupSummary {
+    removed: Vec<String>,
+    failed: Vec<(String, String)>,
+}
+
+fn remove_undesirable_mod_files(
+    mods_directory: &std::path::Path,
+) -> std::io::Result<ModCleanupSummary> {
+    static PATTERNS: std::sync::OnceLock<regex::RegexSet> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        regex::RegexSet::new([r"tl.?skin.?cape.*\.jar", r"kl.?master.*\.jar"])
+            .expect("undesirable mod filename patterns are valid")
+    });
+    let mut summary = ModCleanupSummary::default();
+    if !mods_directory.exists() {
+        return Ok(summary);
+    }
+
+    for entry in fs::read_dir(mods_directory)? {
+        let entry = entry?;
+        if !entry.metadata()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().to_lowercase();
+        if !patterns.is_match(&filename) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => summary.removed.push(filename),
+            Err(error) => summary.failed.push((filename, error.to_string())),
+        }
+    }
+    Ok(summary)
+}
+
+fn parse_legacy_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn default_version_catalog_types() -> HashMap<String, bool> {
+    [
+        ("snapshot", true),
+        ("modified", true),
+        ("old-beta", false),
+        ("old-alpha", false),
+        ("launcher", false),
+        ("pending", true),
+    ]
+    .into_iter()
+    .map(|(kind, enabled)| (kind.to_owned(), enabled))
+    .collect()
+}
+
+fn default_version_type_enabled(kind: &str) -> bool {
+    matches!(kind, "snapshot" | "modified" | "pending")
+}
+
+fn normalize_catalog_type(kind: &str) -> String {
+    kind.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn parse_java_properties(contents: &str) -> HashMap<String, String> {
+    let mut properties = HashMap::new();
+    let mut logical_line = String::new();
+    for raw_line in contents.lines() {
+        let line = if logical_line.is_empty() {
+            let trimmed = raw_line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+                continue;
+            }
+            trimmed
+        } else {
+            raw_line.trim_start()
+        };
+        logical_line.push_str(line);
+        let trailing_slashes = logical_line
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '\\')
+            .count();
+        if trailing_slashes % 2 == 1 {
+            logical_line.pop();
+            continue;
+        }
+
+        let mut escaped = false;
+        let mut separator = None;
+        for (index, character) in logical_line.char_indices() {
+            if !escaped && (character == '=' || character == ':' || character.is_whitespace()) {
+                separator = Some(index);
+                break;
+            }
+            if character == '\\' {
+                escaped = !escaped;
+            } else {
+                escaped = false;
+            }
+        }
+        if let Some(index) = separator {
+            let key = unescape_java_property(&logical_line[..index]);
+            let mut value_start = index;
+            while logical_line[value_start..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+            {
+                value_start += logical_line[value_start..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
+            }
+            if logical_line[value_start..].starts_with('=')
+                || logical_line[value_start..].starts_with(':')
+            {
+                value_start += 1;
+            }
+            while logical_line[value_start..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+            {
+                value_start += logical_line[value_start..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
+            }
+            properties.insert(key, unescape_java_property(&logical_line[value_start..]));
+        } else if !logical_line.is_empty() {
+            properties.insert(unescape_java_property(&logical_line), String::new());
+        }
+        logical_line.clear();
+    }
+    if !logical_line.is_empty() {
+        properties.insert(unescape_java_property(&logical_line), String::new());
+    }
+    properties
+}
+
+fn unescape_java_property(value: &str) -> String {
+    let mut units = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            let mut encoded = [0; 2];
+            units.extend(character.encode_utf16(&mut encoded).iter().copied());
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            units.push('\\' as u16);
+            break;
+        };
+        match escaped {
+            't' => units.push('\t' as u16),
+            'n' => units.push('\n' as u16),
+            'r' => units.push('\r' as u16),
+            'f' => units.push('\u{000c}' as u16),
+            'u' => {
+                while chars.peek() == Some(&'u') {
+                    chars.next();
+                }
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    if let Some(character) = chars.next() {
+                        hex.push(character);
+                    }
+                }
+                if let Ok(unit) = u16::from_str_radix(&hex, 16) {
+                    units.push(unit);
+                }
+            }
+            other => units.push(other as u16),
+        }
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn legacy_mojang_profile(user: &serde_json::Value) -> Option<(String, String)> {
+    let selected = user.get("selectedProfile")?;
+    let selected_id = selected
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| selected.as_str())?;
+    let profile_uuid = uuid::Uuid::parse_str(selected_id).ok()?;
+    let normalized_uuid = profile_uuid.to_string();
+    let selected_name = selected
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned);
+    let name = selected_name.or_else(|| {
+        let profiles = user.get("profiles")?;
+        let candidates: Vec<&serde_json::Value> = match profiles {
+            serde_json::Value::Array(profiles) => profiles.iter().collect(),
+            serde_json::Value::Object(profiles) => profiles.values().collect(),
+            _ => return None,
+        };
+        candidates
+            .into_iter()
+            .find(|profile| {
+                profile
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    .is_some_and(|id| id == profile_uuid)
+            })
+            .and_then(|profile| profile.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+    })?;
+    Some((name, normalized_uuid))
+}
+
+fn import_legacy_accounts(
+    path: &std::path::Path,
+    settings: &mut SavedSettings,
+) -> Result<LegacyImportSummary, String> {
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let root = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error| format!("profile file is not valid JSON: {error}"))?;
+    let user_set = root.get("userSet").unwrap_or(&root);
+    let users = user_set
+        .get("list")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "profile file does not contain a userSet.list account list".to_owned())?;
+    let selected = user_set.get("selected").and_then(|value| {
+        Some((
+            value.get("type")?.as_str()?.to_ascii_lowercase(),
+            value.get("username")?.as_str()?.to_owned(),
+        ))
+    });
+    let mut summary = LegacyImportSummary::default();
+    let mut imported_selected = None;
+
+    for user in users {
+        let Some(kind) = user.get("type").and_then(serde_json::Value::as_str) else {
+            summary.skipped += 1;
+            continue;
+        };
+        match kind {
+            "mojang" => {
+                let login_name = user
+                    .get("username")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let Some((username, player_uuid)) = legacy_mojang_profile(user) else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                if !valid_player_name(&username) {
+                    summary.skipped += 1;
+                    continue;
+                }
+                let already_present = settings
+                    .accounts
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(&username));
+                if !already_present {
+                    settings.accounts.push(username.clone());
+                    settings
+                        .offline_account_uuids
+                        .entry(username.clone())
+                        .or_insert(player_uuid);
+                    summary.mojang_migrated += 1;
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|(selected_kind, selected_name)| {
+                        selected_kind == "mojang"
+                            && (selected_name.eq_ignore_ascii_case(login_name)
+                                || selected_name.eq_ignore_ascii_case(&username))
+                    })
+                {
+                    imported_selected = Some(username);
+                }
+            }
+            "plain" => {
+                let Some(username) = user.get("username").and_then(serde_json::Value::as_str)
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let username = username.trim();
+                if username.is_empty() {
+                    summary.skipped += 1;
+                    continue;
+                }
+                let already_present = settings
+                    .accounts
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(username));
+                if !already_present {
+                    settings.accounts.push(username.to_owned());
+                    summary.offline += 1;
+                    let use_ely_skins = user
+                        .get("elySkins")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    settings
+                        .offline_ely_skins
+                        .insert(username.to_owned(), use_ely_skins);
+                }
+                if let Some(uuid) = user
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                {
+                    let key = settings
+                        .accounts
+                        .iter()
+                        .find(|saved| saved.eq_ignore_ascii_case(username))
+                        .cloned()
+                        .unwrap_or_else(|| username.to_owned());
+                    settings
+                        .offline_account_uuids
+                        .entry(key)
+                        .or_insert_with(|| uuid.to_string());
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|(selected_kind, selected_name)| {
+                        selected_kind == "plain" && selected_name.eq_ignore_ascii_case(username)
+                    })
+                {
+                    imported_selected = Some(username.to_owned());
+                }
+            }
+            "minecraft" => {
+                let Some(username) = user.get("name").and_then(serde_json::Value::as_str) else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(profile_uuid) = user
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(refresh_token) = user
+                    .pointer("/microsoft/refreshToken")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|token| !token.trim().is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let uuid = profile_uuid.to_string();
+                let profile = MicrosoftAccountProfile {
+                    id: format!("microsoft:{uuid}"),
+                    username: username.to_owned(),
+                    uuid,
+                    xuid: String::new(),
+                };
+                vault::store_refresh_token(&profile.storage_key(), refresh_token).map_err(
+                    |error| format!("could not protect an imported Microsoft token: {error}"),
+                )?;
+                let exists = settings
+                    .microsoft_accounts
+                    .iter()
+                    .any(|saved| saved.id == profile.id);
+                settings
+                    .microsoft_accounts
+                    .retain(|saved| saved.id != profile.id);
+                settings.microsoft_accounts.push(profile.clone());
+                if !exists {
+                    summary.microsoft += 1;
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|(selected_kind, selected_name)| {
+                        selected_kind == "minecraft" && selected_name.eq_ignore_ascii_case(username)
+                    })
+                {
+                    imported_selected = Some(profile.id);
+                }
+            }
+            "ely" => {
+                let Some(username) = user
+                    .get("username")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(account_id) = user
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|value| *value >= 0)
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(profile_uuid) = user
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let display_name = user
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(username);
+                let Some(access_token) = user
+                    .get("accessToken")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let refresh_token = user
+                    .get("refreshToken")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned);
+                let expiry_time = user.get("expiryTime").and_then(serde_json::Value::as_u64);
+                let uuid = profile_uuid.to_string();
+                let account = ElyAccountProfile {
+                    id: format!("ely:{uuid}"),
+                    account_id,
+                    username: username.to_owned(),
+                    display_name: display_name.to_owned(),
+                    uuid,
+                };
+                let credentials = ely::Credentials {
+                    access_token: access_token.to_owned(),
+                    refresh_token,
+                    expiry_time,
+                };
+                let serialized = serde_json::to_string(&credentials).map_err(|error| {
+                    format!("could not encode imported Ely.by credentials: {error}")
+                })?;
+                vault::store_refresh_token(&account.storage_key(), &serialized).map_err(
+                    |error| format!("could not protect imported Ely.by credentials: {error}"),
+                )?;
+                let exists = settings
+                    .ely_accounts
+                    .iter()
+                    .any(|saved| saved.id == account.id);
+                settings.ely_accounts.retain(|saved| saved.id != account.id);
+                settings.ely_accounts.push(account.clone());
+                if !exists {
+                    summary.ely += 1;
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|(selected_kind, selected_name)| {
+                        selected_kind == "ely" && selected_name.eq_ignore_ascii_case(username)
+                    })
+                {
+                    imported_selected = Some(account.id);
+                }
+            }
+            "ely_legacy" => {
+                let Some(username) = user
+                    .get("username")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(profile_uuid) = user
+                    .get("uuid")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(display_name) = user
+                    .get("displayName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(client_token) = user
+                    .get("clientToken")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let Some(access_token) = user
+                    .get("accessToken")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    summary.skipped += 1;
+                    continue;
+                };
+                let uuid = profile_uuid.to_string();
+                let profile = ElyLegacyAccountProfile {
+                    id: format!("ely_legacy:{uuid}"),
+                    username: username.to_owned(),
+                    display_name: display_name.to_owned(),
+                    uuid,
+                };
+                let credentials = ely_legacy::Credentials {
+                    access_token: access_token.to_owned(),
+                    client_token: client_token.to_owned(),
+                };
+                let serialized = serde_json::to_string(&credentials).map_err(|error| {
+                    format!("could not encode imported Ely.by credentials: {error}")
+                })?;
+                vault::store_refresh_token(&profile.storage_key(), &serialized).map_err(
+                    |error| format!("could not protect imported Ely.by credentials: {error}"),
+                )?;
+                let exists = settings
+                    .ely_legacy_accounts
+                    .iter()
+                    .any(|saved| saved.id == profile.id);
+                settings
+                    .ely_legacy_accounts
+                    .retain(|saved| saved.id != profile.id);
+                settings.ely_legacy_accounts.push(profile.clone());
+                if !exists {
+                    summary.ely_legacy += 1;
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|(selected_kind, selected_name)| {
+                        selected_kind == "ely_legacy"
+                            && selected_name.eq_ignore_ascii_case(username)
+                    })
+                {
+                    imported_selected = Some(profile.id);
+                }
+            }
+            _ => summary.skipped += 1,
+        }
+    }
+
+    if let Some(selected) = imported_selected {
+        settings.selected_account = Some(selected);
+    } else if settings.selected_account.is_none() {
+        settings.selected_account = settings.accounts.first().cloned().or_else(|| {
+            settings
+                .microsoft_accounts
+                .first()
+                .map(|account| account.id.clone())
+                .or_else(|| {
+                    settings
+                        .ely_legacy_accounts
+                        .first()
+                        .map(|account| account.id.clone())
+                })
+                .or_else(|| {
+                    settings
+                        .ely_accounts
+                        .first()
+                        .map(|account| account.id.clone())
+                })
+        });
+    }
+    Ok(summary)
+}
+
+fn valid_player_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 16
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn valid_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 16
+        && name
+            .chars()
+            .all(|character| (' '..'\u{7f}').contains(&character))
+}
+
+fn valid_version_id(version: &str) -> bool {
+    !version.is_empty()
+        && version != "."
+        && version != ".."
+        && version
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
+}
+
+fn remove_installed_version(game_dir: &std::path::Path, version: &str) -> std::io::Result<()> {
+    if !valid_version_id(version) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "version ID contains unsupported path characters",
+        ));
+    }
+
+    let versions_dir = game_dir.join("versions");
+    let target = versions_dir.join(version);
+    let canonical_game_dir = game_dir.canonicalize()?;
+    let canonical_root = versions_dir.canonicalize()?;
+    if canonical_root.parent() != Some(canonical_game_dir.as_path()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "versions folder resolves outside the selected Minecraft folder",
+        ));
+    }
+    let canonical_target = target.canonicalize()?;
+    if canonical_target.parent() != Some(canonical_root.as_path()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "version path resolves outside the Minecraft versions folder",
+        ));
+    }
+    fs::remove_dir_all(canonical_target)
+}
+
+fn invalidate_game_data_cache(game_dir: &std::path::Path, version: &str) -> std::io::Result<usize> {
+    let mut cache_files = vec![game_dir.join("gameData.json")];
+    if let Ok(instances) = fs::read_dir(game_dir.join("instances")) {
+        cache_files.extend(instances.flatten().filter_map(|entry| {
+            entry.file_type().ok().filter(|kind| kind.is_dir())?;
+            Some(entry.path().join("gameData.json"))
+        }));
+    }
+    let mut removed = 0;
+    for cache_file in cache_files {
+        let Ok(bytes) = fs::read(&cache_file) else {
+            continue;
+        };
+        let Ok(cache) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if cache
+            .get("minecraftVersion")
+            .and_then(|value| value.as_str())
+            == Some(version)
+        {
+            fs::remove_file(cache_file)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn parse_memory_size(value: &str) -> Option<u64> {
+    let value = value.trim().to_ascii_uppercase();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('G') {
+        (number, 1024_u64.pow(3))
+    } else if let Some(number) = value.strip_suffix('M') {
+        (number, 1024_u64.pow(2))
+    } else if let Some(number) = value.strip_suffix('K') {
+        (number, 1024_u64)
+    } else {
+        return None;
+    };
+    let number = number.trim().parse::<u64>().ok()?;
+    (number > 0)
+        .then(|| number.checked_mul(multiplier))
+        .flatten()
+}
+
+fn memory_config(preferences: &SavedSettings) -> MemoryConfig {
+    match (
+        parse_memory_size(&preferences.min_memory),
+        parse_memory_size(&preferences.max_memory),
+    ) {
+        (Some(min), Some(max)) if min <= max => MemoryConfig {
+            min: preferences.min_memory.trim().to_owned(),
+            max: preferences.max_memory.trim().to_owned(),
+        },
+        _ => MemoryConfig::default(),
+    }
+}
+
+fn loader_config(preferences: &SavedSettings) -> LoaderConfig {
+    let loader_type = match preferences.loader_type.as_str() {
+        "forge" => Some(LoaderType::Forge),
+        "neoforge" => Some(LoaderType::NeoForge),
+        "fabric" => Some(LoaderType::Fabric),
+        "legacyfabric" => Some(LoaderType::LegacyFabric),
+        "quilt" => Some(LoaderType::Quilt),
+        _ => None,
+    };
+    let enable = loader_type.is_some();
+    let build = if preferences.loader_build.trim().is_empty() {
+        "latest".to_owned()
+    } else {
+        preferences.loader_build.trim().to_owned()
+    };
+    LoaderConfig {
+        loader_type,
+        build,
+        enable,
+        ..LoaderConfig::default()
+    }
+}
+
+fn split_arguments(arguments: &str) -> Vec<String> {
+    arguments.split_whitespace().map(str::to_owned).collect()
+}
+
+fn detect_java() -> Result<(PathBuf, String), String> {
+    let mut candidates = Vec::new();
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let bin = PathBuf::from(java_home).join("bin");
+        candidates.push(bin.join("javaw.exe"));
+        candidates.push(bin.join("java.exe"));
+    }
+    if let Ok(output) = Command::new("where.exe").arg("java.exe").output() {
+        if output.status.success() {
+            candidates.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(PathBuf::from),
+            );
+        }
+    }
+    if let Ok(output) = Command::new("where.exe").arg("javaw.exe").output() {
+        if output.status.success() {
+            candidates.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(PathBuf::from),
+            );
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if !candidate.is_file() || !seen.insert(candidate.clone()) {
+            continue;
+        }
+        let output = match Command::new(&candidate).arg("-version").output() {
+            Ok(output) if output.status.success() => output,
+            _ => continue,
+        };
+        let mut version_output = String::from_utf8_lossy(&output.stderr).into_owned();
+        if version_output.trim().is_empty() {
+            version_output = String::from_utf8_lossy(&output.stdout).into_owned();
+        }
+        let version = version_output
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Java runtime")
+            .trim()
+            .to_owned();
+        return Ok((candidate, version));
+    }
+    Err("No usable Java executable was found. Leave this blank to use managed Java.".to_owned())
+}
+
+async fn verify_java_compatibility(
+    java_path: &std::path::Path,
+    game_dir: &std::path::Path,
+    version_id: &str,
+    version_manifest: Option<&MojangVersionManifest>,
+) -> Result<String, String> {
+    let path = java_path.to_owned();
+    let (major, version_text) = tokio::task::spawn_blocking(move || inspect_java(&path))
+        .await
+        .map_err(|error| format!("Java inspection failed: {error}"))??;
+    let required_major = local_required_java_major(game_dir, version_id);
+    let required_major = match required_major {
+        Some(required) => Some(required),
+        None => match version_manifest {
+            Some(manifest) => catalog::fetch_required_java_major(version_id, manifest)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+    };
+    if let Some(required) = required_major {
+        if major < required {
+            return Err(format!(
+                "Java {major} is too old for Minecraft {version_id}; this version requires Java {required}. Switch Java to Recommended or select a newer runtime."
+            ));
+        }
+        Ok(format!(
+            "Java {major} is compatible with Minecraft {version_id} ({version_text})."
+        ))
+    } else {
+        Ok(format!("Using Java {major} ({version_text})."))
+    }
+}
+
+fn local_required_java_major(game_dir: &std::path::Path, version_id: &str) -> Option<u32> {
+    let mut current = version_id.to_owned();
+    for _ in 0..8 {
+        if !valid_version_id(&current) {
+            return None;
+        }
+        let path = game_dir
+            .join("versions")
+            .join(&current)
+            .join(format!("{current}.json"));
+        let bytes = fs::read(path).ok()?;
+        let metadata = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        if let Some(major) = metadata
+            .pointer("/javaVersion/majorVersion")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            return Some(major);
+        }
+        let Some(parent) = metadata
+            .get("inheritsFrom")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return None;
+        };
+        current = parent.to_owned();
+    }
+    None
+}
+
+fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
+    if !path.is_file() {
+        return Err(format!(
+            "Java executable does not exist: {}",
+            path.display()
+        ));
+    }
+    let probe_path = if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("javaw.exe"))
+    {
+        let console_java = path.with_file_name("java.exe");
+        if console_java.is_file() {
+            console_java
+        } else {
+            path.to_owned()
+        }
+    } else {
+        path.to_owned()
+    };
+    let output = Command::new(&probe_path)
+        .arg("-version")
+        .output()
+        .map_err(|error| format!("Could not run Java at {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Java at {} returned an error for -version.",
+            path.display()
+        ));
+    }
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    let version = text
+        .split('"')
+        .nth(1)
+        .map(str::trim)
+        .or_else(|| {
+            text.split_whitespace().find(|word| {
+                word.chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit())
+            })
+        })
+        .ok_or_else(|| "Java returned a version string that could not be read.".to_owned())?;
+    let major_text = version
+        .strip_prefix("1.")
+        .unwrap_or(version)
+        .split(['.', '-', '+', '_'])
+        .next()
+        .unwrap_or_default();
+    let major = major_text
+        .parse::<u32>()
+        .map_err(|_| format!("Could not read the Java major version from {version}."))?;
+    Ok((major, version.to_owned()))
+}
+
+fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(path).spawn();
+    let _ = result;
+}
+
+#[cfg(target_os = "windows")]
+fn apply_gpu_preference(java_path: &str, preference: &str) -> Result<(), String> {
+    let value = match preference {
+        "integrated" => "GpuPreference=1;",
+        "discrete" => "GpuPreference=2;",
+        _ => return Ok(()),
+    };
+    let java_path = PathBuf::from(java_path)
+        .canonicalize()
+        .map_err(|error| format!("Java executable path is unavailable: {error}"))?;
+    let current_version = Command::new("reg.exe")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            "CurrentBuildNumber",
+        ])
+        .output()
+        .map_err(|error| format!("could not read Windows build number: {error}"))?;
+    if !current_version.status.success() {
+        return Err("could not read Windows build number".to_owned());
+    }
+    let build = String::from_utf8_lossy(&current_version.stdout)
+        .split_whitespace()
+        .filter_map(|field| field.parse::<u32>().ok())
+        .next_back()
+        .ok_or_else(|| "could not parse Windows build number".to_owned())?;
+    if build < 20_190 {
+        return Err("per-app GPU preference requires Windows build 20190 or newer".to_owned());
+    }
+    let java_path = java_path.to_string_lossy().into_owned();
+    let output = Command::new("reg.exe")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
+            "/v",
+            &java_path,
+            "/t",
+            "REG_SZ",
+            "/d",
+            value,
+            "/f",
+        ])
+        .output()
+        .map_err(|error| format!("could not update the per-app GPU preference: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_gpu_preference(_java_path: &str, preference: &str) -> Result<(), String> {
+    if preference == "system" {
+        Ok(())
+    } else {
+        Err("the per-app GPU preference is supported on Windows only".to_owned())
+    }
+}
+
+fn open_crash_folder(game_directory: &std::path::Path, folder: &str, status: &mut String) {
+    let relative = folder.strip_prefix("./").unwrap_or(folder);
+    let relative_path = std::path::Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        *status = "This crash action points outside the Minecraft folder.".to_owned();
+        return;
+    }
+    let base = match game_directory.canonicalize() {
+        Ok(base) => base,
+        Err(error) => {
+            *status = format!("Could not locate the Minecraft folder: {error}");
+            return;
+        }
+    };
+    let target = base.join(relative_path);
+    if relative_path == std::path::Path::new("mods") && !target.exists() {
+        if let Err(error) = fs::create_dir_all(&target) {
+            *status = format!("Could not create the Mods folder: {error}");
+            return;
+        }
+    }
+    let target = match target.canonicalize() {
+        Ok(target) if target.starts_with(&base) => target,
+        _ => {
+            *status = "The folder suggested by this crash fix does not exist.".to_owned();
+            return;
+        }
+    };
+    open_path(&target);
+}
+
+pub(crate) fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(url).spawn();
+    let _ = result;
+}
+
+fn main() -> eframe::Result {
+    let saved_settings = load_settings();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([
+                saved_settings.launcher_window_width as f32,
+                saved_settings.launcher_window_height as f32,
+            ])
+            .with_min_inner_size([540.0, 360.0])
+            .with_title("Legacy Launcher — Rust"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Legacy Launcher — Rust",
+        options,
+        Box::new(|cc| Ok(Box::new(LauncherApp::new(cc)))),
+    )
+}
