@@ -36,7 +36,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 const EN_US: &str = include_str!("../assets/lang/lang_en_US.properties");
@@ -329,6 +329,9 @@ struct LauncherApp {
     show_support_menu: bool,
     support_menu_pos: Pos2,
     show_support_window: bool,
+    show_first_run_notice: bool,
+    show_arm_compat_notice: bool,
+    arm_compat_notice_started_at: Option<Instant>,
     show_diagnostic_consent: bool,
     diagnostic_send_enabled: bool,
     diagnostic_events: Option<Receiver<Result<String, String>>>,
@@ -422,6 +425,8 @@ impl LauncherApp {
                 true,
             ),
         };
+        let first_run_pending = !settings_path().is_file();
+        let show_arm_compat_notice = first_run_pending && is_windows_arm_host();
         let settings = load_settings();
         let auto_launch_pending = settings.auto_login && settings.selected_account.is_some();
         let notice_events = settings
@@ -431,6 +436,8 @@ impl LauncherApp {
         Self {
             settings,
             assets: Some(assets),
+            show_first_run_notice: first_run_pending,
+            show_arm_compat_notice,
             version_catalog_events: Some(spawn_catalog_fetch()),
             version_catalog_loading: true,
             bootstrap_events: Some(spawn_bootstrap_fetch()),
@@ -2169,7 +2176,7 @@ impl eframe::App for LauncherApp {
             self.persist();
             self.show_feedback_dialog = true;
         }
-        if self.auto_launch_pending {
+        if self.auto_launch_pending && !self.show_first_run_notice {
             self.auto_launch_pending = false;
             self.start_selected_game();
         }
@@ -4726,6 +4733,104 @@ impl eframe::App for LauncherApp {
                         });
                 });
         }
+
+        if self.show_first_run_notice {
+            let acknowledged = egui::Modal::new(Id::unique("first_run_notice")).show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.add_space(4.0);
+                ui.heading(tr("firstrun.title"));
+                ui.label(
+                    RichText::new(tr("firstrun.notice.welcome"))
+                        .strong()
+                        .size(19.0),
+                );
+                ui.add_space(2.0);
+                ui.label(tr("firstrun.notice.body"));
+                ui.add_space(7.0);
+                ui.separator();
+                for key in [
+                    "firstrun.notice.body.0",
+                    "firstrun.notice.body.1",
+                    "firstrun.notice.body.2",
+                ] {
+                    ui.horizontal_top(|ui| {
+                        ui.label(RichText::new("–").color(Color32::from_rgb(111, 173, 203)));
+                        ui.add(egui::Label::new(tr(key)).wrap());
+                    });
+                    ui.add_space(5.0);
+                }
+                ui.add_space(6.0);
+                let mut accepted = false;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    accepted = ui
+                        .add_sized(
+                            [170.0, 36.0],
+                            egui::Button::new(tr("firstrun.notice.answer.yes")),
+                        )
+                        .clicked();
+                });
+                accepted
+            });
+            if acknowledged.inner {
+                self.show_first_run_notice = false;
+                self.persist();
+            }
+        }
+
+        if self.show_arm_compat_notice && !self.show_first_run_notice {
+            let started_at = *self
+                .arm_compat_notice_started_at
+                .get_or_insert_with(Instant::now);
+            let remaining = 5u64.saturating_sub(started_at.elapsed().as_secs());
+            if remaining > 0 {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+
+            let mut open = true;
+            let mut open_support = false;
+            let mut install_pack = false;
+            egui::Window::new(tr("opengl-pack.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    ui.set_min_width(500.0);
+                    ui.heading(tr("opengl-pack.head"));
+                    ui.label(tr("opengl-pack.body"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("loginform.button.support")).clicked() {
+                            open_support = true;
+                        }
+
+                        let install_label = if remaining > 0 {
+                            tr("opengl-pack.button.countdown").replace("%0", &remaining.to_string())
+                        } else {
+                            tr("opengl-pack.button.install").to_owned()
+                        };
+                        if ui
+                            .add_enabled(
+                                remaining == 0,
+                                egui::Button::new(install_label).min_size(Vec2::new(150.0, 36.0)),
+                            )
+                            .clicked()
+                        {
+                            install_pack = true;
+                        }
+                    });
+                });
+
+            if install_pack {
+                open_url("https://apps.microsoft.com/detail/9nqpsl29bfff");
+                open = false;
+            }
+            if open_support {
+                self.show_support_window = true;
+                open = false;
+            }
+            self.show_arm_compat_notice = open;
+        }
     }
 }
 
@@ -5804,6 +5909,17 @@ fn default_game_directory() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(".minecraft")
+}
+
+fn is_windows_arm_host() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+
+    ["PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .any(|architecture| architecture.to_ascii_uppercase().starts_with("ARM"))
 }
 
 fn load_settings() -> SavedSettings {
