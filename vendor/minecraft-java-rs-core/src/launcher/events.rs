@@ -37,6 +37,9 @@ pub enum LaunchEvent {
     /// All game files have been downloaded and verified.
     GameDownloadFinished,
 
+    /// The sanitized command used to start Minecraft.
+    Command(String),
+
     /// A line of stdout/stderr from the running Minecraft process.
     Data(String),
 

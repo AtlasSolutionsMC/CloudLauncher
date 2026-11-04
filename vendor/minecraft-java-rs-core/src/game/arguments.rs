@@ -6,6 +6,7 @@ use crate::game::libraries::natives_base_dir;
 use crate::launcher::options::LaunchOptions;
 use crate::models::loader::LoaderType;
 use crate::models::minecraft::{AssetItem, GameArgEntry, MinecraftVersionJson};
+use crate::utils::platform::{mojang_os, skip_library};
 
 // ── Loader context ────────────────────────────────────────────────────────────
 
@@ -553,6 +554,7 @@ fn build_game_placeholders<'a>(
         auth.user_properties.clone().unwrap_or_else(|| "{}".into()),
     );
     ph.insert("clientid", clientid);
+    ph.insert("forge_transformers", source_forge_transformers(version_json));
     ph
 }
 
@@ -566,7 +568,7 @@ fn build_game_placeholders<'a>(
 /// the correct anchor for `${natives_directory}`.
 fn build_jvm_placeholders<'a>(
     options: &'a LaunchOptions,
-    _version_json: &'a MinecraftVersionJson,
+    version_json: &'a MinecraftVersionJson,
     natives_str: &'a str,
     classpath: &'a str,
 ) -> HashMap<&'a str, String> {
@@ -576,15 +578,32 @@ fn build_jvm_placeholders<'a>(
     ph.insert("launcher_version", env!("CARGO_PKG_VERSION").into());
     ph.insert("classpath_separator", classpath_separator().to_string());
     ph.insert("classpath", classpath.to_owned());
-    ph.insert(
-        "library_directory",
-        options
-            .path
-            .join("libraries")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let library_directory = options
+        .path
+        .join("libraries")
+        .to_string_lossy()
+        .into_owned();
+    ph.insert("library_directory", library_directory.clone());
+    ph.insert("game_libraries_directory", library_directory);
+    ph.insert("forge_transformers", source_forge_transformers(version_json));
     ph
+}
+
+fn source_forge_transformers(version_json: &MinecraftVersionJson) -> String {
+    version_json
+        .libraries
+        .iter()
+        .filter(|library| library.library_type.as_deref() == Some("forge_transformer"))
+        .filter(|library| !skip_library(library.rules.as_deref().unwrap_or(&[])))
+        .map(|library| {
+            let architecture = if usize::BITS == 64 { "64" } else { "32" };
+            library
+                .name
+                .replace("${platform}", mojang_os())
+                .replace("${arch}", architecture)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn replace_placeholders(s: &str, ph: &HashMap<&str, String>) -> String {

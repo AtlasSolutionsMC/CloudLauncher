@@ -38,6 +38,15 @@ pub struct MinecraftVersionJson {
     pub id: String,
     #[serde(rename = "type")]
     pub version_type: String,
+    /// TLauncher-compatible source field used to infer legacy Forge mod-pack args.
+    #[serde(default)]
+    pub jar: Option<String>,
+    /// Source mod-pack kind: legacy, 1.12.2_bug, aquatic, or none.
+    #[serde(default)]
+    pub modpack: Option<String>,
+    /// Source compatibility override for Forge's absolute mod-list prefix.
+    #[serde(default)]
+    pub mod_list_absolute_prefix: bool,
     pub assets: Option<String>,
     pub asset_index: Option<AssetIndexRef>,
     pub downloads: Option<VersionDownloads>,
@@ -110,6 +119,12 @@ pub enum GameArgEntry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Library {
     pub name: String,
+    /// Legacy Launcher library role (`mod`, `library`, `forge_transformer`, …).
+    #[serde(rename = "type", default)]
+    pub library_type: Option<String>,
+    /// Older Legacy Launcher metadata marks modifications with `mod: true`.
+    #[serde(rename = "mod", default)]
+    pub mod_flag: Option<bool>,
     /// OS/feature rules from Mojang. Evaluated by `utils::platform::skip_library`.
     pub rules: Option<Vec<LibraryRule>>,
     /// Maps OS names to native classifier suffixes (e.g. `"linux" → "natives-linux"`).

@@ -19,6 +19,10 @@ Create a portable folder and ZIP after building:
 The package is written to dist\LegacyLauncher-Rust-portable.zip. The launcher's assets
 are embedded and the Windows GNU release build has no bundled third-party DLL requirement.
 
+## Publish a Windows release
+
+Push a semantic version tag such as `v0.1.1`. The Windows release workflow sets the package version from the tag, builds the x64 executable and portable ZIP, generates SHA-256 checksums, and attaches all three files to the GitHub release. The launcher’s **Check for updates** action reads published releases from this repository and displays newer release notes.
+
 ## Current features
 
 - Recreated login screen with the original background and icon assets.
@@ -45,4 +49,4 @@ Set `LEGACYLAUNCHER_ELY_CLIENT_SECRET` in the environment before launching the a
 
 ## Remaining parity work
 
-Update/new-feature dialogs and a Rust-native self-updater/bootstrap handoff, remaining source scenes and settings variants, loader-specific variants, full localization and visual-scale review, and end-to-end comparison against the Java source remain in progress. See `PORTING_PLAN.md` and `STATUS.md` for the current checklist and status.
+The launcher can download a newer Windows executable, check its SHA-256, and hand replacement/restart to a Windows helper. This path still needs validation against a published release artifact. Remaining source scenes and settings variants, loader-specific variants, full localization and visual-scale review, and end-to-end comparison against the Java source remain in progress. See `PORTING_PLAN.md` and `STATUS.md` for the current checklist and status.

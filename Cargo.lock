@@ -2234,6 +2234,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

@@ -20,10 +20,13 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Render optional personal-feed notice banners.
 - [x] Fetch and verify the source's signed bootstrap configuration; show US/global fallback notices and notification links, and merge US/global promoted servers into Minecraft's server list.
 - [x] Add the US support popup and links to the source Discord and support email.
+- [x] Check for newer GitHub releases and show release notes for a newer Rust build.
+- [x] Move settings-page titles/controls and common notice, log, server, account, and update labels into the US locale resource.
 - [ ] Port the remaining scene flows found under `launcher/src/main/java/net/legacylauncher/ui`.
 - [x] Add opt-in diagnostic upload, success link actions, sensitive-line filtering, and a local-save fallback using the source Pasta endpoint.
 - [ ] Load all visible strings from the US locale resource and match the source layout at common Windows scales.
 - [x] Wire the login toolbar to support, game-folder/mods-folder, catalog refresh, and settings actions.
+- [x] Port the source's nine login-form positions and migrate `gui.direction.loginform`.
 - [ ] Match the original toolbar popup details and verify common Windows scales visually.
 
 ### 2. Accounts and authentication
@@ -40,6 +43,8 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Import supported Java launcher game, display, Java, argument, directory, and launch-action settings from `legacy.properties`.
 - [x] Import `login.auto` and `gui.size`; use the source's 1000×600 initial launcher size and expose editable dimensions.
 - [x] Import notice visibility, promoted-notice preference, and per-notice hide expiries from `legacy.properties`.
+- [x] Import the crash scanning and full launch command logging preferences.
+- [x] Import and expose the source's nine login-form positions.
 - [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.
 - [x] Preserve each offline account's `elySkins` preference (defaulting to the Java source's `true` value), import it from `tlauncher_profiles.json`, and apply the matching Ely/plain/Minecraft replacement libraries from `libraries/replace.json` with repo failover and isolated launch caches.
@@ -69,7 +74,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Set game directory, memory, Java executable, screen size/fullscreen, and JVM/game arguments.
 - [x] Port none/family/version game folders and hide/exit/do-nothing launch behavior.
 - [x] Port system/integrated/discrete GPU selection and the Windows per-Java registry preference hook.
-- [ ] Port the remaining launch/exit behavior settings.
+- [x] Port all source launch/exit settings: keep the launcher open, hide it, or close it when Minecraft starts.
 - [x] Add, edit, remove, and save a Rust launcher server list; quick play opens selected servers using the installed version's quick-play feature rule or legacy `--server`/`--port` arguments.
 - [x] Let personal promoted-server notice actions quick-play the server and honor account-type restrictions when provided.
 - [x] Read and write Minecraft `servers.dat` in the selected game folder, preserve server fields, and create a `.bak` before replacing it.
@@ -80,30 +85,35 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 
 ### 5. Mod loaders and game compatibility
 
-- [ ] Inventory loader integrations and compatibility rules in the Java source.
+- [x] Inventory the source's ExtraVersion JSON loader flow and Forge mod-pack compatibility (`legacy`, `1.12.2_bug`, `aquatic`, and `forge_transformer`).
 - [x] Select and install/repair/launch Forge, NeoForge, Fabric, LegacyFabric, and Quilt through the Rust launch backend.
 - [x] Keep each loader/build's cache and save directory separate from vanilla and other loader builds.
-- [ ] Port any source-specific loader variants.
+- [x] Port source Forge mod-list files, 1.13+ mod-list arguments, version-inferred compatibility, and `forge_transformers` argument substitution.
 - [x] Port the source's unwanted-mod cleanup patterns, default setting, settings UI, legacy setting migration, and launch-time deletion scoped to the selected game's `mods` folder.
 
 ### 6. Diagnostics, notices, and support
 
 - [x] Capture game output and show a crash log with initial rule-based suggestions.
+- [x] Preserve the source `minecraft.crash` preference, including legacy import, and skip crash scanning when disabled.
+- [x] Preserve the source `gui.logger.fullcommand` opt-in and only include the sanitized launch command in logs when enabled.
 - [x] Port the bundled US English crash signatures, richer explanations, and supported suggested-fix actions.
 - [x] Add normal log browsing, preview/copy, and log/game-folder actions in the launcher UI.
 - [x] Fetch and show personal US English notices, including persisted one-week hiding and supported URL/scene/promoted-server actions.
 - [x] Render optional personal-feed notice banners and merge available notice server actions into the in-game list.
 - [x] Port signed bootstrap notice, notification-icon, and global promoted-server delivery for the US locale.
-- [ ] Port update/new-feature dialogs and the source self-update/bootstrap handoff flow.
+- [x] Download the release executable with a size limit, verify its SHA-256, and hand off replacement/restart to a Windows helper process.
+- [ ] Validate the download and restart flow against a published Windows release artifact.
+- [ ] Port the source new-feature dialog if it becomes active in the source launcher flow (`NewFeaturesFrame` has no call site in this checkout).
 - [x] Port the source feedback-on-exit prompt using the US/global survey URL from bootstrap configuration.
 - [x] Port the US Discord/email support links and opt-in diagnostics flow.
 
 ### 7. Windows delivery and parity review
 
 - [ ] Port launcher self-update/bootstrap handoff and first-run behavior.
+- [x] Add a tagged Windows release workflow that publishes the executable, portable ZIP, and SHA-256 checksums.
 - [x] Package a portable Windows x64 folder/ZIP; assets are embedded and the release build does not need an external Rust/Java runtime to start.
 - [ ] Review every user-facing flow against the Java source and close the remaining parity gaps.
 
 ## Current focus
 
-Next: port update/new-feature dialogs and a Rust-native self-update/bootstrap handoff, then cover remaining source scenes, settings/account variants, loader variants and compatibility behavior, all remaining US localization, and complete the final parity review. Bootstrap data now uses the Java source's signed endpoint format, embedded RSA public key, SHA-256 digest and RSA/SHA-1 verification, gzip/bzip2 decoding, host failover, US notice parsing, direct promoted-server merge, notification links, and US/global feedback URLs. The support flow includes opt-in diagnostic upload to the source Pasta endpoint, filtering of lines that may contain credentials, link actions, and a local-save fallback. The unwanted-mod cleanup matches the source filename patterns, default, migration, and launch timing. The latest Windows release build and portable packaging passed after these changes. The ExtraVersionList catalog merge and remote version resolver plus account-specific Ely/plain/Minecraft and optional Patchy library replacements are implemented; end-to-end runtime behavior remains in the final flow-by-flow review. Java settings include a configurable managed-runtime root, detected runtime path/version display, all five optimized argument profiles, current trust-store compatibility, wrapper commands, and migration of their source properties. Promoted-server notice actions offer the selected version and up to two recent releases from each compatible family; available US promotions can be added to `servers.dat` with a backup. Ely.by OAuth and Legacy accounts support sign-in/import, DPAPI storage, token refresh, and selection; retired Mojang profiles import as offline identities for local play. The version manager exposes source category filters, remote visibility, only-installed and pre-1.7.10 filters, and imports these settings. The personal US notice feed with embedded/remote images, Minecraft `servers.dat` management and quick play, Microsoft profile creation, loader isolation, tri-state game folders, Java mode/compatibility handling, US crash signatures, log browsing, custom version inheritance, in-task Range resume, and supported Java settings migration are implemented.
+Next: validate the checksum-verified executable download and Windows updater handoff against a published release, then continue remaining source scenes/settings, localization, visual-scale comparison, and end-to-end runtime review. The update check uses the Rust project's GitHub Releases and displays release notes; a tag-triggered Windows workflow prepares executable, portable ZIP, and SHA-256 assets. The current repository has no published release yet, so the download and restart handoff have not been exercised with a release artifact. In the Java source, `UpdateFrame` is shown after the bootstrap update flow supplies notes; `NewFeaturesFrame` has no call site in this checkout. Loader parity includes Forge `legacy`, `1.12.2_bug`, and `aquatic` mod-pack argument modes plus `forge_transformer` placeholder expansion; the launch backend also installs Forge, NeoForge, Fabric, LegacyFabric, and Quilt. Bootstrap data now uses the Java source's signed endpoint format, embedded RSA public key, SHA-256 digest and RSA/SHA-1 verification, gzip/bzip2 decoding, host failover, US notice parsing, direct promoted-server merge, notification links, and US/global feedback URLs. The support flow includes opt-in diagnostic upload to the source Pasta endpoint, filtering of lines that may contain credentials, link actions, and a local-save fallback. The unwanted-mod cleanup matches the source filename patterns, default, migration, and launch timing. The ExtraVersionList catalog merge and remote version resolver plus account-specific Ely/plain/Minecraft and optional Patchy library replacements are implemented; end-to-end runtime behavior remains in the final flow-by-flow review. Java settings include a configurable managed-runtime root, detected runtime path/version display, all five optimized argument profiles, current trust-store compatibility, wrapper commands, and migration of their source properties. Promoted-server notice actions offer the selected version and up to two recent releases from each compatible family; available US promotions can be added to `servers.dat` with a backup. Ely.by OAuth and Legacy accounts support sign-in/import, DPAPI storage, token refresh, and selection; retired Mojang profiles import as offline identities for local play. The version manager exposes source category filters, remote visibility, only-installed and pre-1.7.10 filters, and imports these settings. The personal US notice feed with embedded/remote images, Minecraft `servers.dat` management and quick play, Microsoft profile creation, loader isolation, tri-state game folders, Java mode/compatibility handling, US crash signatures, log browsing, custom version inheritance, in-task Range resume, and supported Java settings migration are implemented. The source crash-analysis toggle and opt-in full launch-command logging now migrate from Java settings and control Rust behavior.

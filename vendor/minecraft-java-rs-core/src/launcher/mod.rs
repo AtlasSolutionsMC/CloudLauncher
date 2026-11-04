@@ -6,6 +6,7 @@ pub use events::LaunchEvent;
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
@@ -375,6 +376,7 @@ impl Launcher {
         if options.screen.fullscreen {
             game_args.push("--fullscreen".into());
         }
+        game_args.extend(source_modpack_arguments(options, version_json)?);
 
         let main_class = game_data
             .loader_main_class
@@ -484,7 +486,7 @@ impl Launcher {
         } else {
             cmd_str.replace(access_token.as_str(), "<access_token>")
         };
-        let _ = event_tx.send(LaunchEvent::Data(sanitized)).await;
+        let _ = event_tx.send(LaunchEvent::Command(sanitized)).await;
 
         // Spawn the process.
         let program = full_command
@@ -642,6 +644,132 @@ impl Launcher {
         ];
         logs.iter()
             .any(|line| PATTERNS.iter().any(|pat| line.contains(pat)))
+    }
+}
+
+/// Reproduce Legacy Launcher's extra launch arguments for Forge mod-pack
+/// metadata in custom version JSON. Modern loader arguments still come from
+/// the loader backend; this covers the source's legacy `mods` library type.
+fn source_modpack_arguments(
+    options: &LaunchOptions,
+    version_json: &crate::models::minecraft::MinecraftVersionJson,
+) -> Result<Vec<String>, LaunchError> {
+    let mod_refs: Vec<String> = version_json
+        .libraries
+        .iter()
+        .filter(|library| {
+            library.library_type.as_deref() == Some("mod")
+                || library.mod_flag.unwrap_or(false)
+        })
+        .filter(|library| {
+            !crate::utils::platform::skip_library(library.rules.as_deref().unwrap_or(&[]))
+        })
+        .map(|library| library.name.clone())
+        .collect();
+    if mod_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let modpack_type = if version_json.mod_list_absolute_prefix {
+        SourceModpackType::LegacyAbsolute
+    } else {
+        match version_json.modpack.as_deref() {
+            Some("legacy") => SourceModpackType::Legacy,
+            Some("1.12.2_bug") => SourceModpackType::LegacyAbsolute,
+            Some("aquatic") => SourceModpackType::Forge113,
+            Some("none") => SourceModpackType::None,
+            _ => infer_source_modpack_type(
+                version_json
+                    .jar
+                    .as_deref()
+                    .unwrap_or(&version_json.id),
+            ),
+        }
+    };
+
+    match modpack_type {
+        SourceModpackType::Legacy | SourceModpackType::LegacyAbsolute => {
+            let save_dir = options.save_dir();
+            std::fs::create_dir_all(&save_dir)?;
+            if let Ok(entries) = std::fs::read_dir(&save_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("tempModList-")
+                        && path.is_file()
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+
+            let library_root = options.path.join("libraries");
+            let absolute_library_root = if library_root.is_absolute() {
+                library_root
+            } else {
+                std::env::current_dir()?.join(library_root)
+            };
+            let mut repository_root = absolute_library_root.to_string_lossy().into_owned();
+            if matches!(modpack_type, SourceModpackType::LegacyAbsolute) {
+                repository_root.insert_str(0, "absolute:");
+            }
+            let mod_list = serde_json::json!({
+                "repositoryRoot": repository_root,
+                "modRef": mod_refs,
+            });
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let filename = format!("tempModList-{}-{timestamp}", std::process::id());
+            std::fs::write(
+                save_dir.join(&filename),
+                serde_json::to_vec(&mod_list)?,
+            )?;
+            Ok(vec!["--modListFile".to_owned(), filename])
+        }
+        SourceModpackType::Forge113 => Ok(vec![
+            "--fml.mods".to_owned(),
+            mod_refs.join(","),
+            "--fml.mavenRoots".to_owned(),
+            if options.instance.is_some() {
+                "../../libraries".to_owned()
+            } else {
+                "libraries".to_owned()
+            },
+        ]),
+        SourceModpackType::None => Ok(Vec::new()),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceModpackType {
+    Legacy,
+    LegacyAbsolute,
+    Forge113,
+    None,
+}
+
+fn infer_source_modpack_type(version: &str) -> SourceModpackType {
+    let version = version.trim();
+    let normalized = if version.matches('.').count() == 1 {
+        format!("{version}.0")
+    } else {
+        version.to_owned()
+    };
+    let Ok(version) = semver::Version::parse(&normalized) else {
+        return SourceModpackType::None;
+    };
+    if version >= semver::Version::new(1, 13, 0) {
+        SourceModpackType::Forge113
+    } else if version == semver::Version::new(1, 12, 2) {
+        SourceModpackType::LegacyAbsolute
+    } else if version >= semver::Version::new(1, 7, 10) {
+        SourceModpackType::Legacy
+    } else {
+        SourceModpackType::None
     }
 }
 
