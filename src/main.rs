@@ -463,6 +463,7 @@ struct LauncherApp {
     auto_launch_pending: bool,
     launcher_window_state_seen: bool,
     show_account_dialog: bool,
+    show_account_help: bool,
     require_minecraft_account: bool,
     show_require_minecraft_account_notice: bool,
     new_account: String,
@@ -3351,6 +3352,21 @@ impl eframe::App for LauncherApp {
                                 {
                                     self.open_ely_legacy_dialog();
                                 }
+                                ui.separator();
+                                if ui
+                                    .button(tr("account.manager.multipane.add-account.hint"))
+                                    .clicked()
+                                {
+                                    self.show_account_help = true;
+                                }
+                                if ui
+                                    .button(tr(
+                                        "account.manager.multipane.add-account.buy-minecraft",
+                                    ))
+                                    .clicked()
+                                {
+                                    open_url("https://minecraft.net/store/minecraft");
+                                }
                             });
 
                         ComboBox::from_id_salt("version_selector")
@@ -4790,6 +4806,47 @@ impl eframe::App for LauncherApp {
                         }
                     });
                 });
+        }
+
+        if self.show_account_help {
+            let mut open = true;
+            let mut close = false;
+            let mut open_minecraft_store = false;
+            let mut open_ely_registration = false;
+            egui::Window::new(tr("rust.ui.window.account.help"))
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(tr("rust.ui.account.help.microsoft"));
+                    ui.add_space(6.0);
+                    ui.label(tr("rust.ui.account.help.offline"));
+                    ui.add_space(6.0);
+                    ui.label(tr("rust.ui.account.help.ely"));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(tr("account.manager.multipane.add-account.buy-minecraft"))
+                            .clicked()
+                        {
+                            open_minecraft_store = true;
+                        }
+                        if ui.button(tr("rust.ui.account.help.ely-register")).clicked() {
+                            open_ely_registration = true;
+                        }
+                        if ui.button(tr("support.button.close")).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            self.show_account_help = open && !close;
+            if open_minecraft_store {
+                open_url("https://minecraft.net/store/minecraft");
+            }
+            if open_ely_registration {
+                open_url("https://ely.by");
+            }
         }
 
         if self.show_ely_dialog {
