@@ -39,12 +39,17 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Protect Microsoft refresh tokens with the current Windows user's DPAPI.
 - [x] Add Minecraft profile creation during Microsoft sign-in when the account lacks one.
 - [x] Migrate retired Mojang entries from `tlauncher_profiles.json` to offline identities with their selected profile UUID; online authentication requires Microsoft sign-in.
+- [x] Port the bootstrap `--requireMinecraftAccount` gate for new offline/Ely accounts, show the US license-required notice, and retain imported Mojang identity for the source-compatible exception.
 - [x] Import offline, Microsoft, Ely.by OAuth, and Ely.by Legacy accounts from `tlauncher_profiles.json`, preserving offline UUIDs and moving online credentials into DPAPI storage.
 - [x] Import supported Java launcher game, display, Java, argument, directory, and launch-action settings from `legacy.properties`.
-- [x] Import `login.auto` and `gui.size`; use the source's 1000×600 initial launcher size and expose editable dimensions.
+- [x] Import `login.auto`, `login.version`, `gui.size`, and `gui.window`; use the source's 1000×600 initial launcher size, expose editable dimensions, and preserve maximized state.
 - [x] Import notice visibility, promoted-notice preference, and per-notice hide expiries from `legacy.properties`.
 - [x] Import the crash scanning and full launch command logging preferences.
 - [x] Import and expose the source's nine login-form positions.
+- [x] Import `gui.font`, clamp it to the source's 12–18 pt range, and apply it as launcher-wide UI scaling with a live preferences control.
+- [x] Import `gui.background` image paths and add a live background image picker/reset; video backgrounds remain unsupported.
+- [x] Import `gui.logger.width/height/x/y`, use them as the log viewer's initial geometry, and persist its size and position after moving/resizing.
+- [x] Import `gui.logger`, add the source Global/None setting, show live game output in Global mode, and turn Global mode off when the log window is closed.
 - [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.
 - [x] Preserve each offline account's `elySkins` preference (defaulting to the Java source's `true` value), import it from `tlauncher_profiles.json`, and apply the matching Ely/plain/Minecraft replacement libraries from `libraries/replace.json` with repo failover and isolated launch caches.
@@ -57,6 +62,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Load installed custom version JSON, resolve `inheritsFrom` parents locally or from Mojang, merge libraries/arguments/downloads, and reject cycles or unsafe IDs.
 - [x] Fetch Legacy Launcher's ExtraVersionList alongside Mojang from the source host mirrors, retain all extra release types, and route selected versions through the launch backend; normalize repository-relative JSON URLs and fail over between mirrors.
 - [x] Match source category defaults, old-release/old-alpha/old-beta handling, only-installed filtering, and local/remote catalog visibility; import these controls from `legacy.properties`.
+- [x] Import and expose the source `gui.alerton.*` preferences, compare refreshed remote versions with `versions/versions.json`, and show the source US update alert with relative release times.
 - [x] Show per-category progress, speed and ETA, support cancellation, and return download/launch errors to the UI.
 - [x] Retry network/5xx/429 download failures with backoff and write through temporary files so interrupted downloads do not replace valid files.
 - [x] Continue interrupted file transfers with HTTP Range retries, then validate final size and checksum before commit.

@@ -9,9 +9,16 @@ Implementation is ongoing; feature parity remains incomplete.
 - Windows x64 Rust launcher with the reference login screen, US English locale, account/version/settings screens, and a portable packaging script.
 - Login panel placement can be selected from all nine positions supported by the Java launcher and is imported from `legacy.properties`.
 - Offline, Microsoft, Ely.by OAuth, and Ely.by Legacy account flows.
+- Optional `--requireMinecraftAccount` account-add gate with the source US warning and Mojang-import exception.
 - Minecraft version catalog and lifecycle, custom inherited versions, Java runtime management, Forge/NeoForge/Fabric/LegacyFabric/Quilt launch paths, and source Forge mod-pack argument compatibility.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostic upload.
 - Source crash-analysis and full-command logging preferences, with legacy settings migration.
+- Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.
+- Legacy `gui.background` image migration and live image selection/reset; video backgrounds are still open.
+- Legacy log-window dimensions and position migration, with current viewer geometry saved across launches.
+- Source `gui.logger` Global/None mode with automatic live game output and close-to-disable behavior.
+- Migration and persistence for the selected Minecraft version and maximized launcher window state.
+- Source version update alerts for enabled release types, backed by the compatible `versions/versions.json` cache and imported `gui.alerton.*` settings.
 - Settings and common dialog labels now resolve from the US locale resource.
 - US personal notices and signed bootstrap configuration with US notices, promoted servers, and notification links.
 - Manual GitHub release checks with release notes, bounded executable download, SHA-256 verification, and a Windows replacement/restart handoff; a tag-triggered workflow publishes the assets.

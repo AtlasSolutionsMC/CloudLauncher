@@ -25,7 +25,7 @@ use minecraft_java_rs_core::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -38,6 +38,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime},
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const EN_US: &str = include_str!("../assets/lang/lang_en_US.properties");
 const FALLBACK_VERSIONS: &[&str] = &["26.3", "1.21.11", "1.21.10", "1.20.1", "1.8.9"];
@@ -46,6 +47,7 @@ const FALLBACK_VERSIONS: &[&str] = &["26.3", "1.21.11", "1.21.10", "1.20.1", "1.
 #[serde(default)]
 struct SavedSettings {
     accounts: Vec<String>,
+    migrated_mojang_accounts: Vec<String>,
     offline_account_uuids: HashMap<String, String>,
     offline_ely_skins: HashMap<String, bool>,
     microsoft_accounts: Vec<MicrosoftAccountProfile>,
@@ -60,16 +62,24 @@ struct SavedSettings {
     notices_enabled: bool,
     promoted_notices_enabled: bool,
     promoted_servers_in_game: bool,
+    logger_mode: String,
     show_full_game_command: bool,
     crash_detection_enabled: bool,
     remove_undesirable_mods: bool,
     delete_patchy: bool,
+    launcher_font_size: f32,
     launcher_window_width: u32,
     launcher_window_height: u32,
+    launcher_maximized: bool,
+    log_window_width: u32,
+    log_window_height: u32,
+    log_window_x: i32,
+    log_window_y: i32,
     login_form_direction: String,
     hidden_notices_until: HashMap<String, u64>,
     servers: Vec<SavedServer>,
     servers_cache_root: String,
+    background_path: String,
     game_directory: String,
     legacy_profiles_path: String,
     legacy_config_path: String,
@@ -97,6 +107,7 @@ struct SavedSettings {
     version_include_remote: bool,
     version_show_old_releases: bool,
     version_catalog_types: HashMap<String, bool>,
+    version_alert_types: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -160,6 +171,22 @@ struct SavedServer {
     hide_address: bool,
     #[serde(default)]
     accept_textures: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedVersion {
+    id: String,
+    #[serde(rename = "type")]
+    version_type: String,
+    #[serde(default)]
+    time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct CachedVersionList {
+    versions: Vec<CachedVersion>,
 }
 
 #[derive(Clone)]
@@ -237,6 +264,7 @@ impl Default for SavedSettings {
     fn default() -> Self {
         Self {
             accounts: Vec::new(),
+            migrated_mojang_accounts: Vec::new(),
             offline_account_uuids: HashMap::new(),
             offline_ely_skins: HashMap::new(),
             microsoft_accounts: Vec::new(),
@@ -251,16 +279,24 @@ impl Default for SavedSettings {
             notices_enabled: true,
             promoted_notices_enabled: true,
             promoted_servers_in_game: true,
+            logger_mode: "none".to_owned(),
             show_full_game_command: false,
             crash_detection_enabled: true,
             remove_undesirable_mods: true,
             delete_patchy: true,
+            launcher_font_size: 12.0,
             launcher_window_width: 1000,
             launcher_window_height: 600,
+            launcher_maximized: false,
+            log_window_width: 720,
+            log_window_height: 500,
+            log_window_x: 30,
+            log_window_y: 30,
             login_form_direction: "top_left".to_owned(),
             hidden_notices_until: HashMap::new(),
             servers: Vec::new(),
             servers_cache_root: String::new(),
+            background_path: String::new(),
             game_directory: default_game_directory().to_string_lossy().into_owned(),
             legacy_profiles_path: String::new(),
             legacy_config_path: default_legacy_config_path().to_string_lossy().into_owned(),
@@ -287,6 +323,7 @@ impl Default for SavedSettings {
             version_include_remote: true,
             version_show_old_releases: true,
             version_catalog_types: default_version_catalog_types(),
+            version_alert_types: default_version_alert_types(),
         }
     }
 }
@@ -306,11 +343,16 @@ struct LauncherApp {
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
     version_catalog_loading: bool,
+    version_update_alert: Option<String>,
+    version_alert_has_refreshed: bool,
     version_search: String,
     version_kind_filter: String,
     confirm_remove_version: Option<String>,
     auto_launch_pending: bool,
+    launcher_window_state_seen: bool,
     show_account_dialog: bool,
+    require_minecraft_account: bool,
+    show_require_minecraft_account_notice: bool,
     new_account: String,
     new_account_allow_invalid: bool,
     new_account_ely_skins: bool,
@@ -344,6 +386,7 @@ struct LauncherApp {
     diagnostic_result_url: Option<String>,
     diagnostic_error: Option<String>,
     show_log_window: bool,
+    show_live_game_log: bool,
     selected_log_path: Option<PathBuf>,
     show_settings_menu: bool,
     settings_menu_pos: Pos2,
@@ -396,8 +439,8 @@ struct LauncherApp {
 }
 
 impl LauncherApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let assets = Assets {
+    fn new(cc: &eframe::CreationContext<'_>, require_minecraft_account: bool) -> Self {
+        let mut assets = Assets {
             background: load_texture(
                 &cc.egui_ctx,
                 "background",
@@ -431,6 +474,24 @@ impl LauncherApp {
         };
         let first_run_pending = !settings_path().is_file();
         let settings = load_settings();
+        let show_global_logger = settings.logger_mode == "global";
+        let background_load_error = if settings.background_path.trim().is_empty() {
+            None
+        } else {
+            match load_texture_from_path(
+                &cc.egui_ctx,
+                "background",
+                Path::new(&settings.background_path),
+            ) {
+                Ok(background) => {
+                    assets.background = background;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        cc.egui_ctx
+            .set_zoom_factor(settings.launcher_font_size / 12.0);
         let first_run_folder_current_directory = PathBuf::from(settings.game_directory.trim());
         let first_run_folder_suggestion = first_run_pending
             .then(|| first_run_game_directory_suggestion(&first_run_folder_current_directory))
@@ -448,6 +509,7 @@ impl LauncherApp {
         Self {
             settings,
             assets: Some(assets),
+            require_minecraft_account,
             show_first_run_notice: first_run_pending,
             show_first_run_folder_notice,
             first_run_folder_current_directory,
@@ -455,12 +517,17 @@ impl LauncherApp {
             show_arm_compat_notice,
             version_catalog_events: Some(spawn_catalog_fetch()),
             version_catalog_loading: true,
+            show_log_window: show_global_logger,
+            show_live_game_log: show_global_logger,
             bootstrap_events: Some(spawn_bootstrap_fetch()),
             bootstrap_loading: true,
             notice_events,
             notices_loading,
             version_kind_filter: "all".to_owned(),
             auto_launch_pending,
+            status: background_load_error
+                .map(|error| tr("rust.status.background.load-error").replace("%0", &error))
+                .unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -1218,6 +1285,9 @@ impl LauncherApp {
     }
 
     fn open_account_dialog(&mut self) {
+        if !self.allow_non_minecraft_account() {
+            return;
+        }
         self.new_account.clear();
         self.new_account_allow_invalid = false;
         self.new_account_ely_skins = true;
@@ -1263,9 +1333,27 @@ impl LauncherApp {
     }
 
     fn open_ely_legacy_dialog(&mut self) {
+        if !self.allow_non_minecraft_account() {
+            return;
+        }
         self.ely_legacy_username.clear();
         self.ely_legacy_password.clear();
         self.show_ely_legacy_dialog = true;
+    }
+
+    fn open_ely_dialog(&mut self) {
+        if !self.allow_non_minecraft_account() {
+            return;
+        }
+        self.show_ely_dialog = true;
+    }
+
+    fn allow_non_minecraft_account(&mut self) -> bool {
+        if !self.require_minecraft_account || has_licensed_minecraft_account(&self.settings) {
+            return true;
+        }
+        self.show_require_minecraft_account_notice = true;
+        false
     }
 
     fn start_ely_legacy_sign_in(&mut self) {
@@ -1680,6 +1768,10 @@ impl LauncherApp {
         let (update_tx, update_rx) = mpsc::channel();
         self.launch_events = Some(update_rx);
         self.launching = true;
+        if self.settings.logger_mode == "global" {
+            self.show_log_window = true;
+            self.show_live_game_log = true;
+        }
         self.launch_progress = Some(0.0);
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
@@ -2089,6 +2181,21 @@ impl LauncherApp {
                 )
                 .changed();
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr("settings.alert-on.label"));
+            for (kind, label_key) in [
+                ("release", "settings.alert-on.release"),
+                ("snapshot", "settings.alert-on.snapshot"),
+                ("modified", "settings.alert-on.modified"),
+            ] {
+                let enabled = self
+                    .settings
+                    .version_alert_types
+                    .entry(kind.to_owned())
+                    .or_insert(false);
+                filter_settings_changed |= ui.checkbox(enabled, tr(label_key)).changed();
+            }
+        });
         if filter_settings_changed {
             self.persist();
         }
@@ -2182,6 +2289,13 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
+        if let Some(maximized) = ctx.input(|input| input.viewport().maximized) {
+            if self.launcher_window_state_seen && maximized != self.settings.launcher_maximized {
+                self.settings.launcher_maximized = maximized;
+                self.persist();
+            }
+            self.launcher_window_state_seen = true;
+        }
         if ctx.input(|input| input.viewport().close_requested())
             && !self.settings.feedback_acknowledged
             && self.bootstrap_feedback_url.is_some()
@@ -2266,6 +2380,13 @@ impl eframe::App for LauncherApp {
             match result {
                 Ok(manifest) => {
                     let version_count = manifest.versions.len();
+                    let first_update = !self.version_alert_has_refreshed;
+                    self.version_alert_has_refreshed = true;
+                    if let Some(alert) =
+                        refresh_version_alert_index(&manifest, &self.settings, first_update)
+                    {
+                        self.version_update_alert = Some(alert);
+                    }
                     self.version_manifest = Some(manifest);
                     self.status =
                         tr("rust.status.catalog.loaded").replace("%0", &version_count.to_string());
@@ -2572,7 +2693,7 @@ impl eframe::App for LauncherApp {
                                     )
                                     .clicked()
                                 {
-                                    self.show_ely_dialog = true;
+                                    self.open_ely_dialog();
                                 }
                                 if ui
                                     .add_enabled(
@@ -3298,9 +3419,16 @@ impl eframe::App for LauncherApp {
             let mut selected = self.selected_log_path.clone();
             let mut open = true;
             let mut copy_text = None;
-            egui::Window::new(tr("rust.ui.window.logs"))
+            let window_response = egui::Window::new(tr("rust.ui.window.logs"))
                 .open(&mut open)
-                .default_size([760.0, 520.0])
+                .default_pos(Pos2::new(
+                    self.settings.log_window_x as f32,
+                    self.settings.log_window_y as f32,
+                ))
+                .default_size([
+                    self.settings.log_window_width as f32,
+                    self.settings.log_window_height as f32,
+                ])
                 .resizable(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
@@ -3323,6 +3451,16 @@ impl eframe::App for LauncherApp {
                     ui.columns(2, |columns| {
                         columns[0].set_min_width(220.0);
                         egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
+                            if ui
+                                .selectable_label(
+                                    self.show_live_game_log,
+                                    tr("rust.ui.logs.live-session"),
+                                )
+                                .clicked()
+                            {
+                                self.show_live_game_log = true;
+                                selected = None;
+                            }
                             if log_files.is_empty() {
                                 ui.label(tr("rust.ui.logs.empty"));
                             }
@@ -3345,11 +3483,44 @@ impl eframe::App for LauncherApp {
                                         .map(|name| name.to_string_lossy())
                                         .unwrap_or_default()
                                 );
-                                ui.selectable_value(&mut selected, Some(path.clone()), label);
+                                if ui
+                                    .selectable_value(&mut selected, Some(path.clone()), label)
+                                    .clicked()
+                                {
+                                    self.show_live_game_log = false;
+                                }
                             }
                         });
                         columns[1].vertical(|ui| {
-                            if let Some(path) = &selected {
+                            if self.show_live_game_log {
+                                let text = self
+                                    .game_log
+                                    .lock()
+                                    .map(|lines| {
+                                        lines.iter().cloned().collect::<Vec<_>>().join("\n")
+                                    })
+                                    .unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    ui.strong(tr("rust.ui.logs.live-session"));
+                                    if ui.small_button(tr("rust.ui.logs.copy")).clicked() {
+                                        copy_text = Some(text.clone());
+                                    }
+                                });
+                                if text.is_empty() {
+                                    ui.label(tr("rust.ui.logs.live-empty"));
+                                } else {
+                                    let mut display_text = text;
+                                    egui::ScrollArea::vertical().show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut display_text)
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(24)
+                                                .interactive(false),
+                                        );
+                                    });
+                                }
+                            } else if let Some(path) = &selected {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -3378,11 +3549,78 @@ impl eframe::App for LauncherApp {
                         });
                     });
                 });
+            if let Some(response) = window_response {
+                let rect = response.response.rect;
+                let width = (rect.width().round() as u32).clamp(400, 4096);
+                let height = (rect.height().round() as u32).clamp(300, 2160);
+                let x = (rect.left().round() as i32).clamp(-16_384, 16_384);
+                let y = (rect.top().round() as i32).clamp(-16_384, 16_384);
+                let changed = width != self.settings.log_window_width
+                    || height != self.settings.log_window_height
+                    || x != self.settings.log_window_x
+                    || y != self.settings.log_window_y;
+                if changed && (!open || ctx.input(|input| input.pointer.any_released())) {
+                    self.settings.log_window_width = width;
+                    self.settings.log_window_height = height;
+                    self.settings.log_window_x = x;
+                    self.settings.log_window_y = y;
+                    self.persist();
+                }
+            }
+            if !open && self.settings.logger_mode == "global" {
+                self.settings.logger_mode = "none".to_owned();
+                self.show_live_game_log = false;
+                self.persist();
+            }
             self.show_log_window = open;
             self.selected_log_path = selected;
             if let Some(text) = copy_text {
                 ctx.copy_text(text);
                 self.status = tr("rust.status.logs.copied").to_owned();
+            }
+        }
+
+        if self.show_require_minecraft_account_notice {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new(tr("support.require_minecraft_account.title"))
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading(tr("support.require_minecraft_account.title"));
+                    ui.label(tr("support.require_minecraft_account.body"));
+                    ui.add_space(8.0);
+                    if ui.button(tr("support.button.close")).clicked() {
+                        close = true;
+                    }
+                });
+            self.show_require_minecraft_account_notice = open && !close;
+        }
+
+        if let Some(alert) = self.version_update_alert.clone() {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new(tr("version.manager.alert.title"))
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([440.0, 360.0])
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.label(&alert);
+                        });
+                    ui.add_space(8.0);
+                    if ui.button(tr("support.button.close")).clicked() {
+                        close = true;
+                    }
+                });
+            if close || !open {
+                self.version_update_alert = None;
             }
         }
 
@@ -3440,8 +3678,21 @@ impl eframe::App for LauncherApp {
                                 } else {
                                     if let Some(old_name) = old_name {
                                         if old_name != name {
+                                            let was_migrated_mojang = self
+                                                .settings
+                                                .migrated_mojang_accounts
+                                                .iter()
+                                                .any(|saved| saved.eq_ignore_ascii_case(&old_name));
                                             let preserved_uuid =
                                                 offline_account_uuid_for(&self.settings, &old_name);
+                                            self.settings
+                                                .migrated_mojang_accounts
+                                                .retain(|saved| !saved.eq_ignore_ascii_case(&old_name));
+                                            if was_migrated_mojang {
+                                                self.settings
+                                                    .migrated_mojang_accounts
+                                                    .push(name.clone());
+                                            }
                                             self.settings.offline_account_uuids.retain(
                                                 |saved, _| !saved.eq_ignore_ascii_case(&old_name),
                                             );
@@ -3644,6 +3895,8 @@ impl eframe::App for LauncherApp {
             }
             let mut open = true;
             let mut browse_game_directory = false;
+            let mut browse_background_file = false;
+            let mut logger_mode_changed = false;
             egui::Window::new(settings_page_title(title))
                 .open(&mut open)
                 .collapsible(false)
@@ -3652,6 +3905,46 @@ impl eframe::App for LauncherApp {
                 .show(ctx, |ui| match title {
                     "Launcher & game preferences" => {
                         ui.label(tr("rust.settings.locale.english-us"));
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.slide.list.label"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.background_path)
+                                    .desired_width(280.0)
+                                    .interactive(false),
+                            );
+                            if ui.button(tr("newfolder.select.browse")).clicked() {
+                                browse_background_file = true;
+                            }
+                            if ui.button(tr("rust.settings.background.default")).clicked() {
+                                self.settings.background_path.clear();
+                                self.persist();
+                                if let Some(assets) = &mut self.assets {
+                                    assets.background = load_texture(
+                                        ui.ctx(),
+                                        "background",
+                                        include_bytes!("../assets/plains.jpg"),
+                                        false,
+                                    );
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.fontsize.label"));
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.settings.launcher_font_size,
+                                        12.0..=18.0,
+                                    )
+                                    .integer()
+                                    .suffix(format!(" {}", tr("settings.fontsize.pt"))),
+                                )
+                                .changed()
+                            {
+                                ui.ctx().set_zoom_factor(self.settings.launcher_font_size / 12.0);
+                                self.persist();
+                            }
+                        });
                         ui.separator();
                         ui.label(tr("settings.client.gamedir.label"));
                         ui.horizontal(|ui| {
@@ -3843,6 +4136,29 @@ impl eframe::App for LauncherApp {
                         {
                             self.persist();
                         }
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.logger.label"));
+                            ComboBox::from_id_salt("logger_mode")
+                                .selected_text(tr(if self.settings.logger_mode == "global" {
+                                    "settings.logger.global"
+                                } else {
+                                    "settings.logger.none"
+                                }))
+                                .show_ui(ui, |ui| {
+                                    for (mode, label) in [
+                                        ("global", "settings.logger.global"),
+                                        ("none", "settings.logger.none"),
+                                    ] {
+                                        logger_mode_changed |= ui
+                                            .selectable_value(
+                                                &mut self.settings.logger_mode,
+                                                mode.to_owned(),
+                                                tr(label),
+                                            )
+                                            .changed();
+                                    }
+                                });
+                        });
                         if ui
                             .checkbox(
                                 &mut self.settings.delete_patchy,
@@ -4340,6 +4656,9 @@ impl eframe::App for LauncherApp {
                         if let Some(account) = remove_account {
                             self.settings.accounts.retain(|saved| saved != &account);
                             self.settings
+                                .migrated_mojang_accounts
+                                .retain(|saved| !saved.eq_ignore_ascii_case(&account));
+                            self.settings
                                 .offline_account_uuids
                                 .retain(|saved, _| !saved.eq_ignore_ascii_case(&account));
                             self.settings
@@ -4480,7 +4799,7 @@ impl eframe::App for LauncherApp {
                             )
                             .clicked()
                         {
-                            self.show_ely_dialog = true;
+                            self.open_ely_dialog();
                         }
                         if self.ely_signin_pending {
                             ui.horizontal(|ui| {
@@ -4573,6 +4892,16 @@ impl eframe::App for LauncherApp {
                     }
                     _ => {}
                 });
+            if logger_mode_changed {
+                self.persist();
+                if self.settings.logger_mode == "global" {
+                    self.show_log_window = true;
+                    self.show_live_game_log = true;
+                } else if self.show_live_game_log {
+                    self.show_log_window = false;
+                    self.show_live_game_log = false;
+                }
+            }
             if browse_game_directory {
                 let current_directory = self.game_dir_path();
                 let mut dialog =
@@ -4590,6 +4919,30 @@ impl eframe::App for LauncherApp {
                         self.persist();
                     } else {
                         self.status = tr("settings.client.gamedir.noaccess").to_owned();
+                    }
+                }
+            }
+            if browse_background_file {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(tr("settings.slide.list.prompt.image"))
+                    .add_filter(
+                        tr("rust.settings.background.filter"),
+                        &["jpg", "jpeg", "png"],
+                    )
+                    .pick_file()
+                {
+                    match load_texture_from_path(ctx, "background", &path) {
+                        Ok(background) => {
+                            self.settings.background_path = path.to_string_lossy().into_owned();
+                            if let Some(assets) = &mut self.assets {
+                                assets.background = background;
+                            }
+                            self.persist();
+                        }
+                        Err(error) => {
+                            self.status =
+                                tr("rust.status.background.load-error").replace("%0", &error);
+                        }
                     }
                 }
             }
@@ -5541,6 +5894,16 @@ fn offline_account_uuid_for(settings: &SavedSettings, username: &str) -> Option<
         .map(|(_, uuid)| uuid.clone())
 }
 
+fn has_licensed_minecraft_account(settings: &SavedSettings) -> bool {
+    !settings.microsoft_accounts.is_empty()
+        || settings.migrated_mojang_accounts.iter().any(|legacy_name| {
+            settings
+                .accounts
+                .iter()
+                .any(|saved| saved.eq_ignore_ascii_case(legacy_name))
+        })
+}
+
 fn offline_ely_skins_for(settings: &SavedSettings, username: &str) -> bool {
     settings
         .offline_ely_skins
@@ -5964,7 +6327,49 @@ fn icon_button(ui: &mut egui::Ui, name: &'static str, texture: &TextureHandle) -
 }
 
 fn load_texture(ctx: &Context, name: &str, bytes: &[u8], recolor: bool) -> TextureHandle {
-    let decoded = image::load_from_memory(bytes).expect("embedded launcher image is valid");
+    load_texture_from_bytes(ctx, name, bytes, recolor).expect("embedded launcher image is valid")
+}
+
+fn load_texture_from_path(ctx: &Context, name: &str, path: &Path) -> Result<TextureHandle, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > 64 * 1024 * 1024 {
+        return Err("image file is larger than 64 MB".to_owned());
+    }
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    texture_from_decoded_image(ctx, name, decoded, false)
+}
+
+fn load_texture_from_bytes(
+    ctx: &Context,
+    name: &str,
+    bytes: &[u8],
+    recolor: bool,
+) -> Result<TextureHandle, String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("could not decode image: {error}"))?;
+    texture_from_decoded_image(ctx, name, decoded, recolor)
+}
+
+fn texture_from_decoded_image(
+    ctx: &Context,
+    name: &str,
+    decoded: image::DynamicImage,
+    recolor: bool,
+) -> Result<TextureHandle, String> {
+    if u64::from(decoded.width()) * u64::from(decoded.height()) > 32_000_000 {
+        return Err("image dimensions are larger than 32 megapixels".to_owned());
+    }
     let mut rgba = decoded.to_rgba8();
     if recolor {
         for pixel in rgba.pixels_mut() {
@@ -5979,7 +6384,7 @@ fn load_texture(ctx: &Context, name: &str, bytes: &[u8], recolor: bool) -> Textu
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
     );
-    ctx.load_texture(name, image, TextureOptions::LINEAR)
+    Ok(ctx.load_texture(name, image, TextureOptions::LINEAR))
 }
 
 fn load_optional_texture(ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
@@ -6025,6 +6430,18 @@ fn tr(key: &'static str) -> &'static str {
             (candidate.trim() == key).then_some(value.trim())
         })
         .unwrap_or(key)
+}
+
+fn tr_dynamic(key: &str) -> String {
+    EN_US
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .find_map(|line| {
+            let (candidate, value) = line.split_once('=')?;
+            (candidate.trim() == key).then_some(value.trim())
+        })
+        .unwrap_or(key)
+        .to_owned()
 }
 
 fn settings_path() -> PathBuf {
@@ -6142,6 +6559,18 @@ fn load_settings() -> SavedSettings {
     }
     settings.launcher_window_width = settings.launcher_window_width.clamp(540, 7680);
     settings.launcher_window_height = settings.launcher_window_height.clamp(360, 4320);
+    if !matches!(settings.logger_mode.as_str(), "global" | "none") {
+        settings.logger_mode = "none".to_owned();
+    }
+    settings.launcher_font_size = if settings.launcher_font_size.is_finite() {
+        settings.launcher_font_size.clamp(12.0, 18.0)
+    } else {
+        12.0
+    };
+    settings.log_window_width = settings.log_window_width.clamp(400, 4096);
+    settings.log_window_height = settings.log_window_height.clamp(300, 2160);
+    settings.log_window_x = settings.log_window_x.clamp(-16_384, 16_384);
+    settings.log_window_y = settings.log_window_y.clamp(-16_384, 16_384);
     if !matches!(
         settings.login_form_direction.as_str(),
         "top_left"
@@ -6197,6 +6626,9 @@ fn load_settings() -> SavedSettings {
             .entry(kind)
             .or_insert(enabled);
     }
+    for (kind, enabled) in default_version_alert_types() {
+        settings.version_alert_types.entry(kind).or_insert(enabled);
+    }
     settings
 }
 
@@ -6227,6 +6659,14 @@ fn import_legacy_settings(
             settings.game_directory = path.to_string_lossy().into_owned();
         }
         apply("minecraft.gamedir", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("login.version") {
+        let version = value.trim();
+        let valid = valid_version_id(version);
+        if valid {
+            settings.selected_version = version.to_owned();
+        }
+        apply("login.version", valid.then_some(()));
     }
     if let Some(value) = properties.get("minecraft.gamedir.separate") {
         let mode = match value.trim().to_ascii_lowercase().as_str() {
@@ -6262,6 +6702,14 @@ fn import_legacy_settings(
         }
         apply("gui.logger.fullcommand", enabled.map(|_| ()));
     }
+    if let Some(value) = properties.get("gui.logger") {
+        let mode = value.trim().to_ascii_lowercase();
+        let valid = matches!(mode.as_str(), "global" | "none");
+        if valid {
+            settings.logger_mode = mode;
+        }
+        apply("gui.logger", valid.then_some(()));
+    }
     if let Some(value) = properties.get("login.auto") {
         let enabled = parse_legacy_bool(value);
         if let Some(enabled) = enabled {
@@ -6289,6 +6737,80 @@ fn import_legacy_settings(
             settings.launcher_window_height = dimensions[1];
         }
         apply("gui.size", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("gui.window") {
+        let maximized = match value.trim().parse::<i32>().ok() {
+            Some(0) => Some(false),
+            Some(2 | 4 | 6) => Some(true),
+            _ => None,
+        };
+        if let Some(maximized) = maximized {
+            settings.launcher_maximized = maximized;
+        }
+        apply("gui.window", maximized.map(|_| ()))
+    }
+    for (key, destination, minimum, maximum) in [
+        (
+            "gui.logger.width",
+            &mut settings.log_window_width,
+            400,
+            4096,
+        ),
+        (
+            "gui.logger.height",
+            &mut settings.log_window_height,
+            300,
+            2160,
+        ),
+    ] {
+        if let Some(value) = properties.get(key) {
+            let size = value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|size| (minimum..=maximum).contains(size));
+            if let Some(size) = size {
+                *destination = size;
+            }
+            apply(key, size.map(|_| ()));
+        }
+    }
+    for (key, destination) in [
+        ("gui.logger.x", &mut settings.log_window_x),
+        ("gui.logger.y", &mut settings.log_window_y),
+    ] {
+        if let Some(value) = properties.get(key) {
+            let position = value
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|position| (-16_384..=16_384).contains(position));
+            if let Some(position) = position {
+                *destination = position;
+            }
+            apply(key, position.map(|_| ()));
+        }
+    }
+    if let Some(value) = properties.get("gui.font") {
+        let font_size = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|size| size.is_finite() && (12.0..=18.0).contains(size));
+        if let Some(font_size) = font_size {
+            settings.launcher_font_size = font_size;
+        }
+        apply("gui.font", font_size.map(|_| ()))
+    }
+    if let Some(value) = properties.get("gui.background") {
+        let path = PathBuf::from(value.trim());
+        let valid = path.is_file()
+            && fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= 64 * 1024 * 1024)
+            && image::image_dimensions(&path).is_ok();
+        if valid {
+            settings.background_path = path.to_string_lossy().into_owned();
+        }
+        apply("gui.background", valid.then_some(()));
     }
     if let Some(value) = properties.get("gui.direction.loginform") {
         let direction = value.trim().to_ascii_lowercase();
@@ -6493,6 +7015,27 @@ fn import_legacy_settings(
         apply("minecraft.versions.sub.remote", enabled.map(|_| ()));
     }
 
+    for kind in [
+        "release",
+        "snapshot",
+        "modified",
+        "old-beta",
+        "old-alpha",
+        "launcher",
+        "pending",
+    ] {
+        let key = format!("gui.alerton.{kind}");
+        if let Some(value) = properties.get(&key) {
+            let enabled = parse_legacy_bool(value);
+            if let Some(enabled) = enabled {
+                settings
+                    .version_alert_types
+                    .insert(kind.to_owned(), enabled);
+            }
+            apply(&key, enabled.map(|_| ()));
+        }
+    }
+
     for key in ["notice.enabled", "gui.notices.enabled"] {
         if let Some(value) = properties.get(key) {
             let enabled = parse_legacy_bool(value);
@@ -6607,6 +7150,200 @@ fn default_version_catalog_types() -> HashMap<String, bool> {
     .into_iter()
     .map(|(kind, enabled)| (kind.to_owned(), enabled))
     .collect()
+}
+
+fn default_version_alert_types() -> HashMap<String, bool> {
+    [
+        "release",
+        "snapshot",
+        "modified",
+        "old-beta",
+        "old-alpha",
+        "launcher",
+        "pending",
+        "unknown",
+    ]
+    .into_iter()
+    .map(|kind| (kind.to_owned(), false))
+    .collect()
+}
+
+fn refresh_version_alert_index(
+    manifest: &MojangVersionManifest,
+    settings: &SavedSettings,
+    first_update: bool,
+) -> Option<String> {
+    let cache_path = version_alert_cache_path(settings);
+    let alerts_enabled = settings
+        .version_alert_types
+        .values()
+        .any(|enabled| *enabled);
+    if !settings.version_include_remote || !alerts_enabled {
+        let _ = fs::remove_file(cache_path);
+        return None;
+    }
+
+    let current = CachedVersionList {
+        versions: manifest
+            .versions
+            .iter()
+            .filter(|version| !version.id.is_empty())
+            .map(|version| CachedVersion {
+                id: version.id.clone(),
+                version_type: version.version_type.to_ascii_lowercase(),
+                time: (!version.time.trim().is_empty()).then(|| version.time.clone()),
+            })
+            .collect(),
+    };
+    let previous = fs::read(&cache_path)
+        .ok()
+        .filter(|bytes| bytes.len() <= 8 * 1024 * 1024)
+        .and_then(|bytes| serde_json::from_slice::<CachedVersionList>(&bytes).ok());
+    let had_previous = previous.is_some();
+    let alert = previous.and_then(|previous| {
+        let old_ids: HashSet<&str> = previous
+            .versions
+            .iter()
+            .map(|version| version.id.as_str())
+            .collect();
+        let newly_available = current
+            .versions
+            .iter()
+            .filter(|version| {
+                !old_ids.contains(version.id.as_str())
+                    && settings
+                        .version_alert_types
+                        .get(&version.version_type)
+                        .copied()
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (!newly_available.is_empty())
+            .then(|| format_version_update_alert(&newly_available, first_update))
+    });
+    if had_previous && alert.is_none() {
+        return None;
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
+        let _ = fs::write(cache_path, bytes);
+    }
+    alert
+}
+
+fn version_alert_cache_path(settings: &SavedSettings) -> PathBuf {
+    let configured = PathBuf::from(settings.game_directory.trim());
+    let game_directory = if configured.is_absolute() {
+        configured
+    } else {
+        default_game_directory()
+    };
+    game_directory.join("versions").join("versions.json")
+}
+
+fn format_version_update_alert(versions: &[CachedVersion], first_update: bool) -> String {
+    let mut groups: BTreeMap<&str, Vec<&CachedVersion>> = BTreeMap::new();
+    for version in versions {
+        let category = match version.version_type.as_str() {
+            "release" => "release",
+            "snapshot" => "snapshot",
+            _ => "unknown",
+        };
+        groups.entry(category).or_default().push(version);
+    }
+
+    let mut message = tr(if first_update {
+        "version.manager.alert.header.found.welcome"
+    } else {
+        "version.manager.alert.header.found"
+    })
+    .to_owned();
+    message.push(' ');
+
+    if versions.len() == 1 {
+        let version = &versions[0];
+        let category = match version.version_type.as_str() {
+            "release" => "release",
+            "snapshot" => "snapshot",
+            _ => "unknown",
+        };
+        message.push_str(&tr_dynamic(&format!(
+            "version.manager.alert.header.single.{category}"
+        )));
+        message.push('\n');
+        append_alert_version(&mut message, version);
+        return message;
+    }
+
+    message.push_str(tr("version.manager.alert.header.multiple"));
+    message.push('\n');
+    for (category, grouped) in groups {
+        let plural = if grouped.len() == 1 {
+            "single"
+        } else {
+            "multiple"
+        };
+        message.push('\n');
+        message.push_str(&tr_dynamic(&format!(
+            "version.manager.alert.{category}.{plural}"
+        )));
+        message.push('\n');
+        for version in grouped.iter().take(4) {
+            append_alert_version(&mut message, version);
+        }
+        if grouped.len() > 4 {
+            message.push_str(
+                &tr("version.manager.alert.more").replace("%0", &(grouped.len() - 4).to_string()),
+            );
+            message.push('\n');
+        }
+    }
+    message
+}
+
+fn append_alert_version(message: &mut String, version: &CachedVersion) {
+    message.push_str("– ");
+    message.push_str(&version.id);
+    message.push_str(" (");
+    message.push_str(&version_time_ago(version.time.as_deref()));
+    message.push_str(")\n");
+}
+
+fn version_time_ago(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return tr("version.manager.alert.time.unknown").to_owned();
+    };
+    let Ok(published) = OffsetDateTime::parse(value, &Rfc3339) else {
+        return tr("version.manager.alert.time.unknown").to_owned();
+    };
+    let seconds = (OffsetDateTime::now_utc() - published)
+        .whole_seconds()
+        .max(0) as u64;
+    if seconds < 60 {
+        return tr("version.manager.alert.time.justnow").to_owned();
+    }
+    let (unit, count) = if seconds < 3_600 {
+        ("minute", seconds / 60)
+    } else if seconds < 86_400 {
+        ("hour", seconds / 3_600)
+    } else if seconds < 14 * 86_400 {
+        ("day", seconds / 86_400)
+    } else {
+        return tr("version.manager.alert.time.longtimeago").to_owned();
+    };
+    let plural_key = format!("version.manager.alert.time.{unit}.0.plural");
+    let plural_forms = tr_dynamic(&plural_key);
+    let forms = plural_forms.split(';').collect::<Vec<_>>();
+    let form = forms
+        .get(usize::from(count != 1).min(forms.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or("%n");
+    let quantity = form.replace("%n", &count.to_string());
+    tr_dynamic(&format!("version.manager.alert.time.{unit}")).replace("%0", &quantity)
 }
 
 fn default_version_type_enabled(kind: &str) -> bool {
@@ -6822,6 +7559,13 @@ fn import_legacy_accounts(
                         .entry(username.clone())
                         .or_insert(player_uuid);
                     summary.mojang_migrated += 1;
+                }
+                if !settings
+                    .migrated_mojang_accounts
+                    .iter()
+                    .any(|saved| saved.eq_ignore_ascii_case(&username))
+                {
+                    settings.migrated_mojang_accounts.push(username.clone());
                 }
                 if selected
                     .as_ref()
@@ -7556,6 +8300,10 @@ pub(crate) fn open_url(url: &str) {
 }
 
 fn main() -> eframe::Result {
+    let require_minecraft_account = std::env::args_os().skip(1).any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == "--requireMinecraftAccount" || argument == "--require-minecraft-account"
+    });
     let saved_settings = load_settings();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -7563,6 +8311,7 @@ fn main() -> eframe::Result {
                 saved_settings.launcher_window_width as f32,
                 saved_settings.launcher_window_height as f32,
             ])
+            .with_maximized(saved_settings.launcher_maximized)
             .with_min_inner_size([540.0, 360.0])
             .with_title("Legacy Launcher — Rust"),
         ..Default::default()
@@ -7570,6 +8319,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Legacy Launcher — Rust",
         options,
-        Box::new(|cc| Ok(Box::new(LauncherApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(LauncherApp::new(cc, require_minecraft_account)))),
     )
 }
