@@ -62,6 +62,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Import `gui.logger`, add the source Global/None setting, show live launcher events by default, capture Minecraft output in the rolling launcher log, and turn Global mode off when the log window is closed.
 - [x] Replace the generic status-driven logger fallback with explicit status events carrying severity and subsystem targets; launch events and startup background-image errors are logged directly.
 - [ ] Port the remaining Java Log4j diagnostics and compare logger coverage against the Java source. In-memory log records now carry timestamps, levels, and subsystem targets; Minecraft download/process, auth, Java, mod, server, catalog, update, bootstrap, notice, diagnostic, settings-import, and crash events are categorized.
+- [x] Record source-style startup version/platform, working-directory, and settings-file context in the launcher log.
 - [x] Import `bootstrap.switchToBeta` and expose it as an opt-in prerelease update channel for the Rust self-updater.
 - [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.

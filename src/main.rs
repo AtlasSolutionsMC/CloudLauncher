@@ -659,6 +659,31 @@ impl LauncherApp {
                 .unwrap_or_default(),
             ..Default::default()
         };
+        record_launcher_log_event(
+            &app.launcher_log,
+            LogLevel::Info,
+            LogTarget::Launcher,
+            &format!(
+                "Starting Legacy Launcher Rust {} ({}/{})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        );
+        if let Ok(directory) = std::env::current_dir() {
+            record_launcher_log_event(
+                &app.launcher_log,
+                LogLevel::Info,
+                LogTarget::Launcher,
+                &format!("Working directory: {}", directory.display()),
+            );
+        }
+        record_launcher_log_event(
+            &app.launcher_log,
+            LogLevel::Debug,
+            LogTarget::Settings,
+            &format!("Settings file: {}", settings_path().display()),
+        );
         if !app.status.is_empty() {
             let startup_error = app.status.clone();
             app.set_logged_status(LogLevel::Error, LogTarget::Launcher, startup_error);
