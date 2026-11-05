@@ -38,7 +38,9 @@ pub async fn fetch() -> Result<Configuration, String> {
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| format!("Could not create bootstrap configuration request: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.bootstrap.client").replace("%0", &error.to_string())
+        })?;
     let mut last_error = None;
     for host in BOOTSTRAP_HOSTS {
         let url = format!("https://{host}/{brand}/bootstrap.json.mgz.signed");
@@ -46,14 +48,15 @@ pub async fn fetch() -> Result<Configuration, String> {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => response,
                 Err(error) => {
-                    last_error = Some(format!(
-                        "Bootstrap configuration returned an error: {error}"
-                    ));
+                    last_error = Some(
+                        crate::tr("rust.error.bootstrap.http").replace("%0", &error.to_string()),
+                    );
                     continue;
                 }
             },
             Err(error) => {
-                last_error = Some(format!("Could not load bootstrap configuration: {error}"));
+                last_error =
+                    Some(crate::tr("rust.error.bootstrap.fetch").replace("%0", &error.to_string()));
                 continue;
             }
         };
@@ -67,10 +70,12 @@ pub async fn fetch() -> Result<Configuration, String> {
             };
         match decode_signed_options(&payload) {
             Ok(options) => return parse_configuration(&client, options).await,
-            Err(error) => last_error = Some(format!("Invalid bootstrap configuration: {error}")),
+            Err(error) => {
+                last_error = Some(crate::tr("rust.error.bootstrap.invalid").replace("%0", &error));
+            }
         }
     }
-    Err(last_error.unwrap_or_else(|| "Bootstrap configuration is unavailable.".to_owned()))
+    Err(last_error.unwrap_or_else(|| crate::tr("rust.error.bootstrap.unavailable").to_owned()))
 }
 
 async fn read_limited_response(
@@ -81,16 +86,16 @@ async fn read_limited_response(
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err("Bootstrap configuration response is too large.".to_owned());
+        return Err(crate::tr("rust.error.bootstrap.response-large").to_owned());
     }
     let mut payload = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("Could not read bootstrap configuration: {error}"))?
+        .map_err(|error| crate::tr("rust.error.bootstrap.read").replace("%0", &error.to_string()))?
     {
         if payload.len().saturating_add(chunk.len()) > limit {
-            return Err("Bootstrap configuration response is too large.".to_owned());
+            return Err(crate::tr("rust.error.bootstrap.response-large").to_owned());
         }
         payload.extend_from_slice(&chunk);
     }
@@ -99,22 +104,23 @@ async fn read_limited_response(
 
 fn decode_signed_options(payload: &[u8]) -> Result<Value, String> {
     if payload.len() <= SIGNATURE_BYTES {
-        return Err("Signed response is incomplete.".to_owned());
+        return Err(crate::tr("rust.error.bootstrap.signed-incomplete").to_owned());
     }
     let signed_content = &payload[SIGNATURE_BYTES..];
     if signed_content.len() < 5 {
-        return Err("Signed response does not contain a compression marker.".to_owned());
+        return Err(crate::tr("rust.error.bootstrap.marker-missing").to_owned());
     }
     if signed_content.len() > MAX_COMPRESSED_BYTES {
-        return Err("Compressed configuration is too large.".to_owned());
+        return Err(crate::tr("rust.error.bootstrap.compressed-large").to_owned());
     }
     let public_key =
         RsaPublicKey::from_public_key_der(include_bytes!("../assets/bootstrap_public.der"))
             .map_err(|error| {
-                format!("Could not read the bundled bootstrap verification key: {error}")
+                crate::tr("rust.error.bootstrap.key-read").replace("%0", &error.to_string())
             })?;
-    let signature = Signature::try_from(&payload[..SIGNATURE_BYTES])
-        .map_err(|error| format!("Bootstrap signature has an invalid format: {error}"))?;
+    let signature = Signature::try_from(&payload[..SIGNATURE_BYTES]).map_err(|error| {
+        crate::tr("rust.error.bootstrap.signature-format").replace("%0", &error.to_string())
+    })?;
     let digest = Sha256::digest(signed_content);
     let digest_hex = digest
         .iter()
@@ -122,7 +128,7 @@ fn decode_signed_options(payload: &[u8]) -> Result<Value, String> {
         .collect::<String>();
     VerifyingKey::<Sha1>::new(public_key)
         .verify(digest_hex.as_bytes(), &signature)
-        .map_err(|_| "Bootstrap configuration signature verification failed.".to_owned())?;
+        .map_err(|_| crate::tr("rust.error.bootstrap.signature-invalid").to_owned())?;
 
     let (marker, compressed) = signed_content.split_at(5);
     let mut decoded = Vec::new();
@@ -130,19 +136,24 @@ fn decode_signed_options(payload: &[u8]) -> Result<Value, String> {
         b"gzip:" => GzDecoder::new(compressed)
             .take(MAX_CONFIG_BYTES as u64 + 1)
             .read_to_end(&mut decoded)
-            .map_err(|error| format!("Could not decompress bootstrap gzip data: {error}"))?,
+            .map_err(|error| {
+                crate::tr("rust.error.bootstrap.gzip").replace("%0", &error.to_string())
+            })?,
         b"bzip:" => BzDecoder::new(compressed)
             .take(MAX_CONFIG_BYTES as u64 + 1)
             .read_to_end(&mut decoded)
-            .map_err(|error| format!("Could not decompress bootstrap bzip2 data: {error}"))?,
-        _ => return Err("Bootstrap configuration has an unknown compression marker.".to_owned()),
+            .map_err(|error| {
+                crate::tr("rust.error.bootstrap.bzip2").replace("%0", &error.to_string())
+            })?,
+        _ => return Err(crate::tr("rust.error.bootstrap.marker-unknown").to_owned()),
     };
     if decoded.len() > MAX_CONFIG_BYTES {
-        return Err("Decompressed bootstrap configuration is too large.".to_owned());
+        return Err(crate::tr("rust.error.bootstrap.decompressed-large").to_owned());
     }
 
-    let root: Value = serde_json::from_slice(&decoded)
-        .map_err(|error| format!("Bootstrap update metadata is not valid JSON: {error}"))?;
+    let root: Value = serde_json::from_slice(&decoded).map_err(|error| {
+        crate::tr("rust.error.bootstrap.json").replace("%0", &error.to_string())
+    })?;
     let Some(mut options) = root
         .get("options")
         .filter(|value| value.is_object())

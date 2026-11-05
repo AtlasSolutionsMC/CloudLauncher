@@ -37,7 +37,7 @@ pub enum NoticeAction {
 
 pub async fn fetch(client_id: &str) -> Result<Vec<Notice>, String> {
     let mut url = Url::parse(&format!("https://api.llaun.ch/v1/notices/{client_id}"))
-        .map_err(|error| format!("Invalid notice service URL: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.notices.url").replace("%0", &error.to_string()))?;
     url.query_pairs_mut()
         .append_pair("version", env!("CARGO_PKG_VERSION"))
         .append_pair("bootstrap_name", "legacylauncher-rust")
@@ -46,24 +46,26 @@ pub async fn fetch(client_id: &str) -> Result<Vec<Notice>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|error| format!("Could not create notice request: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.notices.client").replace("%0", &error.to_string())
+        })?;
     let response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|error| format!("Could not load notices: {error}"))?
+        .map_err(|error| crate::tr("rust.error.notices.fetch").replace("%0", &error.to_string()))?
         .error_for_status()
-        .map_err(|error| format!("Notice service returned an error: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.notices.http").replace("%0", &error.to_string()))?;
     let payload = response
         .json::<Value>()
         .await
-        .map_err(|error| format!("Notice response was not valid JSON: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.notices.json").replace("%0", &error.to_string()))?;
     let items = payload
         .get("notices")
         .and_then(Value::as_array)
         .or_else(|| payload.as_array())
-        .ok_or_else(|| "Notice response did not contain a notice list.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.error.notices.list-missing").to_owned())?;
     let mut notices = Vec::new();
     for item in items {
         let Some((mut notice, image_url)) = parse_notice(item) else {
@@ -189,7 +191,7 @@ fn parse_action(value: &Value) -> Option<NoticeAction> {
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|label| !label.trim().is_empty())
-                .unwrap_or("Open link")
+                .unwrap_or(crate::tr("rust.notice.action.open-link"))
                 .to_owned();
             Some(NoticeAction::Url { label, url })
         }
@@ -200,7 +202,7 @@ fn parse_action(value: &Value) -> Option<NoticeAction> {
                 .and_then(|translations| translations.get("en_US"))
                 .and_then(Value::as_str)
                 .filter(|label| !label.trim().is_empty())
-                .unwrap_or("Open")
+                .unwrap_or(crate::tr("rust.notice.action.open"))
                 .to_owned();
             Some(NoticeAction::Scene {
                 label,
@@ -209,7 +211,7 @@ fn parse_action(value: &Value) -> Option<NoticeAction> {
         }
         "launcher" => {
             let launcher = action.get("launcher")?.as_str()?.trim();
-            let label = format!("Start {launcher}");
+            let label = crate::tr("rust.notice.action.start-launcher").replace("%0", launcher);
             let download_url = action
                 .get("url")
                 .and_then(Value::as_str)
@@ -225,7 +227,7 @@ fn parse_action(value: &Value) -> Option<NoticeAction> {
             let name = server
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or("Server");
+                .unwrap_or(crate::tr("rust.notice.action.server"));
             let address = server.get("address").and_then(Value::as_str)?.trim();
             if address.is_empty() || address.chars().any(char::is_control) {
                 return None;
@@ -249,7 +251,7 @@ fn parse_action(value: &Value) -> Option<NoticeAction> {
                 address.to_owned()
             };
             Some(NoticeAction::Server {
-                label: format!("Join {name}"),
+                label: crate::tr("rust.notice.action.join-server").replace("%0", name),
                 address: full_address,
                 families: server
                     .get("family")

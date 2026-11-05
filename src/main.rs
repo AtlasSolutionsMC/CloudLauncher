@@ -1,6 +1,7 @@
 mod auth;
 mod bootstrap;
 mod catalog;
+mod connectivity;
 mod crash;
 mod ely;
 mod ely_legacy;
@@ -58,6 +59,7 @@ struct SavedSettings {
     auto_login: bool,
     feedback_acknowledged: bool,
     force_update: bool,
+    beta_updates: bool,
     client_id: String,
     notices_enabled: bool,
     promoted_notices_enabled: bool,
@@ -68,9 +70,11 @@ struct SavedSettings {
     remove_undesirable_mods: bool,
     delete_patchy: bool,
     launcher_font_size: f32,
+    legacy_font_size_revert: Option<f32>,
     launcher_window_width: u32,
     launcher_window_height: u32,
     launcher_maximized: bool,
+    look_and_feel: String,
     log_window_width: u32,
     log_window_height: u32,
     log_window_x: i32,
@@ -242,6 +246,111 @@ struct CrashReport {
     log: String,
 }
 
+#[derive(Clone, Copy)]
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LogTarget {
+    Launcher,
+    Authentication,
+    VersionCatalog,
+    VersionManager,
+    MinecraftDownload,
+    Minecraft,
+    MinecraftCommand,
+    JavaRuntime,
+    Mods,
+    Update,
+    Bootstrap,
+    Notices,
+    Connectivity,
+    Diagnostics,
+    Servers,
+    Settings,
+    Crash,
+}
+
+impl LogTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Launcher => "LegacyLauncher",
+            Self::Authentication => "Authentication",
+            Self::VersionCatalog => "VersionCatalog",
+            Self::VersionManager => "VersionManager",
+            Self::MinecraftDownload => "MinecraftDownload",
+            Self::Minecraft => "Minecraft",
+            Self::MinecraftCommand => "MinecraftCommand",
+            Self::JavaRuntime => "JavaRuntime",
+            Self::Mods => "Mods",
+            Self::Update => "Update",
+            Self::Bootstrap => "Bootstrap",
+            Self::Notices => "Notices",
+            Self::Connectivity => "Connectivity",
+            Self::Diagnostics => "Diagnostics",
+            Self::Servers => "Servers",
+            Self::Settings => "Settings",
+            Self::Crash => "Crash",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LogRecord {
+    timestamp: String,
+    level: LogLevel,
+    target: LogTarget,
+    message: String,
+}
+
+impl LogRecord {
+    fn render(&self) -> String {
+        format!(
+            "> {} [{}] [{}] {}",
+            self.timestamp,
+            self.target.label(),
+            self.level.label(),
+            self.message
+        )
+    }
+
+    fn rendered_len(&self) -> usize {
+        9 + self.timestamp.len()
+            + self.target.label().len()
+            + self.level.label().len()
+            + self.message.len()
+    }
+}
+
+struct LaunchUiMessage {
+    message: String,
+    level: LogLevel,
+    target: LogTarget,
+}
+
+enum LaunchUiEvent {
+    Message(LaunchUiMessage),
+    GameStarted,
+    Finished,
+}
+
 impl MicrosoftAccountProfile {
     fn storage_key(&self) -> String {
         format!("microsoft:{}", self.uuid)
@@ -275,6 +384,7 @@ impl Default for SavedSettings {
             auto_login: false,
             feedback_acknowledged: false,
             force_update: false,
+            beta_updates: false,
             client_id: uuid::Uuid::new_v4().to_string(),
             notices_enabled: true,
             promoted_notices_enabled: true,
@@ -285,9 +395,11 @@ impl Default for SavedSettings {
             remove_undesirable_mods: true,
             delete_patchy: true,
             launcher_font_size: 12.0,
+            legacy_font_size_revert: None,
             launcher_window_width: 1000,
             launcher_window_height: 600,
             launcher_maximized: false,
+            look_and_feel: "auto".to_owned(),
             log_window_width: 720,
             log_window_height: 500,
             log_window_x: 30,
@@ -386,6 +498,7 @@ struct LauncherApp {
     diagnostic_result_url: Option<String>,
     diagnostic_error: Option<String>,
     show_log_window: bool,
+    show_live_launcher_log: bool,
     show_live_game_log: bool,
     selected_log_path: Option<PathBuf>,
     show_settings_menu: bool,
@@ -393,11 +506,17 @@ struct LauncherApp {
     update_check_events: Option<Receiver<Result<github_update::CheckResult, String>>>,
     update_checking: bool,
     available_release: Option<github_update::Release>,
+    update_prompt_pending: bool,
     show_update_dialog: bool,
     update_install_events: Option<Receiver<Result<(), String>>>,
     update_installing: bool,
     update_install_error: Option<String>,
     show_notices_window: bool,
+    show_notice_scene: bool,
+    notice_scene_index: usize,
+    connectivity_events: Option<Receiver<connectivity::Report>>,
+    connectivity_report: Option<connectivity::Report>,
+    show_connectivity_window: bool,
     pending_promoted_server: Option<PendingPromotedServerLaunch>,
     new_server_name: String,
     new_server_address: String,
@@ -421,9 +540,11 @@ struct LauncherApp {
     server_list_root: Option<PathBuf>,
     settings_page: Option<&'static str>,
     status: String,
+    launcher_log_initialized: bool,
     launching: bool,
+    game_running: bool,
     launch_progress: Option<f32>,
-    launch_events: Option<Receiver<String>>,
+    launch_events: Option<Receiver<LaunchUiEvent>>,
     microsoft_signin_events: Option<Receiver<Result<auth::SignInOutcome, String>>>,
     microsoft_signin_pending: bool,
     profile_creation_events: Option<Receiver<Result<auth::AuthenticatedMicrosoftAccount, String>>>,
@@ -431,6 +552,7 @@ struct LauncherApp {
     pending_minecraft_profile: Option<auth::PendingMinecraftProfile>,
     show_minecraft_profile_dialog: bool,
     new_minecraft_profile_name: String,
+    launcher_log: Arc<Mutex<VecDeque<LogRecord>>>,
     game_log: Arc<Mutex<VecDeque<String>>>,
     pending_crash_report: Arc<Mutex<Option<CrashReport>>>,
     crash_report: Option<CrashReport>,
@@ -502,11 +624,12 @@ impl LauncherApp {
             .unwrap_or_default();
         let show_arm_compat_notice = first_run_pending && is_windows_arm_host();
         let auto_launch_pending = settings.auto_login && settings.selected_account.is_some();
+        let update_check_events = Some(spawn_update_check(settings.beta_updates));
         let notice_events = settings
             .notices_enabled
             .then(|| spawn_notice_fetch(settings.client_id.clone()));
         let notices_loading = settings.notices_enabled;
-        Self {
+        let mut app = Self {
             settings,
             assets: Some(assets),
             require_minecraft_account,
@@ -518,18 +641,27 @@ impl LauncherApp {
             version_catalog_events: Some(spawn_catalog_fetch()),
             version_catalog_loading: true,
             show_log_window: show_global_logger,
-            show_live_game_log: show_global_logger,
+            show_live_launcher_log: show_global_logger,
+            show_live_game_log: false,
             bootstrap_events: Some(spawn_bootstrap_fetch()),
             bootstrap_loading: true,
             notice_events,
             notices_loading,
+            connectivity_events: Some(spawn_connectivity_check()),
+            update_check_events,
+            update_checking: true,
             version_kind_filter: "all".to_owned(),
             auto_launch_pending,
             status: background_load_error
                 .map(|error| tr("rust.status.background.load-error").replace("%0", &error))
                 .unwrap_or_default(),
             ..Default::default()
+        };
+        if !app.status.is_empty() {
+            let startup_error = app.status.clone();
+            app.set_logged_status(LogLevel::Error, LogTarget::Launcher, startup_error);
         }
+        app
     }
 
     fn persist(&self) {
@@ -540,6 +672,17 @@ impl LauncherApp {
         if let Ok(bytes) = serde_json::to_vec_pretty(&self.settings) {
             let _ = fs::write(path, bytes);
         }
+    }
+
+    fn set_logged_status(
+        &mut self,
+        level: LogLevel,
+        target: LogTarget,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        record_launcher_log_event(&self.launcher_log, level, target, &message);
+        self.status = message;
     }
 
     fn game_dir_path(&self) -> PathBuf {
@@ -856,16 +999,20 @@ impl LauncherApp {
         }
         self.version_catalog_events = Some(spawn_catalog_fetch());
         self.version_catalog_loading = true;
-        self.status = tr("rust.status.catalog.refreshing").to_owned();
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::VersionCatalog,
+            tr("rust.status.catalog.refreshing"),
+        );
     }
 
     fn start_update_check(&mut self) {
         if self.update_checking {
             return;
         }
-        self.update_check_events = Some(spawn_update_check());
+        self.update_check_events = Some(spawn_update_check(self.settings.beta_updates));
         self.update_checking = true;
-        self.status = tr("update.checking").to_owned();
+        self.set_logged_status(LogLevel::Info, LogTarget::Update, tr("update.checking"));
     }
 
     fn start_update_install(&mut self, release: github_update::Release) {
@@ -875,6 +1022,12 @@ impl LauncherApp {
         self.update_install_events = Some(spawn_update_install(release));
         self.update_installing = true;
         self.update_install_error = None;
+        record_launcher_log_event(
+            &self.launcher_log,
+            LogLevel::Info,
+            LogTarget::Update,
+            "Downloading a verified launcher update.",
+        );
     }
 
     fn refresh_notices(&mut self) {
@@ -885,12 +1038,22 @@ impl LauncherApp {
             self.personal_notice_list.clear();
             self.notice_list.clone_from(&self.bootstrap_notice_list);
             self.notice_error = None;
-            self.status = tr("rust.status.notices.disabled").to_owned();
+            self.set_logged_status(
+                LogLevel::Info,
+                LogTarget::Notices,
+                tr("rust.status.notices.disabled"),
+            );
             return;
         }
         self.notice_events = Some(spawn_notice_fetch(self.settings.client_id.clone()));
         self.notices_loading = true;
         self.notice_error = None;
+        record_launcher_log_event(
+            &self.launcher_log,
+            LogLevel::Info,
+            LogTarget::Notices,
+            "Refreshing the US notice feed.",
+        );
     }
 
     fn rebuild_notice_list(&mut self, ctx: &Context) {
@@ -949,6 +1112,41 @@ impl LauncherApp {
                 break;
             }
         }
+        report.push_str("\nRecent launcher output:\n");
+        let launcher_lines = self
+            .launcher_log
+            .lock()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .rev()
+                    .take(1200)
+                    .map(LogRecord::render)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for line in launcher_lines.into_iter().rev() {
+            let lower = line.to_ascii_lowercase();
+            if [
+                "token",
+                "secret",
+                "authorization",
+                "bearer ",
+                "xsts",
+                "xuid",
+            ]
+            .iter()
+            .any(|sensitive| lower.contains(sensitive))
+            {
+                report.push_str("[sensitive log line omitted]\n");
+            } else {
+                report.push_str(&redact_sensitive_log_values(&line));
+                report.push('\n');
+            }
+            if report.len() >= 700_000 {
+                break;
+            }
+        }
         report.chars().take(700_000).collect()
     }
 
@@ -959,6 +1157,12 @@ impl LauncherApp {
         self.diagnostic_pending = true;
         self.diagnostic_result_url = None;
         self.diagnostic_error = None;
+        record_launcher_log_event(
+            &self.launcher_log,
+            LogLevel::Info,
+            LogTarget::Diagnostics,
+            "Sending a diagnostic report after user consent.",
+        );
     }
 
     fn save_diagnostic_report(&mut self) {
@@ -976,13 +1180,18 @@ impl LauncherApp {
             .and_then(|_| fs::write(&path, report));
         match result {
             Ok(()) => {
-                self.status =
-                    tr("rust.status.diagnostics.saved").replace("%0", &path.display().to_string());
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Diagnostics,
+                    tr("rust.status.diagnostics.saved").replace("%0", &path.display().to_string()),
+                );
                 self.show_diagnostic_consent = false;
                 self.diagnostic_error = None;
             }
             Err(error) => {
-                self.diagnostic_error = Some(format!("Could not save diagnostic report: {error}"));
+                self.diagnostic_error = Some(
+                    tr("rust.status.diagnostics.save-error").replace("%0", &error.to_string()),
+                );
             }
         }
     }
@@ -1013,6 +1222,24 @@ impl LauncherApp {
         self.persist();
     }
 
+    fn toggle_notice_visibility_for_week(&mut self, id: &str) {
+        const WEEK_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+        let now = unix_time_millis();
+        let is_hidden = self
+            .settings
+            .hidden_notices_until
+            .get(id)
+            .is_some_and(|expiry| *expiry > now);
+        if is_hidden {
+            self.settings.hidden_notices_until.remove(id);
+        } else {
+            self.settings
+                .hidden_notices_until
+                .insert(id.to_owned(), now.saturating_add(WEEK_MS));
+        }
+        self.persist();
+    }
+
     fn load_server_list(&mut self, game_root: PathBuf) {
         let path = game_root.join("servers.dat");
         let root_key = game_root.to_string_lossy().into_owned();
@@ -1026,8 +1253,12 @@ impl LauncherApp {
                 if !path.exists() && cache_belongs_to_root && !self.settings.servers.is_empty() {
                     servers = self.settings.servers.clone();
                     if let Err(error) = write_minecraft_server_list(&path, &servers) {
-                        self.status = tr("rust.status.servers.migrate-error")
-                            .replace("%0", &error.to_string());
+                        self.set_logged_status(
+                            LogLevel::Error,
+                            LogTarget::Servers,
+                            tr("rust.status.servers.migrate-error")
+                                .replace("%0", &error.to_string()),
+                        );
                     }
                 }
                 self.server_list = servers;
@@ -1037,8 +1268,11 @@ impl LauncherApp {
             }
             Err(error) => {
                 self.server_list = self.settings.servers.clone();
-                self.status =
-                    tr("rust.status.servers.read-error").replace("%0", &error.to_string());
+                self.set_logged_status(
+                    LogLevel::Error,
+                    LogTarget::Servers,
+                    tr("rust.status.servers.read-error").replace("%0", &error.to_string()),
+                );
             }
         }
         self.server_list_root = Some(game_root);
@@ -1053,11 +1287,18 @@ impl LauncherApp {
                 self.settings.servers = self.server_list.clone();
                 self.settings.servers_cache_root = root.to_string_lossy().into_owned();
                 self.persist();
-                self.status = tr("rust.status.servers.saved").to_owned();
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Servers,
+                    tr("rust.status.servers.saved"),
+                );
             }
             Err(error) => {
-                self.status =
-                    tr("rust.status.servers.save-error").replace("%0", &error.to_string());
+                self.set_logged_status(
+                    LogLevel::Error,
+                    LogTarget::Servers,
+                    tr("rust.status.servers.save-error").replace("%0", &error.to_string()),
+                );
             }
         }
     }
@@ -1071,9 +1312,10 @@ impl LauncherApp {
                 accounts,
                 families,
             } => {
+                self.show_notice_scene = false;
                 let name = label
                     .strip_prefix("Join ")
-                    .unwrap_or("Promoted server")
+                    .unwrap_or(tr("rust.ui.servers.promoted"))
                     .to_owned();
                 if let Some(allowed_accounts) = accounts {
                     let selected_type = self.settings.selected_account.as_ref().map(|selected| {
@@ -1107,8 +1349,12 @@ impl LauncherApp {
                     if selected_type
                         .is_some_and(|kind| !allowed_accounts.iter().any(|allowed| allowed == kind))
                     {
-                        self.status = tr("rust.status.servers.account-required")
-                            .replace("%0", &allowed_accounts.join(", "));
+                        self.set_logged_status(
+                            LogLevel::Warn,
+                            LogTarget::Servers,
+                            tr("rust.status.servers.account-required")
+                                .replace("%0", &allowed_accounts.join(", ")),
+                        );
                         self.settings_page = Some("Manage accounts");
                         return;
                     }
@@ -1132,13 +1378,28 @@ impl LauncherApp {
             }
             notices::NoticeAction::Scene { scene, .. } => match scene.as_str() {
                 "settings" | "launcher-settings" => {
+                    self.show_notice_scene = false;
                     self.settings_page = Some("Launcher & game preferences")
                 }
-                "versions" | "version-manager" => self.settings_page = Some("Manage versions"),
-                "accounts" | "account-manager" => self.settings_page = Some("Manage accounts"),
-                "notices" => self.show_notices_window = true,
-                "main" | "login" => {}
-                _ => self.status = tr("rust.status.scene.unavailable").replace("%0", &scene),
+                "versions" | "version-manager" => {
+                    self.show_notice_scene = false;
+                    self.settings_page = Some("Manage versions");
+                }
+                "accounts" | "account-manager" => {
+                    self.show_notice_scene = false;
+                    self.settings_page = Some("Manage accounts");
+                }
+                "notices" => {
+                    self.show_notices_window = false;
+                    self.notice_scene_index = 0;
+                    self.show_notice_scene = true;
+                }
+                "main" | "login" => self.show_notice_scene = false,
+                _ => self.set_logged_status(
+                    LogLevel::Warn,
+                    LogTarget::Launcher,
+                    tr("rust.status.scene.unavailable").replace("%0", &scene),
+                ),
             },
             notices::NoticeAction::Launcher {
                 launcher,
@@ -1148,8 +1409,11 @@ impl LauncherApp {
                 if let Some(url) = download_url {
                     open_url(&url);
                 } else {
-                    self.status =
-                        tr("rust.status.launcher.version-missing").replace("%0", &launcher);
+                    self.set_logged_status(
+                        LogLevel::Warn,
+                        LogTarget::Update,
+                        tr("rust.status.launcher.version-missing").replace("%0", &launcher),
+                    );
                 }
             }
         }
@@ -1312,7 +1576,11 @@ impl LauncherApp {
         self.microsoft_signin_pending = true;
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
-        self.status = tr("rust.status.account.microsoft-browser").to_owned();
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Authentication,
+            tr("rust.status.account.microsoft-browser"),
+        );
         thread::spawn(move || {
             let result = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1322,11 +1590,12 @@ impl LauncherApp {
                     tokio::select! {
                         result = auth::sign_in(cancel_requested.clone()) => result,
                         _ = wait_for_cancel(cancel_requested) => {
-                            Err("Microsoft sign-in was cancelled.".to_owned())
+                            Err(tr("rust.status.account.microsoft.cancelled").to_owned())
                         }
                     }
                 }),
-                Err(error) => Err(format!("Could not start Microsoft sign-in: {error}")),
+                Err(error) => Err(tr("rust.status.account.microsoft.runtime-error")
+                    .replace("%0", &error.to_string())),
             };
             let _ = sender.send(result);
         });
@@ -1363,7 +1632,11 @@ impl LauncherApp {
         let username = self.ely_legacy_username.trim().to_owned();
         let password = self.ely_legacy_password.clone();
         if username.is_empty() || password.is_empty() {
-            self.status = tr("rust.status.account.ely.enter-credentials").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::Authentication,
+                tr("rust.status.account.ely.enter-credentials"),
+            );
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -1371,7 +1644,11 @@ impl LauncherApp {
         self.ely_legacy_signin_pending = true;
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
-        self.status = tr("rust.status.account.ely.signing-in").to_owned();
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Authentication,
+            tr("rust.status.account.ely.signing-in"),
+        );
         thread::spawn(move || {
             let result = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1380,10 +1657,11 @@ impl LauncherApp {
                 Ok(runtime) => runtime.block_on(async {
                     tokio::select! {
                         result = ely_legacy::authenticate(&username, &password) => result,
-                        _ = wait_for_cancel(cancel_requested) => Err("Ely.by sign-in was cancelled.".to_owned()),
+                        _ = wait_for_cancel(cancel_requested) => Err(tr("rust.status.account.ely.oauth.cancelled").to_owned()),
                     }
                 }),
-                Err(error) => Err(format!("Could not start Ely.by sign-in: {error}")),
+                Err(error) => Err(tr("rust.status.account.ely.runtime-error")
+                    .replace("%0", &error.to_string())),
             };
             let _ = sender.send(result);
         });
@@ -1406,14 +1684,22 @@ impl LauncherApp {
                 let secret = match serde_json::to_string(&credentials) {
                     Ok(secret) => secret,
                     Err(error) => {
-                        self.status = tr("rust.status.account.ely.save-error")
-                            .replace("%0", &error.to_string());
+                        self.set_logged_status(
+                            LogLevel::Error,
+                            LogTarget::Authentication,
+                            tr("rust.status.account.ely.save-error")
+                                .replace("%0", &error.to_string()),
+                        );
                         return;
                     }
                 };
                 if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
-                    self.status =
-                        format!("Could not protect Ely.by credentials with DPAPI: {error}");
+                    self.set_logged_status(
+                        LogLevel::Error,
+                        LogTarget::Authentication,
+                        tr("rust.status.account.ely.protect-error")
+                            .replace("%0", &error.to_string()),
+                    );
                     return;
                 }
                 self.settings
@@ -1423,11 +1709,14 @@ impl LauncherApp {
                 self.settings.selected_account = Some(account.id);
                 self.show_ely_legacy_dialog = false;
                 self.ely_legacy_password.clear();
-                self.status =
-                    tr("rust.status.account.ely.signed-in").replace("%0", &account.display_name);
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Authentication,
+                    tr("rust.status.account.ely.signed-in").replace("%0", &account.display_name),
+                );
                 self.persist();
             }
-            Err(error) => self.status = error,
+            Err(error) => self.set_logged_status(LogLevel::Error, LogTarget::Authentication, error),
         }
     }
 
@@ -1440,15 +1729,21 @@ impl LauncherApp {
         self.ely_signin_pending = true;
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
-        self.status = tr("rust.status.account.ely.browser").to_owned();
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Authentication,
+            tr("rust.status.account.ely.browser"),
+        );
         thread::spawn(move || {
-            let result = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(ely::sign_in(cancel_requested.clone())),
-                Err(error) => Err(format!("Could not start Ely.by sign-in: {error}")),
-            };
+            let result =
+                match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(ely::sign_in(cancel_requested.clone())),
+                    Err(error) => Err(tr("rust.status.account.ely.runtime-error")
+                        .replace("%0", &error.to_string())),
+                };
             let _ = sender.send(result);
         });
     }
@@ -1468,14 +1763,22 @@ impl LauncherApp {
                 let secret = match serde_json::to_string(&credentials) {
                     Ok(secret) => secret,
                     Err(error) => {
-                        self.status = tr("rust.status.account.ely.save-error")
-                            .replace("%0", &error.to_string());
+                        self.set_logged_status(
+                            LogLevel::Error,
+                            LogTarget::Authentication,
+                            tr("rust.status.account.ely.save-error")
+                                .replace("%0", &error.to_string()),
+                        );
                         return;
                     }
                 };
                 if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
-                    self.status =
-                        format!("Could not protect Ely.by credentials with DPAPI: {error}");
+                    self.set_logged_status(
+                        LogLevel::Error,
+                        LogTarget::Authentication,
+                        tr("rust.status.account.ely.protect-error")
+                            .replace("%0", &error.to_string()),
+                    );
                     return;
                 }
                 self.settings
@@ -1484,11 +1787,14 @@ impl LauncherApp {
                 self.settings.ely_accounts.push(account.clone());
                 self.settings.selected_account = Some(account.id);
                 self.show_ely_dialog = false;
-                self.status =
-                    tr("rust.status.account.ely.signed-in").replace("%0", &account.display_name);
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Authentication,
+                    tr("rust.status.account.ely.signed-in").replace("%0", &account.display_name),
+                );
                 self.persist();
             }
-            Err(error) => self.status = error,
+            Err(error) => self.set_logged_status(LogLevel::Error, LogTarget::Authentication, error),
         }
     }
 
@@ -1503,9 +1809,13 @@ impl LauncherApp {
                 self.pending_minecraft_profile = Some(pending);
                 self.new_minecraft_profile_name.clear();
                 self.show_minecraft_profile_dialog = true;
-                self.status = tr("rust.status.account.microsoft.profile.choose").to_owned();
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Authentication,
+                    tr("rust.status.account.microsoft.profile.choose"),
+                );
             }
-            Err(error) => self.status = error,
+            Err(error) => self.set_logged_status(LogLevel::Error, LogTarget::Authentication, error),
         }
     }
 
@@ -1519,8 +1829,11 @@ impl LauncherApp {
         if let Err(error) =
             vault::store_refresh_token(&profile.storage_key(), &account.refresh_token)
         {
-            self.status =
-                tr("rust.status.account.microsoft.save-error").replace("%0", &error.to_string());
+            self.set_logged_status(
+                LogLevel::Error,
+                LogTarget::Authentication,
+                tr("rust.status.account.microsoft.save-error").replace("%0", &error.to_string()),
+            );
             return;
         }
         self.settings
@@ -1528,8 +1841,11 @@ impl LauncherApp {
             .retain(|saved| saved.id != profile.id);
         self.settings.microsoft_accounts.push(profile.clone());
         self.settings.selected_account = Some(profile.id);
-        self.status =
-            tr("rust.status.account.microsoft.signed-in").replace("%0", &account.username);
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Authentication,
+            tr("rust.status.account.microsoft.signed-in").replace("%0", &account.username),
+        );
         self.pending_minecraft_profile = None;
         self.show_minecraft_profile_dialog = false;
         self.persist();
@@ -1541,7 +1857,11 @@ impl LauncherApp {
         }
         let Some(pending) = self.pending_minecraft_profile.clone() else {
             self.show_minecraft_profile_dialog = false;
-            self.status = tr("rust.status.account.microsoft.profile.restart").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::Authentication,
+                tr("rust.status.account.microsoft.profile.restart"),
+            );
             return;
         };
         let name = self.new_minecraft_profile_name.trim().to_owned();
@@ -1550,20 +1870,29 @@ impl LauncherApp {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '_')
         {
-            self.status = tr("rust.status.account.microsoft.profile.invalid-name").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::Authentication,
+                tr("rust.status.account.microsoft.profile.invalid-name"),
+            );
             return;
         }
         let (sender, receiver) = mpsc::channel();
         self.profile_creation_events = Some(receiver);
         self.profile_creation_pending = true;
-        self.status = tr("rust.status.account.microsoft.profile.creating").replace("%0", &name);
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Authentication,
+            tr("rust.status.account.microsoft.profile.creating").replace("%0", &name),
+        );
         thread::spawn(move || {
             let result = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
             {
                 Ok(runtime) => runtime.block_on(auth::create_minecraft_profile(pending, &name)),
-                Err(error) => Err(format!("Could not start profile creation: {error}")),
+                Err(error) => Err(tr("rust.status.account.microsoft.profile-runtime-error")
+                    .replace("%0", &error.to_string())),
             };
             let _ = sender.send(result);
         });
@@ -1639,7 +1968,11 @@ impl LauncherApp {
             .as_ref()
             .is_some_and(|server| parse_server_address(&server.address).is_none())
         {
-            self.status = tr("rust.status.servers.invalid-address").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::Servers,
+                tr("rust.status.servers.invalid-address"),
+            );
             return;
         }
         let Some(selected_id) = self.settings.selected_account.clone() else {
@@ -1713,7 +2046,11 @@ impl LauncherApp {
 
         let version = self.settings.selected_version.clone();
         if !valid_version_id(&version) {
-            self.status = tr("rust.status.versions.invalid-id").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::VersionManager,
+                tr("rust.status.versions.invalid-id"),
+            );
             return;
         }
         let force_update = self.settings.force_update;
@@ -1740,9 +2077,9 @@ impl LauncherApp {
                 }
                 None
             }
-            Err(error) => Some(format!(
-                "Could not update servers.dat; continuing launch: {error}"
-            )),
+            Err(error) => {
+                Some(tr("rust.status.game.server-save-warning").replace("%0", &error.to_string()))
+            }
         };
         let quick_play_supported = server
             .as_ref()
@@ -1757,6 +2094,7 @@ impl LauncherApp {
         let crash_loader = format!("{}-{}", preferences.loader_type, preferences.loader_build);
         let version_manifest = self.version_manifest.clone();
         let game_log = self.game_log.clone();
+        let launcher_log = self.launcher_log.clone();
         if let Ok(mut lines) = game_log.lock() {
             lines.clear();
         }
@@ -1770,16 +2108,21 @@ impl LauncherApp {
         self.launching = true;
         if self.settings.logger_mode == "global" {
             self.show_log_window = true;
-            self.show_live_game_log = true;
+            self.show_live_launcher_log = true;
+            self.show_live_game_log = false;
         }
         self.launch_progress = Some(0.0);
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
-        self.status = tr("rust.status.game.preparing").replace("%0", &version);
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Minecraft,
+            tr("rust.status.game.preparing").replace("%0", &version),
+        );
 
         thread::spawn(move || {
             if let Some(warning) = server_save_warning {
-                let _ = update_tx.send(warning);
+                send_launch_message(&update_tx, LogLevel::Warn, LogTarget::Servers, warning);
             }
             let done_tx = update_tx.clone();
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1788,8 +2131,13 @@ impl LauncherApp {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = update_tx.send(format!("Could not start runtime: {error}"));
-                    let _ = done_tx.send("__DONE__".to_owned());
+                    send_launch_message(
+                        &update_tx,
+                        LogLevel::Error,
+                        LogTarget::Launcher,
+                        tr("rust.status.runtime.start-error").replace("%0", &error.to_string()),
+                    );
+                    let _ = done_tx.send(LaunchUiEvent::Finished);
                     return;
                 }
             };
@@ -1800,12 +2148,22 @@ impl LauncherApp {
                         result = authenticate_microsoft_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
-                                let _ = update_tx.send(error);
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Error,
+                                    LogTarget::Authentication,
+                                    error,
+                                );
                                 return;
                             }
                         },
                         _ = wait_for_cancel(cancel_requested.clone()) => {
-                            let _ = update_tx.send("Sign-in cancelled.".to_owned());
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::Authentication,
+                                tr("rust.status.account.signin-cancelled"),
+                            );
                             return;
                         }
                     }
@@ -1814,12 +2172,22 @@ impl LauncherApp {
                         result = authenticate_ely_legacy_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
-                                let _ = update_tx.send(error);
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Error,
+                                    LogTarget::Authentication,
+                                    error,
+                                );
                                 return;
                             }
                         },
                         _ = wait_for_cancel(cancel_requested.clone()) => {
-                            let _ = update_tx.send("Ely.by sign-in cancelled.".to_owned());
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::Authentication,
+                                tr("rust.status.account.ely.signin-cancelled"),
+                            );
                             return;
                         }
                     }
@@ -1828,12 +2196,22 @@ impl LauncherApp {
                         result = authenticate_ely_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
-                                let _ = update_tx.send(error);
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Error,
+                                    LogTarget::Authentication,
+                                    error,
+                                );
                                 return;
                             }
                         },
                         _ = wait_for_cancel(cancel_requested.clone()) => {
-                            let _ = update_tx.send("Ely.by sign-in cancelled.".to_owned());
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::Authentication,
+                                tr("rust.status.account.ely.signin-cancelled"),
+                            );
                             return;
                         }
                     }
@@ -1850,21 +2228,39 @@ impl LauncherApp {
                     "current" => match tokio::task::spawn_blocking(detect_java).await {
                         Ok(Ok((path, version))) => {
                             preferences.java_path = path.to_string_lossy().into_owned();
-                            let _ = update_tx.send(format!("Using current Java: {version}"));
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Info,
+                                LogTarget::JavaRuntime,
+                                tr("rust.status.java.current").replace("%0", &version),
+                            );
                         }
                         Ok(Err(error)) => {
-                            let _ = update_tx.send(error);
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Error,
+                                LogTarget::JavaRuntime,
+                                error,
+                            );
                             return;
                         }
                         Err(error) => {
-                            let _ = update_tx.send(format!("Java detection failed: {error}"));
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Error,
+                                LogTarget::JavaRuntime,
+                                tr("rust.status.java.detection-error")
+                                    .replace("%0", &error.to_string()),
+                            );
                             return;
                         }
                     },
                     "custom" if preferences.java_path.trim().is_empty() => {
-                        let _ = update_tx.send(
-                            "Choose a custom Java executable or switch Java to Recommended."
-                                .to_owned(),
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Warn,
+                            LogTarget::JavaRuntime,
+                            tr("rust.status.java.custom-required"),
                         );
                         return;
                     }
@@ -1884,15 +2280,30 @@ impl LauncherApp {
                         _ = wait_for_cancel(cancel_requested.clone()) => None,
                     };
                     let Some(check_result) = check_result else {
-                        let _ = update_tx.send("Java check cancelled.".to_owned());
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Warn,
+                            LogTarget::JavaRuntime,
+                            tr("rust.status.java.check-cancelled"),
+                        );
                         return;
                     };
                     match check_result {
                         Ok(message) => {
-                            let _ = update_tx.send(message);
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Info,
+                                LogTarget::JavaRuntime,
+                                message,
+                            );
                         }
                         Err(error) => {
-                            let _ = update_tx.send(error);
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Error,
+                                LogTarget::JavaRuntime,
+                                error,
+                            );
                             return;
                         }
                     }
@@ -1922,16 +2333,23 @@ impl LauncherApp {
                 }
                 if let (Some(server), Some(supported)) = (quick_play_server, quick_play_supported) {
                     append_server_launch_arguments(&mut options, &server.address, supported);
-                    let _ = update_tx.send(format!("Connecting to {}…", server.name));
+                    send_launch_message(
+                        &update_tx,
+                        LogLevel::Info,
+                        LogTarget::Minecraft,
+                        tr("rust.status.game.connecting").replace("%0", &server.name),
+                    );
                 }
 
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
                 let progress_tx = update_tx.clone();
                 let listener_game_log = game_log.clone();
+                let listener_launcher_log = launcher_log.clone();
                 let listener = tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
                         let message = launch_event_message_or_record(
                             &listener_game_log,
+                            &listener_launcher_log,
                             event,
                             show_full_game_command,
                         );
@@ -1948,13 +2366,23 @@ impl LauncherApp {
                 };
                 match download_result {
                     None => {
-                        let _ = update_tx.send("Game launch cancelled.".to_owned());
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Warn,
+                            LogTarget::Minecraft,
+                            tr("rust.status.game.launch-cancelled"),
+                        );
                         drop(event_tx);
                         let _ = listener.await;
                         return;
                     }
                     Some(Err(error)) => {
-                        let _ = update_tx.send(format!("Launch failed: {error}"));
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Error,
+                            LogTarget::Minecraft,
+                            tr("rust.status.game.launch-error").replace("%0", &error.to_string()),
+                        );
                         drop(event_tx);
                         let _ = listener.await;
                         return;
@@ -1966,14 +2394,22 @@ impl LauncherApp {
                         if let Err(error) =
                             apply_gpu_preference(&game_data.minecraft_java.path, &gpu_preference)
                         {
-                            let _ = update_tx.send(format!(
-                                "Could not apply the selected GPU preference: {error}"
-                            ));
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::JavaRuntime,
+                                tr("rust.status.game.gpu-error").replace("%0", &error.to_string()),
+                            );
                         }
                     }
                 }
                 if cancel_requested.load(Ordering::Acquire) {
-                    let _ = update_tx.send("Game launch cancelled.".to_owned());
+                    send_launch_message(
+                        &update_tx,
+                        LogLevel::Warn,
+                        LogTarget::Minecraft,
+                        tr("rust.status.game.launch-cancelled"),
+                    );
                     drop(event_tx);
                     let _ = listener.await;
                     return;
@@ -1982,26 +2418,39 @@ impl LauncherApp {
                     match remove_undesirable_mod_files(&mods_directory) {
                         Ok(summary) => {
                             if !summary.removed.is_empty() {
-                                let _ = update_tx.send(format!(
-                                    "Removed unwanted mod files: {}",
-                                    summary.removed.join(", ")
-                                ));
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Info,
+                                    LogTarget::Mods,
+                                    tr("rust.status.game.removed-mods")
+                                        .replace("%0", &summary.removed.join(", ")),
+                                );
                             }
                             for (name, error) in summary.failed {
-                                let _ = update_tx.send(format!(
-                                    "Could not remove unwanted mod {name}: {error}"
-                                ));
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Warn,
+                                    LogTarget::Mods,
+                                    tr("rust.status.game.remove-mod-error")
+                                        .replace("%0", &name)
+                                        .replace("%1", &error),
+                                );
                             }
                         }
                         Err(error) => {
-                            let _ = update_tx.send(format!(
-                                "Could not scan the mods folder for unwanted files: {error}"
-                            ));
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::Mods,
+                                tr("rust.status.game.scan-mods-error")
+                                    .replace("%0", &error.to_string()),
+                            );
                         }
                     }
                 }
                 match launcher.launch(event_tx.clone()).await {
                     Ok(mut child) => {
+                        let _ = update_tx.send(LaunchUiEvent::GameStarted);
                         let wait_result = tokio::select! {
                             result = child.wait() => Some(result),
                             _ = wait_for_cancel(cancel_requested.clone()) => None,
@@ -2025,25 +2474,40 @@ impl LauncherApp {
                                 let _ = event_tx.send(LaunchEvent::Close(code)).await;
                             }
                             Some(Err(error)) => {
-                                let _ =
-                                    update_tx.send(format!("Could not monitor Minecraft: {error}"));
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Error,
+                                    LogTarget::Minecraft,
+                                    tr("rust.status.game.monitor-error")
+                                        .replace("%0", &error.to_string()),
+                                );
                             }
                             None => {
                                 let _ = child.kill().await;
                                 let _ = child.wait().await;
-                                let _ = update_tx.send("Minecraft process stopped.".to_owned());
+                                send_launch_message(
+                                    &update_tx,
+                                    LogLevel::Warn,
+                                    LogTarget::Minecraft,
+                                    tr("rust.status.game.stopped"),
+                                );
                             }
                         }
                     }
                     Err(error) => {
-                        let _ = update_tx.send(format!("Launch failed: {error}"));
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Error,
+                            LogTarget::Minecraft,
+                            tr("rust.status.game.launch-error").replace("%0", &error.to_string()),
+                        );
                     }
                 }
                 drop(event_tx);
                 let _ = listener.await;
             });
 
-            let _ = done_tx.send("__DONE__".to_owned());
+            let _ = done_tx.send(LaunchUiEvent::Finished);
         });
     }
 
@@ -2055,7 +2519,11 @@ impl LauncherApp {
         self.persist();
 
         if !valid_version_id(&version) {
-            self.status = tr("rust.status.versions.invalid-id").to_owned();
+            self.set_logged_status(
+                LogLevel::Warn,
+                LogTarget::VersionManager,
+                tr("rust.status.versions.invalid-id"),
+            );
             return;
         }
         let game_dir = self.game_root_for_version(&version);
@@ -2066,7 +2534,11 @@ impl LauncherApp {
         self.launch_progress = Some(0.0);
         self.cancel_requested.store(false, Ordering::Release);
         let cancel_requested = self.cancel_requested.clone();
-        self.status = tr("rust.status.game.installing").replace("%0", &version);
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::VersionManager,
+            tr("rust.status.game.installing").replace("%0", &version),
+        );
 
         thread::spawn(move || {
             let done_tx = update_tx.clone();
@@ -2076,8 +2548,13 @@ impl LauncherApp {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = update_tx.send(format!("Could not start runtime: {error}"));
-                    let _ = done_tx.send("__DONE__".to_owned());
+                    send_launch_message(
+                        &update_tx,
+                        LogLevel::Error,
+                        LogTarget::Launcher,
+                        tr("rust.status.runtime.start-error").replace("%0", &error.to_string()),
+                    );
+                    let _ = done_tx.send(LaunchUiEvent::Finished);
                     return;
                 }
             };
@@ -2095,8 +2572,8 @@ impl LauncherApp {
                 let progress_tx = update_tx.clone();
                 let listener = tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
-                        if let Some(message) = launch_event_message(event) {
-                            let _ = progress_tx.send(message);
+                        if let Some(message) = launch_event_ui_message(event) {
+                            let _ = progress_tx.send(LaunchUiEvent::Message(message));
                         }
                     }
                 });
@@ -2107,20 +2584,36 @@ impl LauncherApp {
                 };
                 match install_result {
                     Some(Ok(())) => {
-                        let _ = update_tx.send(format!("Minecraft {version} is installed."));
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Info,
+                            LogTarget::VersionManager,
+                            tr("rust.status.versions.installed").replace("%0", &version),
+                        );
                     }
                     Some(Err(error)) => {
-                        let _ = update_tx.send(format!("Install failed: {error}"));
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Error,
+                            LogTarget::VersionManager,
+                            tr("rust.status.versions.install-failed")
+                                .replace("%0", &error.to_string()),
+                        );
                     }
                     None => {
-                        let _ = update_tx.send("Installation cancelled.".to_owned());
+                        send_launch_message(
+                            &update_tx,
+                            LogLevel::Warn,
+                            LogTarget::VersionManager,
+                            tr("rust.status.versions.install-cancelled"),
+                        );
                     }
                 }
                 drop(event_tx);
                 let _ = listener.await;
             });
 
-            let _ = done_tx.send("__DONE__".to_owned());
+            let _ = done_tx.send(LaunchUiEvent::Finished);
         });
     }
 
@@ -2148,36 +2641,39 @@ impl LauncherApp {
 
         let mut filter_settings_changed = false;
         ui.horizontal_wrapped(|ui| {
-            for (kind, label) in [
-                ("snapshot", "Snapshots"),
-                ("modified", "Modified"),
-                ("old-beta", "Old Beta"),
-                ("old-alpha", "Old Alpha"),
-                ("launcher", "Launcher"),
-                ("pending", "Experimental"),
+            for (kind, label_key) in [
+                ("snapshot", "settings.versions.snapshot"),
+                ("modified", "settings.versions.modified"),
+                ("old-beta", "settings.versions.old_beta"),
+                ("old-alpha", "settings.versions.old_alpha"),
+                ("launcher", "settings.versions.launcher"),
+                ("pending", "settings.versions.pending"),
             ] {
                 let enabled = self
                     .settings
                     .version_catalog_types
                     .entry(kind.to_owned())
                     .or_insert_with(|| default_version_type_enabled(kind));
-                filter_settings_changed |= ui.checkbox(enabled, label).changed();
+                filter_settings_changed |= ui.checkbox(enabled, tr(label_key)).changed();
             }
         });
         ui.horizontal(|ui| {
             filter_settings_changed |= ui
-                .checkbox(&mut self.settings.version_only_installed, "Only installed")
+                .checkbox(
+                    &mut self.settings.version_only_installed,
+                    tr("settings.versions.only-installed"),
+                )
                 .changed();
             filter_settings_changed |= ui
                 .checkbox(
                     &mut self.settings.version_include_remote,
-                    "Show remote versions",
+                    tr("rust.ui.versions.filter.remote"),
                 )
                 .changed();
             filter_settings_changed |= ui
                 .checkbox(
                     &mut self.settings.version_show_old_releases,
-                    "Show versions before 1.7.10",
+                    tr("settings.versions.sub.old_release"),
                 )
                 .changed();
         });
@@ -2201,43 +2697,47 @@ impl LauncherApp {
         }
 
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.version_kind_filter, "all".to_owned(), "All");
+            ui.selectable_value(
+                &mut self.version_kind_filter,
+                "all".to_owned(),
+                tr("rust.ui.versions.filter.all"),
+            );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "release".to_owned(),
-                "Release",
+                tr("version.release"),
             );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "snapshot".to_owned(),
-                "Snapshot",
+                tr("settings.versions.snapshot"),
             );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "modified".to_owned(),
-                "Modified",
+                tr("settings.versions.modified"),
             );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "old".to_owned(),
-                "Old Beta/Alpha",
+                tr("rust.ui.versions.filter.old"),
             );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "launcher".to_owned(),
-                "Launcher",
+                tr("settings.versions.launcher"),
             );
             ui.selectable_value(
                 &mut self.version_kind_filter,
                 "pending".to_owned(),
-                "Experimental",
+                tr("settings.versions.pending"),
             );
         });
 
         if self.version_manifest.is_none() && !self.version_catalog_loading {
             ui.colored_label(
                 Color32::from_rgb(238, 183, 85),
-                "The online catalog is unavailable. Installed versions remain listed below.",
+                tr("rust.ui.versions.catalog-fallback"),
             );
         }
 
@@ -2266,7 +2766,11 @@ impl LauncherApp {
                             self.settings.selected_version = version.clone();
                             self.persist();
                         }
-                        let install_label = if is_installed { "Repair" } else { "Install" };
+                        let install_label = tr(if is_installed {
+                            "rust.ui.versions.repair"
+                        } else {
+                            "rust.ui.versions.install"
+                        });
                         if ui
                             .add_enabled(!busy, egui::Button::new(install_label).small())
                             .clicked()
@@ -2289,6 +2793,43 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
+        if !self.launcher_log_initialized {
+            self.launcher_log_initialized = true;
+            record_launcher_log_line(&self.launcher_log, tr("rust.log.launcher-started"));
+        }
+        let connectivity_report = self
+            .connectivity_events
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(report) = connectivity_report {
+            self.connectivity_events = None;
+            for service in &report.services {
+                record_launcher_log_event(
+                    &self.launcher_log,
+                    if service.reachable {
+                        LogLevel::Info
+                    } else {
+                        LogLevel::Warn
+                    },
+                    LogTarget::Connectivity,
+                    &format!(
+                        "Connectivity check {}: {}{}",
+                        service.id,
+                        if service.reachable {
+                            "reachable"
+                        } else {
+                            "unreachable"
+                        },
+                        if service.hosts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", service.hosts.join(", "))
+                        }
+                    ),
+                );
+            }
+            self.connectivity_report = Some(report);
+        }
         if let Some(maximized) = ctx.input(|input| input.viewport().maximized) {
             if self.launcher_window_state_seen && maximized != self.settings.launcher_maximized {
                 self.settings.launcher_maximized = maximized;
@@ -2309,15 +2850,23 @@ impl eframe::App for LauncherApp {
             self.auto_launch_pending = false;
             self.start_selected_game();
         }
+        let theme_preference = match self.settings.look_and_feel.as_str() {
+            "off" | "system" | "auto" => egui::ThemePreference::System,
+            "light" => egui::ThemePreference::Light,
+            _ => egui::ThemePreference::Dark,
+        };
+        ctx.set_theme(theme_preference);
         let theme = ctx.theme();
         let mut style = (*ctx.style_of(theme)).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.window_fill = Color32::from_rgb(31, 35, 38);
-        style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(52, 57, 60);
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(75, 80, 82);
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(94, 101, 104);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(64, 116, 144);
-        style.visuals.selection.bg_fill = Color32::from_rgb(54, 116, 153);
+        style.visuals = theme.default_visuals();
+        if theme == egui::Theme::Dark {
+            style.visuals.window_fill = Color32::from_rgb(31, 35, 38);
+            style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(52, 57, 60);
+            style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(75, 80, 82);
+            style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(94, 101, 104);
+            style.visuals.widgets.active.bg_fill = Color32::from_rgb(64, 116, 144);
+            style.visuals.selection.bg_fill = Color32::from_rgb(54, 116, 153);
+        }
         style.spacing.item_spacing = Vec2::new(0.0, 5.0);
         style.spacing.interact_size.y = 22.0;
         ctx.set_style_of(theme, style);
@@ -2325,46 +2874,67 @@ impl eframe::App for LauncherApp {
         let mut updates = Vec::new();
         let mut finished = false;
         if let Some(receiver) = &self.launch_events {
-            while let Ok(message) = receiver.try_recv() {
-                if message == "__DONE__" {
-                    finished = true;
-                } else {
-                    updates.push(message);
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    LaunchUiEvent::Finished => finished = true,
+                    _ => updates.push(event),
                 }
             }
         }
-        for message in updates {
-            if let Some(progress) = parse_launch_progress(&message) {
-                self.launch_progress = Some(progress);
-            }
-            if message == "__GAME_STARTED__" {
-                self.status = tr("rust.status.game.starting").to_owned();
-                self.launch_progress = None;
-                match self.settings.launch_action.as_str() {
-                    "hide" => {
-                        self.hidden_for_game = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        for event in updates {
+            match event {
+                LaunchUiEvent::Message(message) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        message.level,
+                        message.target,
+                        &message.message,
+                    );
+                    if let Some(progress) = parse_launch_progress(&message.message) {
+                        self.launch_progress = Some(progress);
                     }
-                    "exit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                    _ => {}
+                    self.status = message.message;
                 }
-            } else {
-                self.status = message;
+                LaunchUiEvent::GameStarted => {
+                    let message = tr("rust.status.game.starting").to_owned();
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Info,
+                        LogTarget::Minecraft,
+                        &message,
+                    );
+                    self.game_running = true;
+                    self.status = message;
+                    self.launch_progress = None;
+                    match self.settings.launch_action.as_str() {
+                        "hide" => {
+                            self.hidden_for_game = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        }
+                        "exit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        _ => {}
+                    }
+                }
+                LaunchUiEvent::Finished => {}
             }
         }
         if finished {
             self.launching = false;
+            self.game_running = false;
             self.launch_progress = None;
             self.launch_events = None;
             if self.hidden_for_game {
                 self.hidden_for_game = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
-            if let Ok(mut pending) = self.pending_crash_report.lock() {
-                if let Some(report) = pending.take() {
-                    self.status = report.summary.clone();
-                    self.crash_report = Some(report);
-                }
+            let pending_report = self
+                .pending_crash_report
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.take());
+            if let Some(report) = pending_report {
+                self.set_logged_status(LogLevel::Error, LogTarget::Crash, report.summary.clone());
+                self.crash_report = Some(report);
             }
         }
 
@@ -2388,10 +2958,15 @@ impl eframe::App for LauncherApp {
                         self.version_update_alert = Some(alert);
                     }
                     self.version_manifest = Some(manifest);
-                    self.status =
-                        tr("rust.status.catalog.loaded").replace("%0", &version_count.to_string());
+                    self.set_logged_status(
+                        LogLevel::Info,
+                        LogTarget::VersionCatalog,
+                        tr("rust.status.catalog.loaded").replace("%0", &version_count.to_string()),
+                    );
                 }
-                Err(error) => self.status = error,
+                Err(error) => {
+                    self.set_logged_status(LogLevel::Error, LogTarget::VersionCatalog, error);
+                }
             }
         }
         let mut update_check_result = None;
@@ -2405,19 +2980,34 @@ impl eframe::App for LauncherApp {
             self.update_checking = false;
             match result {
                 Ok(github_update::CheckResult::NoPublishedRelease) => {
-                    self.status = tr("update.check.no-release").to_owned();
+                    self.set_logged_status(
+                        LogLevel::Info,
+                        LogTarget::Update,
+                        tr("update.check.no-release"),
+                    );
                 }
                 Ok(github_update::CheckResult::UpToDate) => {
-                    self.status =
-                        tr("update.check.current").replace("%0", env!("CARGO_PKG_VERSION"));
+                    self.set_logged_status(
+                        LogLevel::Info,
+                        LogTarget::Update,
+                        tr("update.check.current").replace("%0", env!("CARGO_PKG_VERSION")),
+                    );
                 }
                 Ok(github_update::CheckResult::UpdateAvailable(release)) => {
-                    self.status = format!("{} {}", tr("update.check.available"), release.tag_name);
+                    self.set_logged_status(
+                        LogLevel::Info,
+                        LogTarget::Update,
+                        format!("{} {}", tr("update.check.available"), release.tag_name),
+                    );
                     self.available_release = Some(release);
-                    self.show_update_dialog = true;
+                    self.update_prompt_pending = true;
                 }
                 Err(error) => {
-                    self.status = tr("update.check.failed").replace("%0", &error.to_string());
+                    self.set_logged_status(
+                        LogLevel::Error,
+                        LogTarget::Update,
+                        tr("update.check.failed").replace("%0", &error.to_string()),
+                    );
                 }
             }
         }
@@ -2432,14 +3022,26 @@ impl eframe::App for LauncherApp {
             self.update_installing = false;
             match result {
                 Ok(()) => {
-                    self.status = tr("update.installing").to_owned();
+                    self.set_logged_status(
+                        LogLevel::Info,
+                        LogTarget::Update,
+                        tr("update.installing"),
+                    );
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Err(error) => {
                     self.update_install_error = Some(error.clone());
-                    self.status = error;
+                    self.set_logged_status(LogLevel::Error, LogTarget::Update, error);
                 }
             }
+        }
+        if self.update_prompt_pending
+            && !self.show_first_run_notice
+            && !self.show_first_run_folder_notice
+            && !self.show_arm_compat_notice
+        {
+            self.update_prompt_pending = false;
+            self.show_update_dialog = true;
         }
         let mut bootstrap_update = None;
         if let Some(receiver) = &self.bootstrap_events {
@@ -2465,8 +3067,22 @@ impl eframe::App for LauncherApp {
                     self.bootstrap_notification = configuration.notification;
                     self.bootstrap_error = None;
                     self.rebuild_notice_list(ctx);
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Info,
+                        LogTarget::Bootstrap,
+                        "Loaded and verified signed bootstrap configuration.",
+                    );
                 }
-                Err(error) => self.bootstrap_error = Some(error),
+                Err(error) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Warn,
+                        LogTarget::Bootstrap,
+                        &error,
+                    );
+                    self.bootstrap_error = Some(error);
+                }
             }
         }
 
@@ -2481,10 +3097,22 @@ impl eframe::App for LauncherApp {
             self.notices_loading = false;
             match result {
                 Ok(notices) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Info,
+                        LogTarget::Notices,
+                        &format!("Loaded {} US notice(s).", notices.len()),
+                    );
                     self.personal_notice_list = notices;
                     self.notice_error = None;
                 }
                 Err(error) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Warn,
+                        LogTarget::Notices,
+                        &error,
+                    );
                     self.notice_error = Some(error);
                     self.personal_notice_list.clear();
                 }
@@ -2502,10 +3130,24 @@ impl eframe::App for LauncherApp {
             self.diagnostic_pending = false;
             match result {
                 Ok(url) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Info,
+                        LogTarget::Diagnostics,
+                        "Diagnostic report upload completed.",
+                    );
                     self.diagnostic_result_url = Some(url);
                     self.diagnostic_error = None;
                 }
-                Err(error) => self.diagnostic_error = Some(error),
+                Err(error) => {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Error,
+                        LogTarget::Diagnostics,
+                        &error,
+                    );
+                    self.diagnostic_error = Some(error);
+                }
             }
         }
         let mut microsoft_signin_update = None;
@@ -2546,7 +3188,9 @@ impl eframe::App for LauncherApp {
             self.profile_creation_pending = false;
             match result {
                 Ok(account) => self.save_microsoft_account(account),
-                Err(error) => self.status = error,
+                Err(error) => {
+                    self.set_logged_status(LogLevel::Error, LogTarget::Authentication, error)
+                }
             }
         }
         if self.launching {
@@ -2573,7 +3217,7 @@ impl eframe::App for LauncherApp {
         let account_menu_label = self.selected_account_label();
         let selected_version = self.settings.selected_version.clone();
         let install_label = if self.launching {
-            "Installing and launching…"
+            tr("rust.status.game.installing-launching")
         } else if self.version_is_installed() {
             tr("loginform.enter")
         } else {
@@ -2785,8 +3429,12 @@ impl eframe::App for LauncherApp {
                             if refresh.clicked() {
                                 let count = self.installed_versions().len();
                                 self.refresh_version_catalog();
-                                self.status =
-                                    format!("Refreshing catalog; {count} local version(s) found.");
+                                self.set_logged_status(
+                                    LogLevel::Info,
+                                    LogTarget::VersionCatalog,
+                                    tr("rust.status.catalog.refreshed-local")
+                                        .replace("%0", &count.to_string()),
+                                );
                             }
                             refresh.on_hover_text(tr("loginform.button.refresh"));
 
@@ -2866,8 +3514,12 @@ impl eframe::App for LauncherApp {
                             match fs::create_dir_all(&mods) {
                                 Ok(()) => open_path(&mods),
                                 Err(error) => {
-                                    self.status =
-                                        format!("Could not open the mods folder: {error}");
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::Mods,
+                                        tr("rust.status.game.mods-folder-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 }
                             }
                             self.show_folder_menu = false;
@@ -3075,6 +3727,10 @@ impl eframe::App for LauncherApp {
                             self.settings_page = Some("Launcher & game preferences");
                             self.show_settings_menu = false;
                         }
+                        if ui.button(tr("settings.tab.about")).clicked() {
+                            self.settings_page = Some("About us");
+                            self.show_settings_menu = false;
+                        }
                         if ui.button(tr("loginform.button.settings.version")).clicked() {
                             self.settings_page = Some("Manage versions");
                             self.show_settings_menu = false;
@@ -3201,12 +3857,13 @@ impl eframe::App for LauncherApp {
                                 ui.set_max_width(330.0);
                                 ui.horizontal(|ui| {
                                     ui.strong(if notice.promoted {
-                                        "Suggested"
+                                        tr("rust.ui.notices.suggested")
                                     } else {
-                                        "Notice"
+                                        tr("rust.ui.notices.notice")
                                     });
                                     if ui.small_button(tr("rust.ui.notices.all")).clicked() {
-                                        self.show_notices_window = true;
+                                        self.notice_scene_index = 0;
+                                        self.show_notice_scene = true;
                                     }
                                 });
                                 ui.separator();
@@ -3261,7 +3918,10 @@ impl eframe::App for LauncherApp {
                 .show(ctx, |ui| {
                     let was_enabled = self.settings.notices_enabled;
                     let notices_changed = ui
-                        .checkbox(&mut self.settings.notices_enabled, "Show notices")
+                        .checkbox(
+                            &mut self.settings.notices_enabled,
+                            tr("rust.ui.notices.show"),
+                        )
                         .changed();
                     let mut changed = notices_changed;
                     if notices_changed && !was_enabled && self.settings.notices_enabled {
@@ -3270,7 +3930,7 @@ impl eframe::App for LauncherApp {
                     changed |= ui
                         .checkbox(
                             &mut self.settings.promoted_notices_enabled,
-                            "Show promoted suggestions",
+                            tr("rust.ui.notices.show-promoted"),
                         )
                         .changed();
                     if changed {
@@ -3318,9 +3978,9 @@ impl eframe::App for LauncherApp {
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.strong(if notice.promoted {
-                                        "Suggested"
+                                        tr("rust.ui.notices.suggested")
                                     } else {
-                                        "Notice"
+                                        tr("rust.ui.notices.notice")
                                     });
                                     ui.label(
                                         tr("rust.ui.notices.id")
@@ -3359,6 +4019,306 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        if let Some(report) = self.connectivity_report.clone()
+            && report.has_critical_failures()
+        {
+            egui::Area::new(Id::unique("connectivity_warning_badge"))
+                .anchor(Align2::RIGHT_TOP, Vec2::new(-12.0, 58.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        if ui
+                            .button(
+                                RichText::new(format!("⚠ {}", tr("connectivity.warning.title")))
+                                    .color(Color32::from_rgb(242, 195, 86)),
+                            )
+                            .clicked()
+                        {
+                            self.show_connectivity_window = true;
+                        }
+                    });
+                });
+
+            if self.show_connectivity_window {
+                let mut open = true;
+                egui::Window::new(tr("connectivity.warning.title"))
+                    .open(&mut open)
+                    .default_size([500.0, 460.0])
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        let no_connection = report.all_services_unreachable();
+                        let body_key = if no_connection {
+                            "connectivity.warning.body.empty"
+                        } else {
+                            "connectivity.warning.body.text"
+                        };
+                        ui.label(localized_html_to_plain_text(&tr(body_key)));
+                        if ui.link(tr("connectivity.warning.body.link")).clicked() {
+                            open_url(if no_connection {
+                                "https://wiki.llaun.ch/en:connectivity:none"
+                            } else {
+                                "https://wiki.llaun.ch/en:connectivity:some"
+                            });
+                        }
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for service in report
+                                .services
+                                .iter()
+                                .filter(|service| !service.reachable)
+                            {
+                                let (name_key, hint_key) = match service.id {
+                                    "official_repo" => (
+                                        "connectivity.warning.list.name.official_repo",
+                                        "rust.connectivity.hint.official_repo",
+                                    ),
+                                    "repo" => (
+                                        "connectivity.warning.list.name.repo",
+                                        "connectivity.warning.list.hint.repo",
+                                    ),
+                                    "boot" => (
+                                        "connectivity.warning.list.name.boot",
+                                        "connectivity.warning.list.hint.boot",
+                                    ),
+                                    "account.ely.by" => (
+                                        "connectivity.warning.list.name.account.ely.by",
+                                        "connectivity.warning.list.hint.account.ely.by",
+                                    ),
+                                    _ => (
+                                        "connectivity.warning.list.name.web",
+                                        "rust.connectivity.hint.official_repo",
+                                    ),
+                                };
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong(tr(name_key));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.colored_label(
+                                                    Color32::LIGHT_RED,
+                                                    tr("connectivity.warning.list.status.unreachable"),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.label(tr(hint_key));
+                                });
+                            }
+                        });
+                        let unavailable_hosts = report.unavailable_hosts();
+                        if !unavailable_hosts.is_empty() {
+                            egui::CollapsingHeader::new(tr("connectivity.warning.hosts.button"))
+                                .show(ui, |ui| {
+                                    for host in unavailable_hosts {
+                                        ui.monospace(host);
+                                    }
+                                });
+                        }
+                    });
+                self.show_connectivity_window = open;
+            }
+        }
+
+        if self.show_notice_scene {
+            let screen_rect = ctx.content_rect();
+            let selected_notice = self
+                .notice_list
+                .get(self.notice_scene_index % self.notice_list.len().max(1))
+                .cloned();
+            let selected_is_hidden = selected_notice.as_ref().is_some_and(|notice| {
+                self.settings
+                    .hidden_notices_until
+                    .get(&notice.id)
+                    .is_some_and(|expiry| *expiry > unix_time_millis())
+            });
+            let mut go_home = false;
+            let mut change_by = None;
+            let mut toggle_notice = None;
+            let mut action = None;
+            egui::Area::new(Id::unique("legacy_notice_scene"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(screen_rect.min)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    ui.set_min_size(screen_rect.size());
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(27, 31, 34))
+                        .inner_margin(Margin::same(24))
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout(
+                                screen_rect.size() - Vec2::splat(48.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.heading(tr("rust.ui.window.notices"));
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.add_space(10.0);
+
+                                    if let Some(notice) = &selected_notice {
+                                        let content_width = (screen_rect.width() - 112.0).clamp(240.0, 760.0);
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(content_width, ui.available_height()),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                egui::Frame::popup(ui.style())
+                                                    .inner_margin(Margin::same(18))
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_width(content_width - 36.0);
+                                                        ui.horizontal(|ui| {
+                                                            ui.strong(if notice.promoted {
+                                                                tr("rust.ui.notices.suggested")
+                                                            } else {
+                                                                tr("rust.ui.notices.notice")
+                                                            });
+                                                            ui.label(
+                                                                tr("rust.ui.notices.id")
+                                                                    .replace("%0", &notice.id),
+                                                            );
+                                                            if selected_is_hidden {
+                                                                ui.label(
+                                                                    RichText::new(tr(
+                                                                        "rust.ui.notice-scene.hidden",
+                                                                    ))
+                                                                    .weak(),
+                                                                );
+                                                            }
+                                                        });
+                                                        ui.separator();
+                                                        if let Some(texture) =
+                                                            self.notice_images.get(&notice.id)
+                                                        {
+                                                            let size = texture.size_vec2();
+                                                            if size.x > 0.0 && size.y > 0.0 {
+                                                                let max_height = (screen_rect
+                                                                    .height()
+                                                                    - 300.0)
+                                                                .clamp(96.0, 300.0);
+                                                                let scale = (content_width / size.x)
+                                                                    .min(max_height / size.y)
+                                                                    .min(1.0);
+                                                                ui.image((texture.id(), size * scale));
+                                                            }
+                                                        }
+                                                        egui::ScrollArea::vertical()
+                                                            .max_height((screen_rect.height() - 300.0).max(100.0))
+                                                            .show(ui, |ui| {
+                                                                ui.add_enabled_ui(
+                                                                    !selected_is_hidden,
+                                                                    |ui| {
+                                                                        ui.label(&notice.text);
+                                                                    },
+                                                                );
+                                                            });
+                                                        if let Some(notice_action) =
+                                                            notice.action.clone()
+                                                        {
+                                                            let label = match &notice_action {
+                                                                notices::NoticeAction::Url {
+                                                                    label, ..
+                                                                }
+                                                                | notices::NoticeAction::Scene {
+                                                                    label, ..
+                                                                }
+                                                                | notices::NoticeAction::Launcher {
+                                                                    label, ..
+                                                                }
+                                                                | notices::NoticeAction::Server {
+                                                                    label, ..
+                                                                } => label,
+                                                            };
+                                                            if ui
+                                                                .add_enabled(
+                                                                    !selected_is_hidden,
+                                                                    egui::Button::new(label),
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                action = Some(notice_action);
+                                                            }
+                                                        }
+                                                    });
+                                            },
+                                        );
+                                    } else if self.notices_loading || self.bootstrap_loading {
+                                        ui.spinner();
+                                        ui.label(tr("rust.ui.notices.loading"));
+                                        ctx.request_repaint_after(Duration::from_millis(250));
+                                    } else {
+                                        ui.label(tr("rust.ui.notices.empty"));
+                                    }
+
+                                    ui.with_layout(
+                                        egui::Layout::bottom_up(egui::Align::Center),
+                                        |ui| {
+                                            ui.horizontal(|ui| {
+                                                let notice_count = self.notice_list.len();
+                                                if ui
+                                                    .add_enabled(
+                                                        notice_count > 1,
+                                                        egui::Button::new(tr(
+                                                            "rust.ui.notice-scene.previous",
+                                                        )),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    change_by = Some(-1isize);
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        notice_count > 1,
+                                                        egui::Button::new(tr(
+                                                            "rust.ui.notice-scene.next",
+                                                        )),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    change_by = Some(1isize);
+                                                }
+                                                if let Some(notice) = &selected_notice {
+                                                    let key = if selected_is_hidden {
+                                                        "rust.ui.notice-scene.restore"
+                                                    } else {
+                                                        "rust.ui.notice-scene.hide"
+                                                    };
+                                                    if ui.button(tr(key)).clicked() {
+                                                        toggle_notice = Some(notice.id.clone());
+                                                    }
+                                                }
+                                                if ui
+                                                    .button(tr("rust.ui.notice-scene.home"))
+                                                    .clicked()
+                                                {
+                                                    go_home = true;
+                                                }
+                                            });
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                });
+            if let Some(delta) = change_by {
+                let count = self.notice_list.len();
+                if count > 0 {
+                    self.notice_scene_index = if delta < 0 {
+                        (self.notice_scene_index + count - 1) % count
+                    } else {
+                        (self.notice_scene_index + 1) % count
+                    };
+                }
+            }
+            if let Some(id) = toggle_notice {
+                self.toggle_notice_visibility_for_week(&id);
+            }
+            if go_home {
+                self.show_notice_scene = false;
+            }
+            if let Some(action) = action {
+                self.perform_notice_action(action, ctx);
+            }
+        }
+
         if let Some(pending) = self.pending_promoted_server.clone() {
             let installed_versions: HashSet<String> =
                 self.installed_versions().into_iter().collect();
@@ -3374,16 +4334,19 @@ impl eframe::App for LauncherApp {
                         tr("rust.ui.servers.choose-version").replace("%0", &pending.server.name),
                     );
                     if ui
-                        .button(format!("Current version ({})", pending.current_version))
+                        .button(
+                            tr("rust.ui.versions.current-version")
+                                .replace("%0", &pending.current_version),
+                        )
                         .clicked()
                     {
                         selected_version = Some(pending.current_version.clone());
                     }
                     for version in &pending.family_versions {
                         let suffix = if installed_versions.contains(version) {
-                            " (installed)"
+                            format!(" ({})", tr("rust.ui.versions.installed"))
                         } else {
-                            ""
+                            String::new()
                         };
                         if ui.button(format!("{version}{suffix}")).clicked() {
                             selected_version = Some(version.clone());
@@ -3437,10 +4400,31 @@ impl eframe::App for LauncherApp {
                             let _ = fs::create_dir_all(&directory);
                             open_path(&directory);
                         }
+                        if ui.button(tr("rust.ui.logs.open-launcher-folder")).clicked() {
+                            let directory = launcher_log_path().parent().map(Path::to_path_buf);
+                            if let Some(directory) = directory {
+                                let _ = fs::create_dir_all(&directory);
+                                open_path(&directory);
+                            }
+                        }
                         if ui.button(tr("rust.ui.logs.open-crash-folder")).clicked() {
                             let directory = game_directory.join("crash-reports");
                             let _ = fs::create_dir_all(&directory);
                             open_path(&directory);
+                        }
+                        if ui
+                            .add_enabled(
+                                self.game_running,
+                                egui::Button::new(tr("rust.ui.logs.stop-game")),
+                            )
+                            .clicked()
+                        {
+                            self.cancel_requested.store(true, Ordering::Release);
+                            self.set_logged_status(
+                                LogLevel::Warn,
+                                LogTarget::Launcher,
+                                tr("rust.status.operation.cancelling"),
+                            );
                         }
                         ui.label(
                             tr("rust.ui.logs.file-count")
@@ -3453,11 +4437,23 @@ impl eframe::App for LauncherApp {
                         egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
                             if ui
                                 .selectable_label(
+                                    self.show_live_launcher_log,
+                                    tr("rust.ui.logs.live-launcher"),
+                                )
+                                .clicked()
+                            {
+                                self.show_live_launcher_log = true;
+                                self.show_live_game_log = false;
+                                selected = None;
+                            }
+                            if ui
+                                .selectable_label(
                                     self.show_live_game_log,
                                     tr("rust.ui.logs.live-session"),
                                 )
                                 .clicked()
                             {
+                                self.show_live_launcher_log = false;
                                 self.show_live_game_log = true;
                                 selected = None;
                             }
@@ -3487,12 +4483,48 @@ impl eframe::App for LauncherApp {
                                     .selectable_value(&mut selected, Some(path.clone()), label)
                                     .clicked()
                                 {
+                                    self.show_live_launcher_log = false;
                                     self.show_live_game_log = false;
                                 }
                             }
                         });
                         columns[1].vertical(|ui| {
-                            if self.show_live_game_log {
+                            if self.show_live_launcher_log {
+                                let text = self
+                                    .launcher_log
+                                    .lock()
+                                    .map(|lines| {
+                                        lines
+                                            .iter()
+                                            .map(LogRecord::render)
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    })
+                                    .unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    ui.strong(tr("rust.ui.logs.live-launcher"));
+                                    if ui.small_button(tr("rust.ui.logs.copy")).clicked() {
+                                        copy_text = Some(text.clone());
+                                    }
+                                });
+                                if text.is_empty() {
+                                    ui.label(tr("rust.ui.logs.live-launcher-empty"));
+                                } else {
+                                    let mut display_text = text;
+                                    egui::ScrollArea::vertical().stick_to_bottom(true).show(
+                                        ui,
+                                        |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut display_text)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(24)
+                                                    .interactive(false),
+                                            );
+                                        },
+                                    );
+                                }
+                            } else if self.show_live_game_log {
                                 let text = self
                                     .game_log
                                     .lock()
@@ -3510,15 +4542,18 @@ impl eframe::App for LauncherApp {
                                     ui.label(tr("rust.ui.logs.live-empty"));
                                 } else {
                                     let mut display_text = text;
-                                    egui::ScrollArea::vertical().show(ui, |ui| {
-                                        ui.add(
-                                            egui::TextEdit::multiline(&mut display_text)
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY)
-                                                .desired_rows(24)
-                                                .interactive(false),
-                                        );
-                                    });
+                                    egui::ScrollArea::vertical().stick_to_bottom(true).show(
+                                        ui,
+                                        |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut display_text)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .desired_rows(24)
+                                                    .interactive(false),
+                                            );
+                                        },
+                                    );
                                 }
                             } else if let Some(path) = &selected {
                                 ui.horizontal(|ui| {
@@ -3533,7 +4568,7 @@ impl eframe::App for LauncherApp {
                                     }
                                 });
                                 let mut text = read_log_tail(path)
-                                    .unwrap_or_else(|| "Could not read this log file.".to_owned());
+                                    .unwrap_or_else(|| tr("rust.ui.logs.read-error").to_owned());
                                 egui::ScrollArea::vertical().show(ui, |ui| {
                                     ui.add(
                                         egui::TextEdit::multiline(&mut text)
@@ -3569,6 +4604,7 @@ impl eframe::App for LauncherApp {
             }
             if !open && self.settings.logger_mode == "global" {
                 self.settings.logger_mode = "none".to_owned();
+                self.show_live_launcher_log = false;
                 self.show_live_game_log = false;
                 self.persist();
             }
@@ -3576,7 +4612,11 @@ impl eframe::App for LauncherApp {
             self.selected_log_path = selected;
             if let Some(text) = copy_text {
                 ctx.copy_text(text);
-                self.status = tr("rust.status.logs.copied").to_owned();
+                self.set_logged_status(
+                    LogLevel::Info,
+                    LogTarget::Diagnostics,
+                    tr("rust.status.logs.copied"),
+                );
             }
         }
 
@@ -3642,10 +4682,13 @@ impl eframe::App for LauncherApp {
                     if !valid_plain_name(self.new_account.trim()) {
                         ui.checkbox(
                             &mut self.new_account_allow_invalid,
-                            "Allow a non-standard player name",
+                            tr("rust.ui.account.allow-nonstandard"),
                         );
                     }
-                    ui.checkbox(&mut self.new_account_ely_skins, "Use Ely.by skins");
+                    ui.checkbox(
+                        &mut self.new_account_ely_skins,
+                        tr("account.button.ely.toggle"),
+                    );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(tr("support.button.cancel")).clicked() {
@@ -3653,9 +4696,9 @@ impl eframe::App for LauncherApp {
                             self.editing_account = None;
                         }
                         let save_label = if editing {
-                            "Save account"
+                            tr("rust.ui.account.save")
                         } else {
-                            "Add account"
+                            tr("rust.ui.account.add")
                         };
                         if ui.button(save_label).clicked() {
                             let name = self.new_account.trim().to_owned();
@@ -3672,22 +4715,23 @@ impl eframe::App for LauncherApp {
                                 });
                                 if collision {
                                     self.editing_account = old_name;
-                                    self.status =
-                                        "An offline account with that name already exists."
-                                            .to_owned();
+                                    self.set_logged_status(
+                                        LogLevel::Warn,
+                                        LogTarget::Authentication,
+                                        tr("rust.status.account.offline.duplicate"),
+                                    );
                                 } else {
                                     if let Some(old_name) = old_name {
                                         if old_name != name {
-                                            let was_migrated_mojang = self
-                                                .settings
-                                                .migrated_mojang_accounts
-                                                .iter()
-                                                .any(|saved| saved.eq_ignore_ascii_case(&old_name));
+                                            let was_migrated_mojang =
+                                                self.settings.migrated_mojang_accounts.iter().any(
+                                                    |saved| saved.eq_ignore_ascii_case(&old_name),
+                                                );
                                             let preserved_uuid =
                                                 offline_account_uuid_for(&self.settings, &old_name);
-                                            self.settings
-                                                .migrated_mojang_accounts
-                                                .retain(|saved| !saved.eq_ignore_ascii_case(&old_name));
+                                            self.settings.migrated_mojang_accounts.retain(
+                                                |saved| !saved.eq_ignore_ascii_case(&old_name),
+                                            );
                                             if was_migrated_mojang {
                                                 self.settings
                                                     .migrated_mojang_accounts
@@ -3696,9 +4740,9 @@ impl eframe::App for LauncherApp {
                                             self.settings.offline_account_uuids.retain(
                                                 |saved, _| !saved.eq_ignore_ascii_case(&old_name),
                                             );
-                                            self.settings.offline_ely_skins.retain(
-                                                |saved, _| !saved.eq_ignore_ascii_case(&old_name),
-                                            );
+                                            self.settings.offline_ely_skins.retain(|saved, _| {
+                                                !saved.eq_ignore_ascii_case(&old_name)
+                                            });
                                             if let Some(uuid) = preserved_uuid {
                                                 self.settings
                                                     .offline_account_uuids
@@ -3731,11 +4775,17 @@ impl eframe::App for LauncherApp {
                                     self.persist();
                                 }
                             } else {
-                                self.status = if name.is_empty() {
-                                    "Enter a player name.".to_owned()
+                                let message = if name.is_empty() {
+                                    tr("rust.status.account.offline.name-required").to_owned()
                                 } else {
-                                    "Enable non-standard names to use characters outside the usual Minecraft name format.".to_owned()
+                                    tr("rust.status.account.offline.nonstandard-disabled")
+                                        .to_owned()
                                 };
+                                self.set_logged_status(
+                                    LogLevel::Warn,
+                                    LogTarget::Authentication,
+                                    message,
+                                );
                             }
                         }
                     });
@@ -3754,14 +4804,18 @@ impl eframe::App for LauncherApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let cancel_label = if self.ely_signin_pending {
-                            "Cancel sign-in"
+                            tr("rust.ui.account.cancel-sign-in")
                         } else {
-                            "Cancel"
+                            tr("support.button.cancel")
                         };
                         if ui.button(cancel_label).clicked() {
                             if self.ely_signin_pending {
                                 self.cancel_requested.store(true, Ordering::Release);
-                                self.status = tr("rust.status.account.ely.cancelling").to_owned();
+                                self.set_logged_status(
+                                    LogLevel::Warn,
+                                    LogTarget::Authentication,
+                                    tr("rust.status.account.ely.cancelling"),
+                                );
                             } else {
                                 self.show_ely_dialog = false;
                             }
@@ -3811,12 +4865,16 @@ impl eframe::App for LauncherApp {
                         let cancel_label = if self.ely_legacy_signin_pending {
                             tr("rust.ui.account.cancel-sign-in")
                         } else {
-                            tr("ui.cancel")
+                            tr("support.button.cancel")
                         };
                         if ui.button(cancel_label).clicked() {
                             if self.ely_legacy_signin_pending {
                                 self.cancel_requested.store(true, Ordering::Release);
-                                self.status = tr("rust.status.account.ely.cancelling").to_owned();
+                                self.set_logged_status(
+                                    LogLevel::Warn,
+                                    LogTarget::Authentication,
+                                    tr("rust.status.account.ely.cancelling"),
+                                );
                             } else {
                                 self.show_ely_legacy_dialog = false;
                             }
@@ -3903,8 +4961,45 @@ impl eframe::App for LauncherApp {
                 .resizable(true)
                 .default_size([520.0, 500.0])
                 .show(ctx, |ui| match title {
+                    "About us" => {
+                        ui.horizontal(|ui| {
+                            ui.heading("Legacy Launcher");
+                            ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("(by");
+                            if ui.link("turikhay").clicked() {
+                                open_url("https://turikhay.com");
+                            }
+                            ui.label(") —");
+                            ui.label(localized_html_to_plain_text(&tr("about.text")));
+                        });
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.link("Ely.by").clicked() {
+                                open_url("https://ely.by");
+                            }
+                            ui.label("—");
+                            ui.label(localized_html_to_plain_text(&tr("about.partners.ely")));
+                        });
+                        ui.separator();
+                        ui.label(localized_html_to_plain_text(&tr("about.license")));
+                    }
                     "Launcher & game preferences" => {
                         ui.label(tr("rust.settings.locale.english-us"));
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.switch-to-beta.label"));
+                            if ui
+                                .checkbox(
+                                    &mut self.settings.beta_updates,
+                                    tr("settings.switch-to-beta"),
+                                )
+                                .changed()
+                            {
+                                self.persist();
+                            }
+                        });
                         ui.horizontal(|ui| {
                             ui.label(tr("settings.slide.list.label"));
                             ui.add(
@@ -3944,6 +5039,35 @@ impl eframe::App for LauncherApp {
                                 ui.ctx().set_zoom_factor(self.settings.launcher_font_size / 12.0);
                                 self.persist();
                             }
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(tr("settings.laf.label"));
+                            let state_label = tr(look_and_feel_label_key(
+                                &self.settings.look_and_feel,
+                            ));
+                            ComboBox::from_id_salt("look_and_feel")
+                                .selected_text(state_label)
+                                .show_ui(ui, |ui| {
+                                    for (state, key) in [
+                                        ("off", "settings.laf.state.off"),
+                                        ("system", "settings.laf.state.system"),
+                                        ("auto", "settings.laf.state.auto"),
+                                        ("dark", "settings.laf.state.dark"),
+                                        ("light", "settings.laf.state.light"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.settings.look_and_feel,
+                                                state.to_owned(),
+                                                tr(key),
+                                            )
+                                            .changed()
+                                        {
+                                            self.persist();
+                                        }
+                                    }
+                                });
                         });
                         ui.separator();
                         ui.label(tr("settings.client.gamedir.label"));
@@ -4307,11 +5431,19 @@ impl eframe::App for LauncherApp {
                                 {
                                     match detect_java() {
                                         Ok((path, version)) => {
-                                            self.status = tr("rust.status.java.found-current")
-                                                .replace("%0", &version)
-                                                .replace("%1", &path.display().to_string());
+                                            self.set_logged_status(
+                                                LogLevel::Info,
+                                                LogTarget::JavaRuntime,
+                                                tr("rust.status.java.found-current")
+                                                    .replace("%0", &version)
+                                                    .replace("%1", &path.display().to_string()),
+                                            );
                                         }
-                                        Err(error) => self.status = error,
+                                        Err(error) => self.set_logged_status(
+                                            LogLevel::Error,
+                                            LogTarget::JavaRuntime,
+                                            error,
+                                        ),
                                     }
                                 }
                             }
@@ -4334,12 +5466,20 @@ impl eframe::App for LauncherApp {
                                             Ok((path, version)) => {
                                                 self.settings.java_path =
                                                     path.to_string_lossy().into_owned();
-                                                self.status = tr("rust.status.java.found")
-                                                    .replace("%0", &version)
-                                                    .replace("%1", &path.display().to_string());
+                                                self.set_logged_status(
+                                                    LogLevel::Info,
+                                                    LogTarget::JavaRuntime,
+                                                    tr("rust.status.java.found")
+                                                        .replace("%0", &version)
+                                                        .replace("%1", &path.display().to_string()),
+                                                );
                                                 self.persist();
                                             }
-                                            Err(error) => self.status = error,
+                                            Err(error) => self.set_logged_status(
+                                                LogLevel::Error,
+                                                LogTarget::JavaRuntime,
+                                                error,
+                                            ),
                                         }
                                     }
                                 });
@@ -4423,7 +5563,12 @@ impl eframe::App for LauncherApp {
                                 .clicked()
                             {
                                 if let Err(error) = fs::create_dir_all(&runtime_root) {
-                                    self.status = tr("rust.status.java.runtime-folder-error").replace("%0", &error.to_string());
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::JavaRuntime,
+                                        tr("rust.status.java.runtime-folder-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 } else {
                                     open_path(&runtime_root);
                                 }
@@ -4558,14 +5703,25 @@ impl eframe::App for LauncherApp {
                                 };
                                 match import_legacy_settings(&path, &mut self.settings) {
                                     Ok(summary) => {
-                                        self.status = tr("rust.status.import.settings.success")
-                                            .replace("%0", &summary.applied.to_string())
-                                            .replace("%1", &summary.skipped.to_string());
+                                        self.set_logged_status(
+                                            LogLevel::Info,
+                                            LogTarget::Settings,
+                                            tr("rust.status.import.settings.success")
+                                                .replace("%0", &summary.applied.to_string())
+                                                .replace("%1", &summary.skipped.to_string()),
+                                        );
+                                        ui.ctx().set_zoom_factor(
+                                            self.settings.launcher_font_size / 12.0,
+                                        );
                                         self.persist();
                                     }
                                     Err(error) => {
-                                        self.status = tr("rust.status.import.settings.error")
-                                            .replace("%0", &error.to_string());
+                                        self.set_logged_status(
+                                            LogLevel::Error,
+                                            LogTarget::Settings,
+                                            tr("rust.status.import.settings.error")
+                                                .replace("%0", &error.to_string()),
+                                        );
                                     }
                                 }
                             }
@@ -4598,18 +5754,26 @@ impl eframe::App for LauncherApp {
                                 };
                                 match import_legacy_accounts(&path, &mut self.settings) {
                                     Ok(summary) => {
-                                        self.status = tr("rust.status.import.accounts.success")
-                                            .replace("%0", &summary.offline.to_string())
-                                            .replace("%1", &summary.microsoft.to_string())
-                                            .replace("%2", &summary.ely.to_string())
-                                            .replace("%3", &summary.ely_legacy.to_string())
-                                            .replace("%4", &summary.mojang_migrated.to_string())
-                                            .replace("%5", &summary.skipped.to_string());
+                                        self.set_logged_status(
+                                            LogLevel::Info,
+                                            LogTarget::Authentication,
+                                            tr("rust.status.import.accounts.success")
+                                                .replace("%0", &summary.offline.to_string())
+                                                .replace("%1", &summary.microsoft.to_string())
+                                                .replace("%2", &summary.ely.to_string())
+                                                .replace("%3", &summary.ely_legacy.to_string())
+                                                .replace("%4", &summary.mojang_migrated.to_string())
+                                                .replace("%5", &summary.skipped.to_string()),
+                                        );
                                         self.persist();
                                     }
                                     Err(error) => {
-                                        self.status = tr("rust.status.import.accounts.error")
-                                            .replace("%0", &error.to_string());
+                                        self.set_logged_status(
+                                            LogLevel::Error,
+                                            LogTarget::Authentication,
+                                            tr("rust.status.import.accounts.error")
+                                                .replace("%0", &error.to_string()),
+                                        );
                                     }
                                 }
                             }
@@ -4697,8 +5861,12 @@ impl eframe::App for LauncherApp {
                                     self.persist();
                                 }
                                 Err(error) => {
-                                    self.status = tr("rust.status.account.microsoft.remove-error")
-                                        .replace("%0", &error.to_string());
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::Authentication,
+                                        tr("rust.status.account.microsoft.remove-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 }
                             }
                         }
@@ -4730,8 +5898,12 @@ impl eframe::App for LauncherApp {
                                     self.persist();
                                 }
                                 Err(error) => {
-                                    self.status = tr("rust.status.account.ely.remove-error")
-                                        .replace("%0", &error.to_string());
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::Authentication,
+                                        tr("rust.status.account.ely.remove-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 }
                             }
                         }
@@ -4763,8 +5935,12 @@ impl eframe::App for LauncherApp {
                                     self.persist();
                                 }
                                 Err(error) => {
-                                    self.status = tr("rust.status.account.ely.remove-error")
-                                        .replace("%0", &error.to_string());
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::Authentication,
+                                        tr("rust.status.account.ely.remove-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 }
                             }
                         }
@@ -4853,10 +6029,18 @@ impl eframe::App for LauncherApp {
                                         self.new_server_address.clear();
                                         self.persist_server_list();
                                     } else {
-                                        self.status = tr("rust.status.servers.duplicate").to_owned();
+                                        self.set_logged_status(
+                                            LogLevel::Warn,
+                                            LogTarget::Servers,
+                                            tr("rust.status.servers.duplicate"),
+                                        );
                                     }
                                 } else {
-                                    self.status = tr("rust.status.servers.invalid-entry").to_owned();
+                                    self.set_logged_status(
+                                        LogLevel::Warn,
+                                        LogTarget::Servers,
+                                        tr("rust.status.servers.invalid-entry"),
+                                    );
                                 }
                             }
                         });
@@ -4896,10 +6080,14 @@ impl eframe::App for LauncherApp {
                 self.persist();
                 if self.settings.logger_mode == "global" {
                     self.show_log_window = true;
-                    self.show_live_game_log = true;
-                } else if self.show_live_game_log {
-                    self.show_log_window = false;
+                    self.show_live_launcher_log = true;
                     self.show_live_game_log = false;
+                } else if self.show_live_game_log || self.show_live_launcher_log {
+                    self.show_log_window = false;
+                    self.show_live_launcher_log = false;
+                    self.show_live_game_log = false;
+                } else {
+                    self.show_live_launcher_log = false;
                 }
             }
             if browse_game_directory {
@@ -4918,7 +6106,11 @@ impl eframe::App for LauncherApp {
                             .into_owned();
                         self.persist();
                     } else {
-                        self.status = tr("settings.client.gamedir.noaccess").to_owned();
+                        self.set_logged_status(
+                            LogLevel::Error,
+                            LogTarget::Settings,
+                            tr("settings.client.gamedir.noaccess"),
+                        );
                     }
                 }
             }
@@ -4940,8 +6132,11 @@ impl eframe::App for LauncherApp {
                             self.persist();
                         }
                         Err(error) => {
-                            self.status =
-                                tr("rust.status.background.load-error").replace("%0", &error);
+                            self.set_logged_status(
+                                LogLevel::Error,
+                                LogTarget::Settings,
+                                tr("rust.status.background.load-error").replace("%0", &error),
+                            );
                         }
                     }
                 }
@@ -4972,13 +6167,18 @@ impl eframe::App for LauncherApp {
                                     let invalidated =
                                         invalidate_game_data_cache(&version_root, &version)
                                             .unwrap_or(0);
-                                    self.status = if invalidated == 0 {
+                                    let message = if invalidated == 0 {
                                         tr("rust.status.versions.removed").replace("%0", &version)
                                     } else {
                                         tr("rust.status.versions.removed-caches")
                                             .replace("%0", &version)
                                             .replace("%1", &invalidated.to_string())
                                     };
+                                    self.set_logged_status(
+                                        LogLevel::Info,
+                                        LogTarget::VersionManager,
+                                        message,
+                                    );
                                     if self.settings.selected_version == version {
                                         self.settings.selected_version = self
                                             .available_versions()
@@ -4989,8 +6189,12 @@ impl eframe::App for LauncherApp {
                                     }
                                 }
                                 Err(error) => {
-                                    self.status = tr("rust.status.versions.remove-error")
-                                        .replace("%0", &error.to_string());
+                                    self.set_logged_status(
+                                        LogLevel::Error,
+                                        LogTarget::VersionManager,
+                                        tr("rust.status.versions.remove-error")
+                                            .replace("%0", &error.to_string()),
+                                    );
                                 }
                             }
                             close_dialog = true;
@@ -5079,13 +6283,21 @@ impl eframe::App for LauncherApp {
                     crash::CrashActionKind::ForceUpdate => {
                         self.settings.force_update = true;
                         self.persist();
-                        self.status = tr("rust.status.crash.force-update").to_owned();
+                        self.set_logged_status(
+                            LogLevel::Info,
+                            LogTarget::Crash,
+                            tr("rust.status.crash.force-update"),
+                        );
                     }
                     crash::CrashActionKind::RecommendedJava => {
                         self.settings.java_mode = "recommended".to_owned();
                         self.settings.java_path.clear();
                         self.persist();
-                        self.status = tr("rust.status.crash.recommended-java").to_owned();
+                        self.set_logged_status(
+                            LogLevel::Info,
+                            LogTarget::Crash,
+                            tr("rust.status.crash.recommended-java"),
+                        );
                     }
                     crash::CrashActionKind::SetJvmArgument(argument) => {
                         let current = split_arguments(&self.settings.jvm_args);
@@ -5097,9 +6309,58 @@ impl eframe::App for LauncherApp {
                             };
                             self.persist();
                         }
-                        self.status = tr("rust.status.crash.jvm-argument").replace("%0", &argument);
+                        self.set_logged_status(
+                            LogLevel::Info,
+                            LogTarget::Crash,
+                            tr("rust.status.crash.jvm-argument").replace("%0", &argument),
+                        );
                     }
                 }
+            }
+        }
+
+        let legacy_font_revert = self
+            .settings
+            .legacy_font_size_revert
+            .filter(|previous| (previous - self.settings.launcher_font_size).abs() > 0.01);
+        if let Some(previous_size) = legacy_font_revert {
+            let mut revert = false;
+            let mut dismiss = false;
+            egui::Area::new(Id::unique("legacy_font_revert"))
+                .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(
+                                        RichText::new(tr("revert.font.approve"))
+                                            .size(previous_size),
+                                    )
+                                    .clicked()
+                                {
+                                    revert = true;
+                                }
+                                if ui
+                                    .small_button(tr("revert.font.close"))
+                                    .on_hover_text(tr("revert.font.close.hint"))
+                                    .clicked()
+                                {
+                                    dismiss = true;
+                                }
+                            });
+                        });
+                });
+            if revert {
+                self.settings.launcher_font_size = previous_size;
+                self.settings.legacy_font_size_revert = None;
+                ctx.set_zoom_factor(previous_size / 12.0);
+                self.persist();
+            } else if dismiss {
+                self.settings.legacy_font_size_revert = None;
+                self.persist();
             }
         }
 
@@ -5122,7 +6383,11 @@ impl eframe::App for LauncherApp {
                                     && ui.small_button(tr("support.button.cancel")).clicked()
                                 {
                                     self.cancel_requested.store(true, Ordering::Release);
-                                    self.status = tr("rust.status.operation.cancelling").to_owned();
+                                    self.set_logged_status(
+                                        LogLevel::Warn,
+                                        LogTarget::Launcher,
+                                        tr("rust.status.operation.cancelling"),
+                                    );
                                 }
                             });
                             if let Some(progress) = self.launch_progress {
@@ -5333,7 +6598,7 @@ fn spawn_catalog_fetch() -> Receiver<Result<MojangVersionManifest, String>> {
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start catalog request: {error}"))
+            .map_err(|error| tr("rust.error.runtime.catalog").replace("%0", &error.to_string()))
             .and_then(|runtime| {
                 runtime
                     .block_on(catalog::fetch_manifest())
@@ -5344,14 +6609,35 @@ fn spawn_catalog_fetch() -> Receiver<Result<MojangVersionManifest, String>> {
     receiver
 }
 
-fn spawn_update_check() -> Receiver<Result<github_update::CheckResult, String>> {
+fn spawn_connectivity_check() -> Receiver<connectivity::Report> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let report = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(connectivity::check()),
+            Err(_) => connectivity::unavailable_report(),
+        };
+        let _ = sender.send(report);
+    });
+    receiver
+}
+
+fn spawn_update_check(
+    include_prereleases: bool,
+) -> Receiver<Result<github_update::CheckResult, String>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start update check: {error}"))
-            .and_then(|runtime| runtime.block_on(github_update::check_for_update()));
+            .map_err(|error| {
+                tr("rust.error.runtime.update-check").replace("%0", &error.to_string())
+            })
+            .and_then(|runtime| {
+                runtime.block_on(github_update::check_for_update(include_prereleases))
+            });
         let _ = sender.send(result);
     });
     receiver
@@ -5363,7 +6649,9 @@ fn spawn_update_install(release: github_update::Release) -> Receiver<Result<(), 
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start update installation: {error}"))
+            .map_err(|error| {
+                tr("rust.error.runtime.update-install").replace("%0", &error.to_string())
+            })
             .and_then(|runtime| runtime.block_on(github_update::download_and_handoff(release)));
         let _ = sender.send(result);
     });
@@ -5376,7 +6664,7 @@ fn spawn_bootstrap_fetch() -> Receiver<Result<bootstrap::Configuration, String>>
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start bootstrap request: {error}"))
+            .map_err(|error| tr("rust.error.runtime.bootstrap").replace("%0", &error.to_string()))
             .and_then(|runtime| runtime.block_on(bootstrap::fetch()));
         let _ = sender.send(result);
     });
@@ -5389,7 +6677,7 @@ fn spawn_diagnostic_upload(report: String) -> Receiver<Result<String, String>> {
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start diagnostic upload: {error}"))
+            .map_err(|error| tr("rust.error.runtime.diagnostics").replace("%0", &error.to_string()))
             .and_then(|runtime| runtime.block_on(support::upload_diagnostic_report(report)));
         let _ = sender.send(result);
     });
@@ -5402,7 +6690,7 @@ fn spawn_notice_fetch(client_id: String) -> Receiver<Result<Vec<notices::Notice>
         let result = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("Could not start notice request: {error}"))
+            .map_err(|error| tr("rust.error.runtime.notices").replace("%0", &error.to_string()))
             .and_then(|runtime| runtime.block_on(notices::fetch(&client_id)));
         let _ = sender.send(result);
     });
@@ -5700,22 +6988,33 @@ fn read_minecraft_server_list(path: &std::path::Path) -> Result<Vec<SavedServer>
     let compressed = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Err(error) => {
+            return Err(tr("rust.error.servers.read")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string()));
+        }
     };
     if compressed.len() as u64 > MAX_COMPRESSED_BYTES {
-        return Err("servers.dat is larger than 8 MiB".to_owned());
+        return Err(tr("rust.error.servers.compressed-large").to_owned());
     }
     let decoder = flate2::read::GzDecoder::new(compressed.as_slice());
     let mut nbt_bytes = Vec::new();
     decoder
         .take(MAX_NBT_BYTES + 1)
         .read_to_end(&mut nbt_bytes)
-        .map_err(|error| format!("Could not decompress {}: {error}", path.display()))?;
+        .map_err(|error| {
+            tr("rust.error.servers.decompress")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })?;
     if nbt_bytes.len() as u64 > MAX_NBT_BYTES {
-        return Err("decompressed servers.dat is larger than 16 MiB".to_owned());
+        return Err(tr("rust.error.servers.decompressed-large").to_owned());
     }
-    let file: MinecraftServerList = fastnbt::from_bytes(&nbt_bytes)
-        .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+    let file: MinecraftServerList = fastnbt::from_bytes(&nbt_bytes).map_err(|error| {
+        tr("rust.error.servers.parse")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     Ok(file
         .servers
         .into_iter()
@@ -5747,34 +7046,44 @@ fn write_minecraft_server_list(
             .collect(),
     };
     let nbt_bytes = fastnbt::to_bytes(&file)
-        .map_err(|error| format!("Could not encode Minecraft server list: {error}"))?;
+        .map_err(|error| tr("rust.error.servers.encode").replace("%0", &error.to_string()))?;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder
         .write_all(&nbt_bytes)
-        .map_err(|error| format!("Could not compress Minecraft server list: {error}"))?;
-    let compressed = encoder
-        .finish()
-        .map_err(|error| format!("Could not finish server list compression: {error}"))?;
+        .map_err(|error| tr("rust.error.servers.compress").replace("%0", &error.to_string()))?;
+    let compressed = encoder.finish().map_err(|error| {
+        tr("rust.error.servers.compress-finish").replace("%0", &error.to_string())
+    })?;
 
     let parent = path
         .parent()
-        .ok_or_else(|| "Minecraft server list path has no parent".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+        .ok_or_else(|| tr("rust.error.servers.parent-missing").to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        tr("rust.error.servers.directory")
+            .replace("%0", &parent.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     let temporary_path = path_with_suffix(path, ".tmp");
     let backup_path = path_with_suffix(path, ".bak");
-    fs::write(&temporary_path, compressed)
-        .map_err(|error| format!("Could not write {}: {error}", temporary_path.display()))?;
+    fs::write(&temporary_path, compressed).map_err(|error| {
+        tr("rust.error.servers.write-temp")
+            .replace("%0", &temporary_path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
 
     let had_original = path.is_file();
     if had_original {
         if let Err(error) = fs::copy(path, &backup_path) {
             let _ = fs::remove_file(&temporary_path);
-            return Err(format!("Could not back up {}: {error}", path.display()));
+            return Err(tr("rust.error.servers.backup")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string()));
         }
         if let Err(error) = fs::remove_file(path) {
             let _ = fs::remove_file(&temporary_path);
-            return Err(format!("Could not replace {}: {error}", path.display()));
+            return Err(tr("rust.error.servers.replace")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string()));
         }
     }
     if let Err(error) = fs::rename(&temporary_path, path) {
@@ -5782,7 +7091,9 @@ fn write_minecraft_server_list(
             let _ = fs::copy(&backup_path, path);
         }
         let _ = fs::remove_file(&temporary_path);
-        return Err(format!("Could not install {}: {error}", path.display()));
+        return Err(tr("rust.error.servers.install")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string()));
     }
     Ok(())
 }
@@ -5917,13 +7228,16 @@ async fn authenticate_microsoft_account(
     account: &MicrosoftAccountProfile,
 ) -> Result<Authenticator, String> {
     let refresh_token = vault::load_refresh_token(&account.storage_key())
-        .map_err(|error| format!("Could not read Microsoft credentials: {error}"))?
-        .ok_or_else(|| {
-            "Microsoft credentials are missing. Sign in to this account again.".to_owned()
-        })?;
+        .map_err(|error| {
+            tr("rust.status.account.microsoft.credentials-read").replace("%0", &error.to_string())
+        })?
+        .ok_or_else(|| tr("rust.status.account.microsoft.credentials-missing").to_owned())?;
     let authenticated = auth::refresh_sign_in(&refresh_token).await?;
-    vault::store_refresh_token(&account.storage_key(), &authenticated.refresh_token)
-        .map_err(|error| format!("Could not save the refreshed Microsoft credentials: {error}"))?;
+    vault::store_refresh_token(&account.storage_key(), &authenticated.refresh_token).map_err(
+        |error| {
+            tr("rust.status.account.microsoft.credentials-save").replace("%0", &error.to_string())
+        },
+    )?;
     Ok(authenticated.authenticator)
 }
 
@@ -5931,17 +7245,20 @@ async fn authenticate_ely_legacy_account(
     account: &ElyLegacyAccountProfile,
 ) -> Result<Authenticator, String> {
     let stored = vault::load_refresh_token(&account.storage_key())
-        .map_err(|error| format!("Could not read Ely.by credentials: {error}"))?
-        .ok_or_else(|| {
-            "Ely.by credentials are missing. Sign in to this account again.".to_owned()
-        })?;
-    let credentials: ely_legacy::Credentials = serde_json::from_str(&stored)
-        .map_err(|error| format!("Saved Ely.by credentials are invalid: {error}"))?;
+        .map_err(|error| {
+            tr("rust.status.account.ely.credentials-read").replace("%0", &error.to_string())
+        })?
+        .ok_or_else(|| tr("rust.status.account.ely.credentials-missing").to_owned())?;
+    let credentials: ely_legacy::Credentials = serde_json::from_str(&stored).map_err(|error| {
+        tr("rust.status.account.ely.credentials-invalid").replace("%0", &error.to_string())
+    })?;
     let (profile, refreshed) = ely_legacy::refresh(&account.username, &credentials).await?;
-    let serialized = serde_json::to_string(&refreshed)
-        .map_err(|error| format!("Could not encode refreshed Ely.by credentials: {error}"))?;
-    vault::store_refresh_token(&account.storage_key(), &serialized)
-        .map_err(|error| format!("Could not save refreshed Ely.by credentials: {error}"))?;
+    let serialized = serde_json::to_string(&refreshed).map_err(|error| {
+        tr("rust.status.account.ely.credentials-encode").replace("%0", &error.to_string())
+    })?;
+    vault::store_refresh_token(&account.storage_key(), &serialized).map_err(|error| {
+        tr("rust.status.account.ely.credentials-save").replace("%0", &error.to_string())
+    })?;
 
     // LegacyLauncher's ElyLegacyUser exposes Ely's display name as its auth XUID and
     // reports auth type "msa". The core derives that type from xbox_account presence.
@@ -5960,17 +7277,20 @@ async fn authenticate_ely_legacy_account(
 
 async fn authenticate_ely_account(account: &ElyAccountProfile) -> Result<Authenticator, String> {
     let stored = vault::load_refresh_token(&account.storage_key())
-        .map_err(|error| format!("Could not read Ely.by credentials: {error}"))?
-        .ok_or_else(|| {
-            "Ely.by credentials are missing. Sign in to this account again.".to_owned()
-        })?;
-    let credentials: ely::Credentials = serde_json::from_str(&stored)
-        .map_err(|error| format!("Saved Ely.by credentials are invalid: {error}"))?;
+        .map_err(|error| {
+            tr("rust.status.account.ely.credentials-read").replace("%0", &error.to_string())
+        })?
+        .ok_or_else(|| tr("rust.status.account.ely.credentials-missing").to_owned())?;
+    let credentials: ely::Credentials = serde_json::from_str(&stored).map_err(|error| {
+        tr("rust.status.account.ely.credentials-invalid").replace("%0", &error.to_string())
+    })?;
     let (profile, refreshed) = ely::refresh(&credentials).await?;
-    let serialized = serde_json::to_string(&refreshed)
-        .map_err(|error| format!("Could not encode refreshed Ely.by credentials: {error}"))?;
-    vault::store_refresh_token(&account.storage_key(), &serialized)
-        .map_err(|error| format!("Could not save refreshed Ely.by credentials: {error}"))?;
+    let serialized = serde_json::to_string(&refreshed).map_err(|error| {
+        tr("rust.status.account.ely.credentials-encode").replace("%0", &error.to_string())
+    })?;
+    vault::store_refresh_token(&account.storage_key(), &serialized).map_err(|error| {
+        tr("rust.status.account.ely.credentials-save").replace("%0", &error.to_string())
+    })?;
     Ok(ely::authenticator(profile, refreshed))
 }
 
@@ -5986,26 +7306,37 @@ fn launch_event_message(event: LaunchEvent) -> Option<String> {
             } else {
                 downloaded.saturating_mul(100) / total
             };
-            Some(format!("Downloading {kind}: {percent}%"))
+            Some(
+                tr("rust.status.download.progress")
+                    .replace("%0", &kind)
+                    .replace("%1", &percent.to_string()),
+            )
         }
         LaunchEvent::Check {
             current,
             total,
             kind,
-        } => Some(format!("Checking {kind}: {current}/{total}")),
-        LaunchEvent::GameDownloadFinished => Some("Game files ready.".to_owned()),
-        LaunchEvent::Extract(name) => Some(format!("Extracting {name}…")),
+        } => Some(
+            tr("rust.status.download.check")
+                .replace("%0", &kind)
+                .replace("%1", &current.to_string())
+                .replace("%2", &total.to_string()),
+        ),
+        LaunchEvent::GameDownloadFinished => Some(tr("rust.status.download.ready").to_owned()),
+        LaunchEvent::Extract(name) => Some(tr("rust.status.download.extract").replace("%0", &name)),
         LaunchEvent::Patch(message) => Some(message),
-        LaunchEvent::Close(code) => Some(format!("Minecraft closed (exit code {code}).")),
-        LaunchEvent::Error(message) => Some(format!("Warning: {message}")),
-        LaunchEvent::Speed(bytes_per_second) => Some(format!(
-            "Download speed: {}",
-            format_data_rate(bytes_per_second)
-        )),
-        LaunchEvent::Estimated(seconds) => Some(format!(
-            "Estimated time remaining: {}",
-            format_duration(seconds)
-        )),
+        LaunchEvent::Close(code) => {
+            Some(tr("rust.status.download.game-closed").replace("%0", &code.to_string()))
+        }
+        LaunchEvent::Error(message) => {
+            Some(tr("rust.status.download.warning").replace("%0", &message))
+        }
+        LaunchEvent::Speed(bytes_per_second) => Some(
+            tr("rust.status.download.speed").replace("%0", &format_data_rate(bytes_per_second)),
+        ),
+        LaunchEvent::Estimated(seconds) => {
+            Some(tr("rust.status.download.eta").replace("%0", &format_duration(seconds)))
+        }
         LaunchEvent::Command(_) => None,
         LaunchEvent::Data(_) => None,
     }
@@ -6013,22 +7344,65 @@ fn launch_event_message(event: LaunchEvent) -> Option<String> {
 
 fn launch_event_message_or_record(
     buffer: &Arc<Mutex<VecDeque<String>>>,
+    launcher_log: &Arc<Mutex<VecDeque<LogRecord>>>,
     event: LaunchEvent,
     show_full_game_command: bool,
-) -> Option<String> {
+) -> Option<LaunchUiEvent> {
     match event {
-        LaunchEvent::GameDownloadFinished => Some("__GAME_STARTED__".to_owned()),
         LaunchEvent::Command(line) if show_full_game_command => {
+            record_launcher_log_event(
+                launcher_log,
+                LogLevel::Debug,
+                LogTarget::MinecraftCommand,
+                &line,
+            );
             record_game_log_line(buffer, line);
             None
         }
         LaunchEvent::Command(_) => None,
         LaunchEvent::Data(line) => {
+            record_launcher_log_event(launcher_log, LogLevel::Trace, LogTarget::Minecraft, &line);
             record_game_log_line(buffer, line);
             None
         }
-        event => launch_event_message(event),
+        event => launch_event_ui_message(event).map(LaunchUiEvent::Message),
     }
+}
+
+fn send_launch_message(
+    sender: &mpsc::Sender<LaunchUiEvent>,
+    level: LogLevel,
+    target: LogTarget,
+    message: impl Into<String>,
+) {
+    let _ = sender.send(LaunchUiEvent::Message(LaunchUiMessage {
+        message: message.into(),
+        level,
+        target,
+    }));
+}
+
+fn launch_event_ui_message(event: LaunchEvent) -> Option<LaunchUiMessage> {
+    let (level, target) = match &event {
+        LaunchEvent::Progress { .. }
+        | LaunchEvent::Check { .. }
+        | LaunchEvent::Speed(_)
+        | LaunchEvent::Estimated(_) => (LogLevel::Debug, LogTarget::MinecraftDownload),
+        LaunchEvent::GameDownloadFinished | LaunchEvent::Extract(_) => {
+            (LogLevel::Info, LogTarget::MinecraftDownload)
+        }
+        LaunchEvent::Patch(_) => (LogLevel::Info, LogTarget::Mods),
+        LaunchEvent::Close(code) if *code == 0 => (LogLevel::Info, LogTarget::Minecraft),
+        LaunchEvent::Close(_) => (LogLevel::Error, LogTarget::Minecraft),
+        LaunchEvent::Error(_) => (LogLevel::Error, LogTarget::MinecraftDownload),
+        LaunchEvent::Command(_) | LaunchEvent::Data(_) => return None,
+    };
+    let message = launch_event_message(event)?;
+    Some(LaunchUiMessage {
+        message,
+        level,
+        target,
+    })
 }
 
 fn launch_action_label_key(action: &str) -> &'static str {
@@ -6039,14 +7413,53 @@ fn launch_action_label_key(action: &str) -> &'static str {
     }
 }
 
+fn localized_html_to_plain_text(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut inside_tag = false;
+    let mut tag = String::new();
+    for character in value.chars() {
+        if inside_tag {
+            if character == '>' {
+                if tag.trim_start_matches('/').starts_with("br") {
+                    text.push('\n');
+                }
+                inside_tag = false;
+                tag.clear();
+            } else {
+                tag.push(character);
+            }
+        } else if character == '<' {
+            inside_tag = true;
+        } else {
+            text.push(character);
+        }
+    }
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
 fn settings_page_title(title: &str) -> &'static str {
     tr(match title {
+        "About us" => "settings.tab.about",
         "Launcher" | "Launcher & game preferences" => "rust.settings.page.preferences",
         "Manage versions" => "rust.settings.page.versions",
         "Manage accounts" => "rust.settings.page.accounts",
         "Manage servers" => "rust.settings.page.servers",
         _ => "rust.settings.page.preferences",
     })
+}
+
+fn look_and_feel_label_key(state: &str) -> &'static str {
+    match state {
+        "off" => "settings.laf.state.off",
+        "system" => "settings.laf.state.system",
+        "dark" => "settings.laf.state.dark",
+        "light" => "settings.laf.state.light",
+        _ => "settings.laf.state.auto",
+    }
 }
 
 fn login_form_anchor(direction: &str) -> (Align2, Vec2) {
@@ -6129,6 +7542,118 @@ fn record_game_log_line(buffer: &Arc<Mutex<VecDeque<String>>>, line: String) {
     }
 }
 
+fn record_launcher_log_line(buffer: &Arc<Mutex<VecDeque<LogRecord>>>, message: &str) {
+    record_launcher_log_event(buffer, LogLevel::Info, LogTarget::Launcher, message);
+}
+
+fn record_launcher_log_event(
+    buffer: &Arc<Mutex<VecDeque<LogRecord>>>,
+    level: LogLevel,
+    target: LogTarget,
+    message: &str,
+) {
+    const BUFFER_CAPACITY: usize = 1024 * 1024;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs() % 86_400;
+    let timestamp = format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60,
+        now.subsec_millis()
+    );
+    let redacted = redact_sensitive_log_values(message);
+    let mut records_to_write = Vec::new();
+    for message_line in redacted.lines().take(256) {
+        let mut record = LogRecord {
+            timestamp: timestamp.clone(),
+            level,
+            target,
+            message: message_line.to_owned(),
+        };
+        if record.rendered_len() > 32 * 1024 {
+            let fixed_length = record.rendered_len() - record.message.len();
+            record.message = truncate_utf8_to_bytes(&record.message, 32 * 1024 - fixed_length);
+        }
+        let line = record.render();
+        if let Ok(mut lines) = buffer.lock() {
+            let mut current_size = lines.iter().map(LogRecord::rendered_len).sum::<usize>();
+            while current_size + line.len() > BUFFER_CAPACITY {
+                let Some(removed) = lines.pop_front() else {
+                    break;
+                };
+                current_size = current_size.saturating_sub(removed.rendered_len());
+            }
+            lines.push_back(record.clone());
+        }
+        records_to_write.push(format!("{line}\n"));
+    }
+    for line in records_to_write {
+        append_launcher_log_file(line.as_bytes());
+    }
+}
+
+fn truncate_utf8_to_bytes(value: &str, limit: usize) -> String {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn redact_sensitive_log_values(message: &str) -> String {
+    use std::sync::OnceLock;
+
+    static KEY_VALUE: OnceLock<regex::Regex> = OnceLock::new();
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
+    let key_value = KEY_VALUE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)((?:access|refresh|id|client)[_-]?(?:token|secret)|authorization|password|secret|token)(["']?\s*[:=]\s*["']?)[^&\s,;"']+"#,
+        )
+        .expect("static sensitive-value expression is valid")
+    });
+    let bearer = BEARER.get_or_init(|| {
+        regex::Regex::new(r"(?i)(bearer\s+)[A-Za-z0-9._~+/-]+=*")
+            .expect("static bearer-token expression is valid")
+    });
+    let without_bearer = bearer.replace_all(message, "$1[REDACTED]");
+    key_value
+        .replace_all(&without_bearer, "$1$2[REDACTED]")
+        .into_owned()
+}
+
+fn append_launcher_log_file(line: &[u8]) {
+    const FILE_CAPACITY: u64 = 12 * 1024 * 1024;
+    let path = launcher_log_path();
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let current_size = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current_size.saturating_add(line.len() as u64) > FILE_CAPACITY {
+        for index in (1..10).rev() {
+            let source = path.with_file_name(format!("launcher.log.{index}"));
+            let target = path.with_file_name(format!("launcher.log.{}", index + 1));
+            if source.exists() {
+                let _ = fs::remove_file(&target);
+                let _ = fs::rename(source, target);
+            }
+        }
+        let first_backup = path.with_file_name("launcher.log.1");
+        let _ = fs::remove_file(&first_backup);
+        let _ = fs::rename(&path, first_backup);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line);
+    }
+}
+
 fn collect_crash_report(
     game_dir: &std::path::Path,
     game_log: &Arc<Mutex<VecDeque<String>>>,
@@ -6156,16 +7681,16 @@ fn collect_crash_report(
         suggestions = diagnose_crash_fallback(&log)
             .into_iter()
             .map(|body| crash::CrashSuggestion {
-                title: "Possible fix".to_owned(),
+                title: tr("rust.ui.crash.fallback-title").to_owned(),
                 body,
                 actions: Vec::new(),
             })
             .collect();
     }
     let summary = if let Some(first) = suggestions.first() {
-        format!("Minecraft exited with an error. {}", first.title)
+        tr("rust.crash.summary-with-suggestion").replace("%0", &first.title)
     } else {
-        "Minecraft exited with an error. Review the captured log below.".to_owned()
+        tr("rust.crash.summary-no-suggestion").to_owned()
     };
     Some(CrashReport {
         path: report_path,
@@ -6249,6 +7774,18 @@ fn list_recent_logs(game_dir: &std::path::Path) -> Vec<(PathBuf, SystemTime)> {
             Some((path, entry.metadata().ok()?.modified().ok()?))
         })
         .collect::<Vec<_>>();
+    let launcher_log = launcher_log_path();
+    for path in std::iter::once(launcher_log.clone())
+        .chain((1..=10).map(|index| launcher_log.with_file_name(format!("launcher.log.{index}"))))
+    {
+        if let Ok(metadata) = fs::metadata(&path) {
+            if metadata.is_file() {
+                if let Ok(modified) = metadata.modified() {
+                    files.push((path, modified));
+                }
+            }
+        }
+    }
     files.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     files.truncate(100);
     files
@@ -6269,34 +7806,24 @@ fn diagnose_crash_fallback(log: &str) -> Vec<String> {
     if lower.contains("outofmemoryerror")
         || lower.contains("could not reserve enough space for object heap")
     {
-        suggestions.push(
-            "The game ran out of memory. Lower other applications' usage or adjust the memory allocation in settings.".to_owned(),
-        );
+        suggestions.push(tr("rust.crash.fallback.out-of-memory").to_owned());
     }
     if lower.contains("unsupportedclassversionerror")
         || lower.contains("unsupported major.minor version")
     {
-        suggestions.push(
-            "The selected Java runtime is incompatible with this Minecraft version. Use managed Java or select the required Java release.".to_owned(),
-        );
+        suggestions.push(tr("rust.crash.fallback.java-incompatible").to_owned());
     }
     if lower.contains("could not find or load main class")
         || lower.contains("noclassdeffounderror")
         || lower.contains("classnotfoundexception")
     {
-        suggestions.push(
-            "A game or loader file may be missing. Repair the selected version from Version Manager.".to_owned(),
-        );
+        suggestions.push(tr("rust.crash.fallback.game-file-missing").to_owned());
     }
     if lower.contains("glfw error") || lower.contains("failed to create window") {
-        suggestions.push(
-            "Minecraft could not create its graphics window. Update the graphics driver and try a smaller window size.".to_owned(),
-        );
+        suggestions.push(tr("rust.crash.fallback.graphics-window").to_owned());
     }
     if lower.contains("duplicate mods") || lower.contains("duplicate mod") {
-        suggestions.push(
-            "The mod folder contains duplicate or conflicting mods. Remove one copy and launch again.".to_owned(),
-        );
+        suggestions.push(tr("rust.crash.fallback.mod-conflict").to_owned());
     }
     suggestions
 }
@@ -6331,22 +7858,36 @@ fn load_texture(ctx: &Context, name: &str, bytes: &[u8], recolor: bool) -> Textu
 }
 
 fn load_texture_from_path(ctx: &Context, name: &str, path: &Path) -> Result<TextureHandle, String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        tr("rust.status.background.path-error")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     if metadata.len() > 64 * 1024 * 1024 {
-        return Err("image file is larger than 64 MB".to_owned());
+        return Err(tr("rust.status.background.file-large").to_owned());
     }
     let mut reader = image::ImageReader::open(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?
+        .map_err(|error| {
+            tr("rust.status.background.path-error")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })?
         .with_guessed_format()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+        .map_err(|error| {
+            tr("rust.status.background.path-error")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let decoded = reader.decode().map_err(|error| {
+        tr("rust.status.background.decode-error")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     texture_from_decoded_image(ctx, name, decoded, false)
 }
 
@@ -6356,8 +7897,9 @@ fn load_texture_from_bytes(
     bytes: &[u8],
     recolor: bool,
 ) -> Result<TextureHandle, String> {
-    let decoded = image::load_from_memory(bytes)
-        .map_err(|error| format!("could not decode image: {error}"))?;
+    let decoded = image::load_from_memory(bytes).map_err(|error| {
+        tr("rust.status.background.decode-bytes-error").replace("%0", &error.to_string())
+    })?;
     texture_from_decoded_image(ctx, name, decoded, recolor)
 }
 
@@ -6368,7 +7910,7 @@ fn texture_from_decoded_image(
     recolor: bool,
 ) -> Result<TextureHandle, String> {
     if u64::from(decoded.width()) * u64::from(decoded.height()) > 32_000_000 {
-        return Err("image dimensions are larger than 32 megapixels".to_owned());
+        return Err(tr("rust.status.background.dimensions-large").to_owned());
     }
     let mut rgba = decoded.to_rgba8();
     if recolor {
@@ -6450,6 +7992,14 @@ fn settings_path() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     root.join("LegacyLauncher-Rust").join("config.json")
+}
+
+fn launcher_log_path() -> PathBuf {
+    settings_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs")
+        .join("launcher.log")
 }
 
 fn default_legacy_config_path() -> PathBuf {
@@ -6562,11 +8112,21 @@ fn load_settings() -> SavedSettings {
     if !matches!(settings.logger_mode.as_str(), "global" | "none") {
         settings.logger_mode = "none".to_owned();
     }
+    if !matches!(
+        settings.look_and_feel.as_str(),
+        "off" | "system" | "auto" | "dark" | "light"
+    ) {
+        settings.look_and_feel = "auto".to_owned();
+    }
     settings.launcher_font_size = if settings.launcher_font_size.is_finite() {
         settings.launcher_font_size.clamp(12.0, 18.0)
     } else {
         12.0
     };
+    settings.legacy_font_size_revert = settings
+        .legacy_font_size_revert
+        .filter(|size| size.is_finite())
+        .map(|size| size.clamp(12.0, 18.0));
     settings.log_window_width = settings.log_window_width.clamp(400, 4096);
     settings.log_window_height = settings.log_window_height.clamp(300, 2160);
     settings.log_window_x = settings.log_window_x.clamp(-16_384, 16_384);
@@ -6636,10 +8196,14 @@ fn import_legacy_settings(
     path: &std::path::Path,
     settings: &mut SavedSettings,
 ) -> Result<LegacySettingsImportSummary, String> {
-    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let bytes = fs::read(path).map_err(|error| {
+        tr("rust.error.import.settings-read")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     let properties = parse_java_properties(&String::from_utf8_lossy(&bytes));
     if properties.is_empty() {
-        return Err("the properties file is empty or has no readable entries".to_owned());
+        return Err(tr("rust.error.import.settings-empty").to_owned());
     }
     let mut summary = LegacySettingsImportSummary::default();
     let mut apply = |key: &str, result: Option<()>| {
@@ -6802,6 +8366,21 @@ fn import_legacy_settings(
         }
         apply("gui.font", font_size.map(|_| ()))
     }
+    if let Some(value) = properties.get("gui.font.old") {
+        let previous_size = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|size| size.is_finite());
+        if let Some(previous_size) = previous_size {
+            settings.legacy_font_size_revert = Some(if (12.0..=18.0).contains(&previous_size) {
+                previous_size
+            } else {
+                18.0
+            });
+        }
+        apply("gui.font.old", previous_size.map(|_| ()))
+    }
     if let Some(value) = properties.get("gui.background") {
         let path = PathBuf::from(value.trim());
         let valid = path.is_file()
@@ -6811,6 +8390,20 @@ fn import_legacy_settings(
             settings.background_path = path.to_string_lossy().into_owned();
         }
         apply("gui.background", valid.then_some(()));
+    }
+    if let Some(value) = properties.get("gui.laf.v1.state") {
+        let state = value.trim().to_ascii_lowercase();
+        let valid = matches!(state.as_str(), "off" | "system" | "auto" | "dark" | "light");
+        if valid {
+            settings.look_and_feel = state;
+        }
+        apply("gui.laf.v1.state", valid.then_some(()));
+    } else if let Some(value) = properties.get("gui.systemlookandfeel") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.look_and_feel = if enabled { "system" } else { "off" }.to_owned();
+        }
+        apply("gui.systemlookandfeel", enabled.map(|_| ()))
     }
     if let Some(value) = properties.get("gui.direction.loginform") {
         let direction = value.trim().to_ascii_lowercase();
@@ -7044,6 +8637,13 @@ fn import_legacy_settings(
             }
             apply(key, enabled.map(|_| ()));
         }
+    }
+    if let Some(value) = properties.get("bootstrap.switchToBeta") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.beta_updates = enabled;
+        }
+        apply("bootstrap.switchToBeta", enabled.map(|_| ()));
     }
     if let Some(value) = properties.get("notice.promoted") {
         let enabled = parse_legacy_bool(value);
@@ -7512,14 +9112,18 @@ fn import_legacy_accounts(
     path: &std::path::Path,
     settings: &mut SavedSettings,
 ) -> Result<LegacyImportSummary, String> {
-    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let bytes = fs::read(path).map_err(|error| {
+        tr("rust.error.import.accounts-read")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })?;
     let root = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .map_err(|error| format!("profile file is not valid JSON: {error}"))?;
+        .map_err(|error| tr("rust.error.import.accounts-json").replace("%0", &error.to_string()))?;
     let user_set = root.get("userSet").unwrap_or(&root);
     let users = user_set
         .get("list")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "profile file does not contain a userSet.list account list".to_owned())?;
+        .ok_or_else(|| tr("rust.error.import.accounts-list-missing").to_owned())?;
     let selected = user_set.get("selected").and_then(|value| {
         Some((
             value.get("type")?.as_str()?.to_ascii_lowercase(),
@@ -7658,7 +9262,9 @@ fn import_legacy_accounts(
                     xuid: String::new(),
                 };
                 vault::store_refresh_token(&profile.storage_key(), refresh_token).map_err(
-                    |error| format!("could not protect an imported Microsoft token: {error}"),
+                    |error| {
+                        tr("rust.error.import.microsoft-token").replace("%0", &error.to_string())
+                    },
                 )?;
                 let exists = settings
                     .microsoft_accounts
@@ -7740,10 +9346,10 @@ fn import_legacy_accounts(
                     expiry_time,
                 };
                 let serialized = serde_json::to_string(&credentials).map_err(|error| {
-                    format!("could not encode imported Ely.by credentials: {error}")
+                    tr("rust.error.import.ely-encode").replace("%0", &error.to_string())
                 })?;
                 vault::store_refresh_token(&account.storage_key(), &serialized).map_err(
-                    |error| format!("could not protect imported Ely.by credentials: {error}"),
+                    |error| tr("rust.error.import.ely-protect").replace("%0", &error.to_string()),
                 )?;
                 let exists = settings
                     .ely_accounts
@@ -7818,10 +9424,10 @@ fn import_legacy_accounts(
                     client_token: client_token.to_owned(),
                 };
                 let serialized = serde_json::to_string(&credentials).map_err(|error| {
-                    format!("could not encode imported Ely.by credentials: {error}")
+                    tr("rust.error.import.ely-encode").replace("%0", &error.to_string())
                 })?;
                 vault::store_refresh_token(&profile.storage_key(), &serialized).map_err(
-                    |error| format!("could not protect imported Ely.by credentials: {error}"),
+                    |error| tr("rust.error.import.ely-protect").replace("%0", &error.to_string()),
                 )?;
                 let exists = settings
                     .ely_legacy_accounts
@@ -8051,12 +9657,12 @@ fn detect_java() -> Result<(PathBuf, String), String> {
         let version = version_output
             .lines()
             .find(|line| !line.trim().is_empty())
-            .unwrap_or("Java runtime")
+            .unwrap_or(tr("rust.status.java.runtime"))
             .trim()
             .to_owned();
         return Ok((candidate, version));
     }
-    Err("No usable Java executable was found. Leave this blank to use managed Java.".to_owned())
+    Err(tr("rust.status.java.no-usable").to_owned())
 }
 
 async fn verify_java_compatibility(
@@ -8068,7 +9674,9 @@ async fn verify_java_compatibility(
     let path = java_path.to_owned();
     let (major, version_text) = tokio::task::spawn_blocking(move || inspect_java(&path))
         .await
-        .map_err(|error| format!("Java inspection failed: {error}"))??;
+        .map_err(|error| {
+            tr("rust.status.java.inspection-error").replace("%0", &error.to_string())
+        })??;
     let required_major = local_required_java_major(game_dir, version_id);
     let required_major = match required_major {
         Some(required) => Some(required),
@@ -8082,15 +9690,19 @@ async fn verify_java_compatibility(
     };
     if let Some(required) = required_major {
         if major < required {
-            return Err(format!(
-                "Java {major} is too old for Minecraft {version_id}; this version requires Java {required}. Switch Java to Recommended or select a newer runtime."
-            ));
+            return Err(tr("rust.status.java.too-old")
+                .replace("%0", &major.to_string())
+                .replace("%1", version_id)
+                .replace("%2", &required.to_string()));
         }
-        Ok(format!(
-            "Java {major} is compatible with Minecraft {version_id} ({version_text})."
-        ))
+        Ok(tr("rust.status.java.compatible")
+            .replace("%0", &major.to_string())
+            .replace("%1", version_id)
+            .replace("%2", &version_text))
     } else {
-        Ok(format!("Using Java {major} ({version_text})."))
+        Ok(tr("rust.status.java.using")
+            .replace("%0", &major.to_string())
+            .replace("%1", &version_text))
     }
 }
 
@@ -8126,10 +9738,9 @@ fn local_required_java_major(game_dir: &std::path::Path, version_id: &str) -> Op
 
 fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
     if !path.is_file() {
-        return Err(format!(
-            "Java executable does not exist: {}",
-            path.display()
-        ));
+        return Err(
+            tr("rust.status.java.executable-missing").replace("%0", &path.display().to_string())
+        );
     }
     let probe_path = if path
         .file_name()
@@ -8147,12 +9758,15 @@ fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
     let output = Command::new(&probe_path)
         .arg("-version")
         .output()
-        .map_err(|error| format!("Could not run Java at {}: {error}", path.display()))?;
+        .map_err(|error| {
+            tr("rust.status.java.executable-run")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })?;
     if !output.status.success() {
-        return Err(format!(
-            "Java at {} returned an error for -version.",
-            path.display()
-        ));
+        return Err(
+            tr("rust.status.java.version-command-error").replace("%0", &path.display().to_string())
+        );
     }
     let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -8167,7 +9781,7 @@ fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
                     .is_some_and(|character| character.is_ascii_digit())
             })
         })
-        .ok_or_else(|| "Java returned a version string that could not be read.".to_owned())?;
+        .ok_or_else(|| tr("rust.status.java.version-unreadable").to_owned())?;
     let major_text = version
         .strip_prefix("1.")
         .unwrap_or(version)
@@ -8176,7 +9790,7 @@ fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
         .unwrap_or_default();
     let major = major_text
         .parse::<u32>()
-        .map_err(|_| format!("Could not read the Java major version from {version}."))?;
+        .map_err(|_| tr("rust.status.java.major-unreadable").replace("%0", version))?;
     Ok((major, version.to_owned()))
 }
 
@@ -8197,9 +9811,9 @@ fn apply_gpu_preference(java_path: &str, preference: &str) -> Result<(), String>
         "discrete" => "GpuPreference=2;",
         _ => return Ok(()),
     };
-    let java_path = PathBuf::from(java_path)
-        .canonicalize()
-        .map_err(|error| format!("Java executable path is unavailable: {error}"))?;
+    let java_path = PathBuf::from(java_path).canonicalize().map_err(|error| {
+        tr("rust.status.java.path-unavailable").replace("%0", &error.to_string())
+    })?;
     let current_version = Command::new("reg.exe")
         .args([
             "query",
@@ -8208,17 +9822,19 @@ fn apply_gpu_preference(java_path: &str, preference: &str) -> Result<(), String>
             "CurrentBuildNumber",
         ])
         .output()
-        .map_err(|error| format!("could not read Windows build number: {error}"))?;
+        .map_err(|error| {
+            tr("rust.status.game.gpu-windows-build-read").replace("%0", &error.to_string())
+        })?;
     if !current_version.status.success() {
-        return Err("could not read Windows build number".to_owned());
+        return Err(tr("rust.status.game.gpu-windows-build-read-failed").to_owned());
     }
     let build = String::from_utf8_lossy(&current_version.stdout)
         .split_whitespace()
         .filter_map(|field| field.parse::<u32>().ok())
         .next_back()
-        .ok_or_else(|| "could not parse Windows build number".to_owned())?;
+        .ok_or_else(|| tr("rust.status.game.gpu-windows-build-parse").to_owned())?;
     if build < 20_190 {
-        return Err("per-app GPU preference requires Windows build 20190 or newer".to_owned());
+        return Err(tr("rust.status.game.gpu-windows-build-old").to_owned());
     }
     let java_path = java_path.to_string_lossy().into_owned();
     let output = Command::new("reg.exe")
@@ -8234,7 +9850,9 @@ fn apply_gpu_preference(java_path: &str, preference: &str) -> Result<(), String>
             "/f",
         ])
         .output()
-        .map_err(|error| format!("could not update the per-app GPU preference: {error}"))?;
+        .map_err(|error| {
+            tr("rust.status.game.gpu-registry-update").replace("%0", &error.to_string())
+        })?;
     if output.status.success() {
         Ok(())
     } else {
@@ -8247,7 +9865,7 @@ fn apply_gpu_preference(_java_path: &str, preference: &str) -> Result<(), String
     if preference == "system" {
         Ok(())
     } else {
-        Err("the per-app GPU preference is supported on Windows only".to_owned())
+        Err(tr("rust.status.game.gpu-windows-only").to_owned())
     }
 }
 
@@ -8262,27 +9880,27 @@ fn open_crash_folder(game_directory: &std::path::Path, folder: &str, status: &mu
             )
         })
     {
-        *status = "This crash action points outside the Minecraft folder.".to_owned();
+        *status = tr("rust.status.crash.folder-outside-game").to_owned();
         return;
     }
     let base = match game_directory.canonicalize() {
         Ok(base) => base,
         Err(error) => {
-            *status = format!("Could not locate the Minecraft folder: {error}");
+            *status = tr("rust.status.crash.game-folder-error").replace("%0", &error.to_string());
             return;
         }
     };
     let target = base.join(relative_path);
     if relative_path == std::path::Path::new("mods") && !target.exists() {
         if let Err(error) = fs::create_dir_all(&target) {
-            *status = format!("Could not create the Mods folder: {error}");
+            *status = tr("rust.status.crash.mods-create-error").replace("%0", &error.to_string());
             return;
         }
     }
     let target = match target.canonicalize() {
         Ok(target) if target.starts_with(&base) => target,
         _ => {
-            *status = "The folder suggested by this crash fix does not exist.".to_owned();
+            *status = tr("rust.status.crash.folder-missing").to_owned();
             return;
         }
     };

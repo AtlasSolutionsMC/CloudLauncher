@@ -56,7 +56,10 @@ pub async fn sign_in(cancel_requested: Arc<AtomicBool>) -> Result<(Profile, Cred
     let callback =
         tokio::task::spawn_blocking(move || request_authorization_code(cancel_requested))
             .await
-            .map_err(|error| format!("Ely.by sign-in callback failed: {error}"))??;
+            .map_err(|error| {
+                crate::tr("rust.status.account.ely.oauth.callback-error")
+                    .replace("%0", &error.to_string())
+            })??;
     let client = http_client()?;
     let response = client
         .post(TOKEN_ENDPOINT)
@@ -70,8 +73,15 @@ pub async fn sign_in(cancel_requested: Arc<AtomicBool>) -> Result<(Profile, Cred
         ])
         .send()
         .await
-        .map_err(|error| format!("Could not exchange Ely.by sign-in code: {error}"))?;
-    let token = decode_token(response, "Ely.by sign-in").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.exchange-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let token = decode_token(
+        response,
+        crate::tr("rust.status.account.ely.oauth.operation.sign-in"),
+    )
+    .await?;
     let credentials = build_credentials(token, None)?;
     let profile = load_profile(&client, &credentials.access_token).await?;
     Ok((profile, credentials))
@@ -99,8 +109,15 @@ pub async fn refresh(credentials: &Credentials) -> Result<(Profile, Credentials)
         ])
         .send()
         .await
-        .map_err(|error| format!("Could not refresh Ely.by sign-in: {error}"))?;
-    let token = decode_token(response, "Ely.by token refresh").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.refresh-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let token = decode_token(
+        response,
+        crate::tr("rust.status.account.ely.oauth.operation.token-refresh"),
+    )
+    .await?;
     let refreshed = build_credentials(token, credentials.refresh_token.clone())?;
     let profile = load_profile(&client, &refreshed.access_token).await?;
     Ok((profile, refreshed))
@@ -110,10 +127,7 @@ fn load_client_secret() -> Result<String, String> {
     std::env::var("LEGACYLAUNCHER_ELY_CLIENT_SECRET")
         .ok()
         .filter(|secret| !secret.trim().is_empty())
-        .ok_or_else(|| {
-            "Ely.by sign-in needs the LEGACYLAUNCHER_ELY_CLIENT_SECRET environment variable."
-                .to_owned()
-        })
+        .ok_or_else(|| crate::tr("rust.status.account.ely.oauth.secret-required").to_owned())
 }
 
 pub fn authenticator(profile: Profile, credentials: Credentials) -> Authenticator {
@@ -137,7 +151,10 @@ async fn load_profile(client: &reqwest::Client, access_token: &str) -> Result<Pr
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|error| format!("Could not load the Ely.by account profile: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.profile-load-error")
+                .replace("%0", &error.to_string())
+        })?;
     let status = response.status();
     if !status.is_success() {
         let detail = response
@@ -151,23 +168,29 @@ async fn load_profile(client: &reqwest::Client, access_token: &str) -> Result<Pr
                     .map(|message| message.chars().take(200).collect::<String>())
             });
         return Err(detail.map_or_else(
-            || format!("Ely.by account profile returned HTTP {status}."),
-            |message| format!("Ely.by account profile failed: {message}"),
+            || {
+                crate::tr("rust.status.account.ely.oauth.profile-http-error")
+                    .replace("%0", &status.to_string())
+            },
+            |message| {
+                crate::tr("rust.status.account.ely.oauth.profile-detail-error")
+                    .replace("%0", &message)
+            },
         ));
     }
     let info = response
         .json::<AccountInfo>()
         .await
-        .map_err(|_| "Ely.by returned an unreadable account profile.".to_owned())?;
+        .map_err(|_| crate::tr("rust.status.account.ely.oauth.profile-unreadable").to_owned())?;
     let uuid = uuid::Uuid::parse_str(&info.uuid)
         .map(|uuid| uuid.to_string())
-        .map_err(|_| "Ely.by returned an invalid account UUID.".to_owned())?;
+        .map_err(|_| crate::tr("rust.status.account.ely.oauth.profile-uuid-invalid").to_owned())?;
     let display_name = info
         .display_name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| info.username.clone());
     if info.id < 0 || info.username.trim().is_empty() {
-        return Err("Ely.by returned an invalid account profile.".to_owned());
+        return Err(crate::tr("rust.status.account.ely.oauth.profile-invalid").to_owned());
     }
     Ok(Profile {
         id: info.id,
@@ -182,7 +205,7 @@ fn build_credentials(
     previous_refresh_token: Option<String>,
 ) -> Result<Credentials, String> {
     if token.token_type != "Bearer" || token.access_token.trim().is_empty() {
-        return Err("Ely.by returned an invalid OAuth token.".to_owned());
+        return Err(crate::tr("rust.status.account.ely.oauth.token-invalid").to_owned());
     }
     let expiry_time = token
         .expires_in
@@ -221,14 +244,21 @@ async fn decode_token(
             .find_map(|key| body.get(key).and_then(serde_json::Value::as_str))
             .map(|message| message.chars().take(200).collect::<String>());
         return Err(detail.map_or_else(
-            || format!("{operation} returned HTTP {status}."),
-            |message| format!("{operation} failed: {message}"),
+            || {
+                crate::tr("rust.status.account.ely.oauth.http-error")
+                    .replace("%0", operation)
+                    .replace("%1", &status.to_string())
+            },
+            |message| {
+                crate::tr("rust.status.account.ely.oauth.detail-error")
+                    .replace("%0", operation)
+                    .replace("%1", &message)
+            },
         ));
     }
-    response
-        .json::<TokenResponse>()
-        .await
-        .map_err(|_| format!("{operation} returned an unreadable token response."))
+    response.json::<TokenResponse>().await.map_err(|_| {
+        crate::tr("rust.status.account.ely.oauth.token-unreadable").replace("%0", operation)
+    })
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -236,7 +266,10 @@ fn http_client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(30))
         .user_agent("LegacyLauncher-Rust/0.1")
         .build()
-        .map_err(|error| format!("Could not initialize Ely.by sign-in: {error}"))
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.client-error")
+                .replace("%0", &error.to_string())
+        })
 }
 
 struct AuthorizationCallback {
@@ -248,19 +281,26 @@ struct AuthorizationCallback {
 fn request_authorization_code(
     cancel_requested: Arc<AtomicBool>,
 ) -> Result<AuthorizationCallback, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|error| format!("Could not open an Ely.by sign-in callback: {error}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Could not prepare the Ely.by callback: {error}"))?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+        crate::tr("rust.status.account.ely.oauth.callback-open-error")
+            .replace("%0", &error.to_string())
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        crate::tr("rust.status.account.ely.oauth.callback-prepare-error")
+            .replace("%0", &error.to_string())
+    })?;
     let port = listener
         .local_addr()
-        .map_err(|error| format!("Could not read the Ely.by callback port: {error}"))?
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.callback-port-error")
+                .replace("%0", &error.to_string())
+        })?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/");
     let state = uuid::Uuid::new_v4().simple().to_string();
-    let mut login_url = Url::parse("https://account.ely.by/oauth2/v1")
-        .map_err(|error| format!("Invalid Ely.by sign-in URL: {error}"))?;
+    let mut login_url = Url::parse("https://account.ely.by/oauth2/v1").map_err(|error| {
+        crate::tr("rust.status.account.ely.oauth.url-error").replace("%0", &error.to_string())
+    })?;
     login_url.query_pairs_mut().extend_pairs([
         ("client_id", CLIENT_ID),
         ("response_type", "code"),
@@ -274,7 +314,7 @@ fn request_authorization_code(
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {
         if cancel_requested.load(Ordering::Acquire) {
-            return Err("Ely.by sign-in was cancelled.".to_owned());
+            return Err(crate::tr("rust.status.account.ely.oauth.cancelled").to_owned());
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -282,7 +322,10 @@ fn request_authorization_code(
                 let target = read_request_target(&mut stream)?;
                 let callback = Url::parse(&redirect_uri)
                     .and_then(|base| base.join(&target))
-                    .map_err(|error| format!("Could not read Ely.by callback: {error}"))?;
+                    .map_err(|error| {
+                        crate::tr("rust.status.account.ely.oauth.callback-read-error")
+                            .replace("%0", &error.to_string())
+                    })?;
                 let parameters: std::collections::HashMap<String, String> =
                     callback.query_pairs().into_owned().collect();
                 if parameters.get("state") != Some(&state) {
@@ -292,16 +335,18 @@ fn request_authorization_code(
                 if let Some(error) = parameters.get("error") {
                     write_callback_response(&mut stream, true);
                     return Err(if error == "access_denied" {
-                        "Ely.by sign-in was cancelled.".to_owned()
+                        crate::tr("rust.status.account.ely.oauth.cancelled").to_owned()
                     } else {
-                        "Ely.by sign-in was rejected.".to_owned()
+                        crate::tr("rust.status.account.ely.oauth.rejected").to_owned()
                     });
                 }
                 let code = parameters
                     .get("code")
                     .filter(|value| !value.trim().is_empty())
                     .cloned()
-                    .ok_or_else(|| "Ely.by returned no authorization code.".to_owned())?;
+                    .ok_or_else(|| {
+                        crate::tr("rust.status.account.ely.oauth.code-missing").to_owned()
+                    })?;
                 write_callback_response(&mut stream, true);
                 return Ok(AuthorizationCallback {
                     code,
@@ -312,25 +357,31 @@ fn request_authorization_code(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => return Err(format!("Could not receive Ely.by callback: {error}")),
+            Err(error) => {
+                return Err(
+                    crate::tr("rust.status.account.ely.oauth.callback-receive-error")
+                        .replace("%0", &error.to_string()),
+                );
+            }
         }
     }
-    Err("Ely.by sign-in timed out after five minutes.".to_owned())
+    Err(crate::tr("rust.status.account.ely.oauth.timeout").to_owned())
 }
 
 fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        let count = stream
-            .read(&mut chunk)
-            .map_err(|error| format!("Could not read Ely.by callback: {error}"))?;
+        let count = stream.read(&mut chunk).map_err(|error| {
+            crate::tr("rust.status.account.ely.oauth.callback-read-error")
+                .replace("%0", &error.to_string())
+        })?;
         if count == 0 {
             break;
         }
         request.extend_from_slice(&chunk[..count]);
         if request.len() > 16 * 1024 {
-            return Err("Ely.by callback request was too large.".to_owned());
+            return Err(crate::tr("rust.status.account.ely.oauth.callback-too-large").to_owned());
         }
     }
     let request = String::from_utf8_lossy(&request);
@@ -339,18 +390,22 @@ fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .map(str::to_owned)
-        .ok_or_else(|| "Ely.by callback did not contain a valid request.".to_owned())
+        .ok_or_else(|| crate::tr("rust.status.account.ely.oauth.callback-malformed").to_owned())
 }
 
 fn write_callback_response(stream: &mut TcpStream, accepted: bool) {
     let (status, body, location) = if accepted {
         (
             "302 Found",
-            "Authorization complete. You may close this window.",
+            crate::tr("rust.status.account.ely.oauth.browser-complete"),
             Some(CALLBACK_SUCCESS),
         )
     } else {
-        ("400 Bad Request", "Invalid sign-in callback.", None)
+        (
+            "400 Bad Request",
+            crate::tr("rust.status.account.ely.oauth.browser-invalid"),
+            None,
+        )
     };
     let mut response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n",

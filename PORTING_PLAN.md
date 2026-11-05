@@ -22,8 +22,13 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Add the US support popup and links to the source Discord and support email.
 - [x] Check for newer GitHub releases and show release notes for a newer Rust build.
 - [x] Move settings-page titles/controls and common notice, log, server, account, and update labels into the US locale resource.
-- [ ] Port the remaining scene flows found under `launcher/src/main/java/net/legacylauncher/ui`.
+- [x] Port the Java `NoticeScene` as a full-screen notice flow with previous/next navigation, one-week hide/restore, notice actions, and a home action.
+- [x] Port the Java SettingsPanel About us tab with the US source copy, version display, creator/partner links, and license text.
+- [x] Port startup connectivity checks and the source-style warning window for Mojang metadata, Legacy Launcher repositories, bootstrap hosts, and Ely.by.
+- [ ] Port the remaining scene and dialog flows found under `launcher/src/main/java/net/legacylauncher/ui`.
 - [x] Add opt-in diagnostic upload, success link actions, sensitive-line filtering, and a local-save fallback using the source Pasta endpoint.
+- [x] Move version filters, notices/account controls, and launch/download event labels into the US locale resource; every literal `tr("key")` in Rust currently resolves to a US property.
+- [ ] Finish moving remaining backend/network and dynamic notice/crash error wording into the locale; Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server, import, background-image, and crash fallback errors are localized.
 - [ ] Load all visible strings from the US locale resource and match the source layout at common Windows scales.
 - [x] Wire the login toolbar to support, game-folder/mods-folder, catalog refresh, and settings actions.
 - [x] Port the source's nine login-form positions and migrate `gui.direction.loginform`.
@@ -47,9 +52,14 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Import the crash scanning and full launch command logging preferences.
 - [x] Import and expose the source's nine login-form positions.
 - [x] Import `gui.font`, clamp it to the source's 12–18 pt range, and apply it as launcher-wide UI scaling with a live preferences control.
+- [x] Import `gui.font.old` and show the source's revert/dismiss font-size prompt, applying the restored value immediately with live Rust UI scaling.
+- [x] Import `gui.laf.v1.state` and the pre-FlatLaf `gui.systemlookandfeel` setting, then expose the source Off/System/Auto/Dark/Light modes as live system-aware UI themes.
 - [x] Import `gui.background` image paths and add a live background image picker/reset; video backgrounds remain unsupported.
 - [x] Import `gui.logger.width/height/x/y`, use them as the log viewer's initial geometry, and persist its size and position after moving/resizing.
-- [x] Import `gui.logger`, add the source Global/None setting, show live game output in Global mode, and turn Global mode off when the log window is closed.
+- [x] Import `gui.logger`, add the source Global/None setting, show live launcher events by default, capture Minecraft output in the rolling launcher log, and turn Global mode off when the log window is closed.
+- [x] Replace the generic status-driven logger fallback with explicit status events carrying severity and subsystem targets; launch events and startup background-image errors are logged directly.
+- [ ] Port the remaining Java Log4j diagnostics and compare logger coverage against the Java source. In-memory log records now carry timestamps, levels, and subsystem targets; Minecraft download/process, auth, Java, mod, server, catalog, update, bootstrap, notice, diagnostic, settings-import, and crash events are categorized.
+- [x] Import `bootstrap.switchToBeta` and expose it as an opt-in prerelease update channel for the Rust self-updater.
 - [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.
 - [x] Preserve each offline account's `elySkins` preference (defaulting to the Java source's `true` value), import it from `tlauncher_profiles.json`, and apply the matching Ely/plain/Minecraft replacement libraries from `libraries/replace.json` with repo failover and isolated launch caches.
@@ -115,12 +125,13 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 
 ### 7. Windows delivery and parity review
 
-- [ ] Port launcher self-update/bootstrap handoff and remaining first-run behavior.
+- [ ] Complete signed-metadata bootstrap self-update, validate the release handoff, and finish remaining first-run behavior.
 - [x] Show the source's US first-run welcome and acknowledgment notice when the Rust settings file is absent; save settings after acknowledgment.
 - [x] Detect first-run game-folder conflicts, offer source-compatible destination suggestions and a folder browser, validate the selected path, and preserve the source data without copying it.
 - [x] Show the source's Windows ARM OpenGL compatibility notice on first run, with a five-second install countdown and support action.
 - [x] Add a tagged Windows release workflow that publishes the executable, portable ZIP, and SHA-256 checksums.
 - [x] Package a portable Windows x64 folder/ZIP; assets are embedded and the release build does not need an external Rust/Java runtime to start.
+- [x] Check for Rust release updates at startup and defer the release-notes prompt until first-run setup is complete; keep the verified download and Windows replacement/restart flow.
 - [ ] Review every user-facing flow against the Java source and close the remaining parity gaps.
 
 ## Current focus

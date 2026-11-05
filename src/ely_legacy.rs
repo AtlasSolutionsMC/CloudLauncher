@@ -62,7 +62,7 @@ pub async fn authenticate(
 ) -> Result<(Profile, Credentials), String> {
     let username = username.trim();
     if username.is_empty() || password.is_empty() {
-        return Err("Enter your Ely.by username and password.".to_owned());
+        return Err(crate::tr("rust.status.account.ely.legacy.credentials-required").to_owned());
     }
     let request = AuthenticateRequest {
         agent: Agent {
@@ -96,42 +96,53 @@ async fn send_request<T: Serialize>(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|error| format!("Could not create Ely.by request: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.legacy.client-error")
+                .replace("%0", &error.to_string())
+        })?;
     let response = client
         .post(format!("{AUTH_SERVER}/{endpoint}"))
         .header(reqwest::header::ACCEPT, "application/json")
         .json(body)
         .send()
         .await
-        .map_err(|error| format!("Could not contact Ely.by: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.ely.legacy.request-error")
+                .replace("%0", &error.to_string())
+        })?;
     let status = response.status();
-    let payload = response
-        .json::<AuthResponse>()
-        .await
-        .map_err(|error| format!("Ely.by returned an invalid response: {error}"))?;
+    let payload = response.json::<AuthResponse>().await.map_err(|error| {
+        crate::tr("rust.status.account.ely.legacy.response-error").replace("%0", &error.to_string())
+    })?;
     if !status.is_success() || payload.error.is_some() || payload.error_message.is_some() {
         let detail = payload
             .error_message
             .or(payload.error)
             .unwrap_or_else(|| status.to_string());
-        return Err(format!("Ely.by sign-in failed: {detail}"));
+        return Err(
+            crate::tr("rust.status.account.ely.legacy.sign-in-error").replace("%0", &detail)
+        );
     }
     let access_token = payload
         .access_token
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Ely.by did not return an access token.".to_owned())?;
+        .ok_or_else(|| {
+            crate::tr("rust.status.account.ely.legacy.access-token-missing").to_owned()
+        })?;
     let client_token = payload
         .client_token
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Ely.by did not return a client token.".to_owned())?;
+        .ok_or_else(|| {
+            crate::tr("rust.status.account.ely.legacy.client-token-missing").to_owned()
+        })?;
     let game_profile = payload
         .selected_profile
-        .ok_or_else(|| "This Ely.by account has no selected Minecraft profile.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.status.account.ely.legacy.profile-missing").to_owned())?;
     let uuid = uuid::Uuid::parse_str(&game_profile.id)
         .map(|uuid| uuid.to_string())
-        .map_err(|_| "Ely.by returned an invalid Minecraft profile UUID.".to_owned())?;
+        .map_err(|_| crate::tr("rust.status.account.ely.legacy.profile-uuid-invalid").to_owned())?;
     if game_profile.name.trim().is_empty() {
-        return Err("Ely.by returned an empty Minecraft profile name.".to_owned());
+        return Err(crate::tr("rust.status.account.ely.legacy.profile-name-empty").to_owned());
     }
 
     Ok((

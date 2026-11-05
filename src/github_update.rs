@@ -5,6 +5,8 @@ use std::fs;
 
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/AtlasSolutionsMC/CloudLauncher/releases/latest";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/AtlasSolutionsMC/CloudLauncher/releases?per_page=100";
 const RELEASE_ASSET_PREFIX: &str =
     "https://github.com/AtlasSolutionsMC/CloudLauncher/releases/download/";
 const MAX_RELEASE_EXE_BYTES: usize = 256 * 1024 * 1024;
@@ -48,39 +50,77 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-pub async fn check_for_update() -> Result<CheckResult, String> {
+pub async fn check_for_update(include_prereleases: bool) -> Result<CheckResult, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| format!("Could not prepare the update check: {error}"))?;
-    let response = client
-        .get(LATEST_RELEASE_API)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| format!("Could not check GitHub Releases: {error}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(CheckResult::NoPublishedRelease);
-    }
-    let release: GithubRelease = response
-        .error_for_status()
-        .map_err(|error| format!("GitHub Releases returned an error: {error}"))?
-        .json()
-        .await
-        .map_err(|error| format!("Could not read GitHub release metadata: {error}"))?;
-    if release.draft || release.prerelease {
-        return Ok(CheckResult::NoPublishedRelease);
-    }
+        .map_err(|error| {
+            crate::tr("rust.error.update.check-client").replace("%0", &error.to_string())
+        })?;
+    let release = if include_prereleases {
+        let response = client
+            .get(RELEASES_API)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|error| {
+                crate::tr("rust.error.update.check").replace("%0", &error.to_string())
+            })?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(CheckResult::NoPublishedRelease);
+        }
+        let releases = response
+            .error_for_status()
+            .map_err(|error| crate::tr("rust.error.update.http").replace("%0", &error.to_string()))?
+            .json::<Vec<GithubRelease>>()
+            .await
+            .map_err(|error| {
+                crate::tr("rust.error.update.metadata").replace("%0", &error.to_string())
+            })?;
+        let Some((_, release)) = releases
+            .into_iter()
+            .filter(|release| !release.draft)
+            .filter_map(|release| {
+                parse_version(&release.tag_name).map(|version| (version, release))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+        else {
+            return Ok(CheckResult::NoPublishedRelease);
+        };
+        release
+    } else {
+        let response = client
+            .get(LATEST_RELEASE_API)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|error| {
+                crate::tr("rust.error.update.check").replace("%0", &error.to_string())
+            })?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(CheckResult::NoPublishedRelease);
+        }
+        let release: GithubRelease = response
+            .error_for_status()
+            .map_err(|error| crate::tr("rust.error.update.http").replace("%0", &error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| {
+                crate::tr("rust.error.update.metadata").replace("%0", &error.to_string())
+            })?;
+        if release.draft || release.prerelease {
+            return Ok(CheckResult::NoPublishedRelease);
+        }
+        release
+    };
 
     let latest_version = parse_version(&release.tag_name).ok_or_else(|| {
-        format!(
-            "Latest release tag is not a semantic version: {}",
-            release.tag_name
-        )
+        crate::tr("rust.error.update.tag-invalid").replace("%0", &release.tag_name)
     })?;
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|error| format!("The bundled launcher version is invalid: {error}"))?;
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
+        crate::tr("rust.error.update.version-invalid").replace("%0", &error.to_string())
+    })?;
     if latest_version <= current_version {
         return Ok(CheckResult::UpToDate);
     }
@@ -88,7 +128,7 @@ pub async fn check_for_update() -> Result<CheckResult, String> {
         .html_url
         .starts_with("https://github.com/AtlasSolutionsMC/CloudLauncher/releases/")
     {
-        return Err("GitHub returned an unexpected release URL.".to_owned());
+        return Err(crate::tr("rust.error.update.release-url").to_owned());
     }
 
     let executable_url = release
@@ -121,22 +161,24 @@ pub async fn download_and_handoff(release: Release) -> Result<(), String> {
     let exe_url = release
         .executable_url
         .as_deref()
-        .ok_or_else(|| "This release does not include the Windows executable.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.error.update.exe-missing").to_owned())?;
     let checksums_url = release
         .checksums_url
         .as_deref()
-        .ok_or_else(|| "This release does not include SHA-256 checksums.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.error.update.checksums-missing").to_owned())?;
     if !exe_url.starts_with(RELEASE_ASSET_PREFIX)
         || !checksums_url.starts_with(RELEASE_ASSET_PREFIX)
     {
-        return Err("Release assets use an unexpected download URL.".to_owned());
+        return Err(crate::tr("rust.error.update.asset-url").to_owned());
     }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| format!("Could not prepare the update download: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.update.download-client").replace("%0", &error.to_string())
+        })?;
     let checksums = read_limited(&client, checksums_url, MAX_CHECKSUM_BYTES).await?;
     let executable = read_limited(&client, exe_url, MAX_RELEASE_EXE_BYTES).await?;
     let expected_hash = checksum_for_asset(&checksums, EXE_ASSET_NAME)?;
@@ -145,7 +187,7 @@ pub async fn download_and_handoff(release: Release) -> Result<(), String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
-        return Err("The downloaded executable failed its SHA-256 checksum.".to_owned());
+        return Err(crate::tr("rust.error.update.checksum-mismatch").to_owned());
     }
 
     #[cfg(windows)]
@@ -155,7 +197,7 @@ pub async fn download_and_handoff(release: Release) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = executable;
-        Err("Automatic updates are available only on Windows.".to_owned())
+        Err(crate::tr("rust.error.update.windows-only").to_owned())
     }
 }
 
@@ -168,23 +210,23 @@ async fn read_limited(
         .get(url)
         .send()
         .await
-        .map_err(|error| format!("Could not download the update asset: {error}"))?
+        .map_err(|error| crate::tr("rust.error.update.download").replace("%0", &error.to_string()))?
         .error_for_status()
-        .map_err(|error| format!("Update asset request failed: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.update.asset-http").replace("%0", &error.to_string())
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err("The update asset exceeds the allowed size.".to_owned());
+        return Err(crate::tr("rust.error.update.asset-large").to_owned());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("Could not read the update asset: {error}"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        crate::tr("rust.error.update.asset-read").replace("%0", &error.to_string())
+    })? {
         if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err("The update asset exceeds the allowed size.".to_owned());
+            return Err(crate::tr("rust.error.update.asset-large").to_owned());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -193,7 +235,7 @@ async fn read_limited(
 
 fn checksum_for_asset(checksums: &[u8], asset_name: &str) -> Result<String, String> {
     let text = std::str::from_utf8(checksums)
-        .map_err(|_| "The release checksum file is not valid UTF-8.".to_owned())?;
+        .map_err(|_| crate::tr("rust.error.update.checksums-utf8").to_owned())?;
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let Some(hash) = parts.next() else { continue };
@@ -204,9 +246,7 @@ fn checksum_for_asset(checksums: &[u8], asset_name: &str) -> Result<String, Stri
             return Ok(hash.to_ascii_lowercase());
         }
     }
-    Err(format!(
-        "The release checksum file has no valid entry for {asset_name}."
-    ))
+    Err(crate::tr("rust.error.update.checksum-entry-missing").replace("%0", asset_name))
 }
 
 #[cfg(windows)]
@@ -214,36 +254,35 @@ fn prepare_windows_handoff(executable: Vec<u8>) -> Result<(), String> {
     use std::{io::Write, os::windows::process::CommandExt, process::Command};
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let current_exe = std::env::current_exe()
-        .map_err(|error| format!("Could not locate the running launcher: {error}"))?;
+    let current_exe = std::env::current_exe().map_err(|error| {
+        crate::tr("rust.error.update.exe-locate").replace("%0", &error.to_string())
+    })?;
     let parent = current_exe
         .parent()
-        .ok_or_else(|| "Could not locate the launcher's installation folder.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.error.update.install-folder").to_owned())?;
     let file_name = current_exe
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "The launcher's executable name is not valid Unicode.".to_owned())?;
+        .ok_or_else(|| crate::tr("rust.error.update.exe-name-invalid").to_owned())?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let replacement = parent.join(format!("{file_name}.{suffix}.update"));
     let helper = parent.join(format!("{file_name}.{suffix}.cmd"));
 
     fs::write(&replacement, executable)
-        .map_err(|error| format!("Could not save the verified update: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.update.save").replace("%0", &error.to_string()))?;
     let mut helper_file = match fs::File::create(&helper) {
         Ok(file) => file,
         Err(error) => {
             let _ = fs::remove_file(&replacement);
-            return Err(format!(
-                "Could not prepare the Windows update handoff: {error}"
-            ));
+            return Err(
+                crate::tr("rust.error.update.handoff-prepare").replace("%0", &error.to_string())
+            );
         }
     };
     if let Err(error) = helper_file.write_all(include_bytes!("../assets/update_windows.cmd")) {
         let _ = fs::remove_file(&replacement);
         let _ = fs::remove_file(&helper);
-        return Err(format!(
-            "Could not write the Windows update handoff: {error}"
-        ));
+        return Err(crate::tr("rust.error.update.handoff-write").replace("%0", &error.to_string()));
     }
     drop(helper_file);
 
@@ -259,9 +298,7 @@ fn prepare_windows_handoff(executable: Vec<u8>) -> Result<(), String> {
     if let Err(error) = spawn_result {
         let _ = fs::remove_file(&replacement);
         let _ = fs::remove_file(&helper);
-        return Err(format!(
-            "Could not start the Windows update handoff: {error}"
-        ));
+        return Err(crate::tr("rust.error.update.handoff-start").replace("%0", &error.to_string()));
     }
     Ok(())
 }

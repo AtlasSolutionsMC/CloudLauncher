@@ -76,7 +76,7 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
             signature
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or("Known Minecraft issue")
+                .unwrap_or(crate::tr("rust.crash.issue.known"))
                 .replace('-', " ")
         });
         let body = localized(signature.get("body"), variables).unwrap_or_default();
@@ -186,16 +186,16 @@ fn clean_html(input: &str) -> String {
 
 fn friendly_button_label(label: &str) -> String {
     match label {
-        "logs" => "Open logs".to_owned(),
-        "open-mods" => "Open Mods folder".to_owned(),
-        "open-config" => "Open config folder".to_owned(),
-        "open-game-root" => "Open game folder".to_owned(),
-        "jre-recommended" => "Use Recommended Java".to_owned(),
-        "update-java" => "Update Java".to_owned(),
-        "install-java64" => "Get 64-bit Java".to_owned(),
-        "open-settings" => "Open settings".to_owned(),
-        "fix-stack-size" => "Fix Java stack size".to_owned(),
-        "force-update" => "Force update".to_owned(),
+        "logs" => crate::tr("rust.crash.action.logs").to_owned(),
+        "open-mods" => crate::tr("rust.crash.action.mods").to_owned(),
+        "open-config" => crate::tr("rust.crash.action.config").to_owned(),
+        "open-game-root" => crate::tr("rust.crash.action.game-folder").to_owned(),
+        "jre-recommended" => crate::tr("rust.crash.action.recommended-java").to_owned(),
+        "update-java" => crate::tr("rust.crash.action.update-java").to_owned(),
+        "install-java64" => crate::tr("rust.crash.action.java-64-bit").to_owned(),
+        "open-settings" => crate::tr("rust.crash.action.settings").to_owned(),
+        "fix-stack-size" => crate::tr("rust.crash.action.stack-size").to_owned(),
+        "force-update" => crate::tr("rust.crash.action.force-update").to_owned(),
         other => other.replace('-', " "),
     }
 }

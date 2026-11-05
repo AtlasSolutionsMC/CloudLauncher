@@ -90,7 +90,10 @@ pub async fn sign_in(cancel_requested: Arc<AtomicBool>) -> Result<SignInOutcome,
     let (code, redirect_uri) =
         tokio::task::spawn_blocking(move || request_authorization_code(cancel_requested))
             .await
-            .map_err(|error| format!("Sign-in callback failed: {error}"))??;
+            .map_err(|error| {
+                crate::tr("rust.status.account.microsoft.callback-error")
+                    .replace("%0", &error.to_string())
+            })??;
 
     let client = http_client()?;
     let response = client
@@ -103,9 +106,15 @@ pub async fn sign_in(cancel_requested: Arc<AtomicBool>) -> Result<SignInOutcome,
         ])
         .send()
         .await
-        .map_err(|error| format!("Could not exchange Microsoft sign-in code: {error}"))?;
-    let microsoft_token =
-        decode_response::<MicrosoftTokenResponse>(response, "Microsoft OAuth").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.exchange-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let microsoft_token = decode_response::<MicrosoftTokenResponse>(
+        response,
+        crate::tr("rust.status.account.microsoft.operation.oauth"),
+    )
+    .await?;
 
     authenticate_minecraft(client, microsoft_token).await
 }
@@ -121,16 +130,21 @@ pub async fn refresh_sign_in(refresh_token: &str) -> Result<AuthenticatedMicroso
         ])
         .send()
         .await
-        .map_err(|error| format!("Could not refresh Microsoft sign-in: {error}"))?;
-    let microsoft_token =
-        decode_response::<MicrosoftTokenResponse>(response, "Microsoft token refresh").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.refresh-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let microsoft_token = decode_response::<MicrosoftTokenResponse>(
+        response,
+        crate::tr("rust.status.account.microsoft.operation.token-refresh"),
+    )
+    .await?;
 
     match authenticate_minecraft(client, microsoft_token).await? {
         SignInOutcome::Authenticated(account) => Ok(account),
-        SignInOutcome::ProfileCreationRequired(_) => Err(
-            "No Minecraft profile exists for this account. Add it again to create a profile."
-                .to_owned(),
-        ),
+        SignInOutcome::ProfileCreationRequired(_) => {
+            Err(crate::tr("rust.status.account.microsoft.profile-missing").to_owned())
+        }
     }
 }
 
@@ -150,7 +164,7 @@ async fn authenticate_minecraft(
             "RelyingParty": "http://auth.xboxlive.com",
             "TokenType": "JWT",
         }),
-        "Xbox Live sign-in",
+        crate::tr("rust.status.account.microsoft.operation.xbox-live"),
     )
     .await?;
 
@@ -165,14 +179,13 @@ async fn authenticate_minecraft(
             "RelyingParty": "rp://api.minecraftservices.com/",
             "TokenType": "JWT",
         }),
-        "Xbox XSTS sign-in",
+        crate::tr("rust.status.account.microsoft.operation.xbox-xsts"),
     )
     .await?;
-    let identity = xsts
-        .display_claims
-        .xui
-        .first()
-        .ok_or_else(|| "Xbox sign-in did not return an account identity.".to_owned())?;
+    let identity =
+        xsts.display_claims.xui.first().ok_or_else(|| {
+            crate::tr("rust.status.account.microsoft.identity-missing").to_owned()
+        })?;
 
     let minecraft_token: MinecraftServiceToken = post_json(
         &client,
@@ -180,7 +193,7 @@ async fn authenticate_minecraft(
         json!({
             "identityToken": format!("XBL3.0 x={};{}", identity.uhs, xsts.token),
         }),
-        "Minecraft Services sign-in",
+        crate::tr("rust.status.account.microsoft.operation.minecraft"),
     )
     .await?;
 
@@ -193,9 +206,15 @@ async fn authenticate_minecraft(
         .bearer_auth(&minecraft_token.access_token)
         .send()
         .await
-        .map_err(|error| format!("Could not check Minecraft ownership: {error}"))?;
-    let ownership: Entitlements =
-        decode_response(ownership_response, "Minecraft ownership check").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.ownership-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let ownership: Entitlements = decode_response(
+        ownership_response,
+        crate::tr("rust.status.account.microsoft.operation.ownership"),
+    )
+    .await?;
     let has_product = ownership
         .items
         .iter()
@@ -205,7 +224,7 @@ async fn authenticate_minecraft(
         .iter()
         .any(|item| item.name == "game_minecraft");
     if !has_product || !has_game {
-        return Err("This Microsoft account does not own Minecraft Java Edition.".to_owned());
+        return Err(crate::tr("rust.status.account.microsoft.not-owned").to_owned());
     }
 
     let profile_response = client
@@ -213,7 +232,10 @@ async fn authenticate_minecraft(
         .bearer_auth(&minecraft_token.access_token)
         .send()
         .await
-        .map_err(|error| format!("Could not load Minecraft profile: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.profile-load-error")
+                .replace("%0", &error.to_string())
+        })?;
     if profile_response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(SignInOutcome::ProfileCreationRequired(
             PendingMinecraftProfile {
@@ -223,7 +245,11 @@ async fn authenticate_minecraft(
             },
         ));
     }
-    let profile: MinecraftProfile = decode_response(profile_response, "Minecraft profile").await?;
+    let profile: MinecraftProfile = decode_response(
+        profile_response,
+        crate::tr("rust.status.account.microsoft.operation.profile"),
+    )
+    .await?;
     Ok(SignInOutcome::Authenticated(build_authenticated_account(
         profile,
         microsoft_token.refresh_token,
@@ -242,9 +268,7 @@ pub async fn create_minecraft_profile(
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
     {
-        return Err(
-            "Minecraft profile names must be 3–16 letters, numbers, or underscores.".to_owned(),
-        );
+        return Err(crate::tr("rust.status.account.microsoft.profile-name-format").to_owned());
     }
     let client = http_client()?;
     let response = client
@@ -253,8 +277,15 @@ pub async fn create_minecraft_profile(
         .json(&json!({ "profileName": profile_name }))
         .send()
         .await
-        .map_err(|error| format!("Could not create the Minecraft profile: {error}"))?;
-    let profile: MinecraftProfile = decode_response(response, "Minecraft profile creation").await?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.profile-create-error")
+                .replace("%0", &error.to_string())
+        })?;
+    let profile: MinecraftProfile = decode_response(
+        response,
+        crate::tr("rust.status.account.microsoft.operation.profile-create"),
+    )
+    .await?;
     build_authenticated_account(
         profile,
         pending.refresh_token,
@@ -270,7 +301,7 @@ fn build_authenticated_account(
     access_token: String,
 ) -> Result<AuthenticatedMicrosoftAccount, String> {
     let parsed_uuid = uuid::Uuid::parse_str(&profile.id)
-        .map_err(|_| "Minecraft returned an invalid profile ID.".to_owned())?;
+        .map_err(|_| crate::tr("rust.status.account.microsoft.invalid-profile-id").to_owned())?;
     let uuid = parsed_uuid.to_string();
     let authenticator = Authenticator {
         access_token,
@@ -302,7 +333,11 @@ async fn post_json<T: serde::de::DeserializeOwned>(
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("{operation} request failed: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.request-error")
+                .replace("%0", operation)
+                .replace("%1", &error.to_string())
+        })?;
     decode_response(response, operation).await
 }
 
@@ -310,6 +345,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     operation: &str,
 ) -> Result<T, String> {
+    let operation_label = operation;
     let status = response.status();
     if !status.is_success() {
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
@@ -320,12 +356,10 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
         });
         if let Some(code) = xerr {
             let message = match code {
-                2_148_916_233 => "This Microsoft account does not have an Xbox profile.",
-                2_148_916_235 => "Xbox services are not available for this account's region.",
-                2_148_916_238 => {
-                    "This child account needs an adult account to authorize Xbox access."
-                }
-                _ => "Xbox rejected this account.",
+                2_148_916_233 => crate::tr("rust.status.account.microsoft.xbox-no-profile"),
+                2_148_916_235 => crate::tr("rust.status.account.microsoft.xbox-region"),
+                2_148_916_238 => crate::tr("rust.status.account.microsoft.xbox-child"),
+                _ => crate::tr("rust.status.account.microsoft.xbox-rejected"),
             };
             return Err(message.to_owned());
         }
@@ -334,14 +368,18 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
             .find_map(|field| body.get(field).and_then(Value::as_str))
         {
             let detail = message.chars().take(240).collect::<String>();
-            return Err(format!("{operation} failed (HTTP {status}): {detail}"));
+            return Err(crate::tr("rust.status.account.microsoft.http-detail")
+                .replace("%0", operation_label)
+                .replace("%1", &status.to_string())
+                .replace("%2", &detail));
         }
-        return Err(format!("{operation} returned HTTP {status}."));
+        return Err(crate::tr("rust.status.account.microsoft.http-error")
+            .replace("%0", operation_label)
+            .replace("%1", &status.to_string()));
     }
-    response
-        .json::<T>()
-        .await
-        .map_err(|_| format!("{operation} returned an unreadable response."))
+    response.json::<T>().await.map_err(|_| {
+        crate::tr("rust.status.account.microsoft.response-error").replace("%0", operation_label)
+    })
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -349,7 +387,10 @@ fn http_client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(30))
         .user_agent("LegacyLauncher-Rust/0.1")
         .build()
-        .map_err(|error| format!("Could not initialize Microsoft sign-in: {error}"))
+        .map_err(|error| {
+            crate::tr("rust.status.account.microsoft.client-error")
+                .replace("%0", &error.to_string())
+        })
 }
 
 fn request_authorization_code(
@@ -363,15 +404,17 @@ fn request_authorization_code(
         }
     }
     let (listener, port) = listener_and_port
-        .ok_or_else(|| "Could not open a local sign-in callback port.".to_owned())?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Could not prepare the sign-in callback: {error}"))?;
+        .ok_or_else(|| crate::tr("rust.status.account.microsoft.callback-port").to_owned())?;
+    listener.set_nonblocking(true).map_err(|error| {
+        crate::tr("rust.status.account.microsoft.callback-prepare")
+            .replace("%0", &error.to_string())
+    })?;
 
     let redirect_uri = format!("http://localhost:{port}");
     let state = uuid::Uuid::new_v4().simple().to_string();
-    let mut login_url = Url::parse(AUTHORIZATION_ENDPOINT)
-        .map_err(|error| format!("Invalid Microsoft sign-in URL: {error}"))?;
+    let mut login_url = Url::parse(AUTHORIZATION_ENDPOINT).map_err(|error| {
+        crate::tr("rust.status.account.microsoft.url-invalid").replace("%0", &error.to_string())
+    })?;
     login_url.query_pairs_mut().extend_pairs([
         ("client_id", CLIENT_ID),
         ("response_type", "code"),
@@ -385,7 +428,7 @@ fn request_authorization_code(
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {
         if cancel_requested.load(Ordering::Acquire) {
-            return Err("Microsoft sign-in was cancelled.".to_owned());
+            return Err(crate::tr("rust.status.account.microsoft.cancelled").to_owned());
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -399,7 +442,10 @@ fn request_authorization_code(
                 };
                 let callback = Url::parse(&redirect_uri)
                     .and_then(|base| base.join(&request_target))
-                    .map_err(|error| format!("Could not read Microsoft callback: {error}"))?;
+                    .map_err(|error| {
+                        crate::tr("rust.status.account.microsoft.callback-read")
+                            .replace("%0", &error.to_string())
+                    })?;
                 let parameters: std::collections::HashMap<String, String> =
                     callback.query_pairs().into_owned().collect();
                 if parameters.get("state").map(String::as_str) != Some(state.as_str()) {
@@ -409,13 +455,13 @@ fn request_authorization_code(
                 if let Some(error) = parameters.get("error") {
                     write_callback_response(&mut stream, true);
                     return Err(if error == "access_denied" {
-                        "Microsoft sign-in was cancelled.".to_owned()
+                        crate::tr("rust.status.account.microsoft.cancelled").to_owned()
                     } else {
-                        "Microsoft sign-in was rejected.".to_owned()
+                        crate::tr("rust.status.account.microsoft.rejected").to_owned()
                     });
                 }
                 let code = parameters.get("code").cloned().ok_or_else(|| {
-                    "Microsoft sign-in returned no authorization code.".to_owned()
+                    crate::tr("rust.status.account.microsoft.code-missing").to_owned()
                 })?;
                 write_callback_response(&mut stream, true);
                 return Ok((code, redirect_uri));
@@ -423,19 +469,23 @@ fn request_authorization_code(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
             }
-            Err(error) => return Err(format!("Could not receive Microsoft sign-in: {error}")),
+            Err(error) => {
+                return Err(crate::tr("rust.status.account.microsoft.callback-receive")
+                    .replace("%0", &error.to_string()));
+            }
         }
     }
-    Err("Microsoft sign-in timed out after five minutes.".to_owned())
+    Err(crate::tr("rust.status.account.microsoft.timeout").to_owned())
 }
 
 fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
     loop {
-        let count = stream
-            .read(&mut chunk)
-            .map_err(|error| format!("Could not read the sign-in callback: {error}"))?;
+        let count = stream.read(&mut chunk).map_err(|error| {
+            crate::tr("rust.status.account.microsoft.request-read")
+                .replace("%0", &error.to_string())
+        })?;
         if count == 0 {
             break;
         }
@@ -444,7 +494,7 @@ fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
             break;
         }
         if request.len() > 16 * 1024 {
-            return Err("Microsoft sign-in callback was too large.".to_owned());
+            return Err(crate::tr("rust.status.account.microsoft.callback-too-large").to_owned());
         }
     }
     let first_line = String::from_utf8_lossy(&request)
@@ -457,19 +507,19 @@ fn read_request_target(stream: &mut TcpStream) -> Result<String, String> {
         .nth(1)
         .filter(|target| target.starts_with('/'))
         .map(str::to_owned)
-        .ok_or_else(|| "Microsoft sign-in callback was malformed.".to_owned())
+        .ok_or_else(|| crate::tr("rust.status.account.microsoft.callback-malformed").to_owned())
 }
 
 fn write_callback_response(stream: &mut TcpStream, success: bool) {
     let (status, body) = if success {
         (
             "200 OK",
-            "Sign-in complete. You can return to LegacyLauncher.",
+            crate::tr("rust.status.account.microsoft.browser-complete"),
         )
     } else {
         (
             "400 Bad Request",
-            "Sign-in could not be verified. Return to LegacyLauncher.",
+            crate::tr("rust.status.account.microsoft.browser-invalid"),
         )
     };
     let response = format!(

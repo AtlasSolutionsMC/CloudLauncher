@@ -34,20 +34,22 @@ pub async fn fetch_manifest() -> Result<MojangVersionManifest, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|error| format!("Could not initialize version metadata request: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.catalog.client").replace("%0", &error.to_string())
+        })?;
     let response = client
         .get(VERSION_MANIFEST_URL)
         .header(reqwest::header::USER_AGENT, "LegacyLauncher-Rust/0.1")
         .send()
         .await
-        .map_err(|error| format!("Could not reach Mojang's version catalog: {error}"))?
+        .map_err(|error| crate::tr("rust.error.catalog.fetch").replace("%0", &error.to_string()))?
         .error_for_status()
-        .map_err(|error| format!("Mojang's version catalog returned an error: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.catalog.http").replace("%0", &error.to_string()))?;
 
     let mut manifest = response
         .json::<MojangVersionManifest>()
         .await
-        .map_err(|error| format!("Could not read Mojang's version catalog: {error}"))?;
+        .map_err(|error| crate::tr("rust.error.catalog.parse").replace("%0", &error.to_string()))?;
 
     let mut extra_entries = Vec::new();
     for base in EXTRA_VERSION_REPOS {
@@ -115,11 +117,13 @@ pub async fn fetch_required_java_major(
         .versions
         .iter()
         .find(|entry| entry.id == version_id)
-        .ok_or_else(|| format!("Minecraft version {version_id} is not in Mojang's catalog."))?;
+        .ok_or_else(|| crate::tr("rust.error.catalog.version-missing").replace("%0", version_id))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|error| format!("Could not initialize Java requirement check: {error}"))?;
+        .map_err(|error| {
+            crate::tr("rust.error.catalog.java-check-client").replace("%0", &error.to_string())
+        })?;
     let metadata = if let Some(path) = EXTRA_VERSION_REPOS
         .iter()
         .find_map(|base| version.url.strip_prefix(base))
@@ -145,7 +149,7 @@ pub async fn fetch_required_java_major(
             }
         }
         metadata.ok_or_else(|| {
-            format!("Could not read {version_id} metadata from Legacy Launcher repositories.")
+            crate::tr("rust.error.catalog.extra-metadata").replace("%0", version_id)
         })?
     } else {
         let response = client
@@ -153,15 +157,22 @@ pub async fn fetch_required_java_major(
             .header(reqwest::header::USER_AGENT, "LegacyLauncher-Rust/0.1")
             .send()
             .await
-            .map_err(|error| format!("Could not read Minecraft {version_id} metadata: {error}"))?
+            .map_err(|error| {
+                crate::tr("rust.error.catalog.metadata-fetch")
+                    .replace("%0", version_id)
+                    .replace("%1", &error.to_string())
+            })?
             .error_for_status()
             .map_err(|error| {
-                format!("Minecraft {version_id} metadata returned an error: {error}")
+                crate::tr("rust.error.catalog.metadata-http")
+                    .replace("%0", version_id)
+                    .replace("%1", &error.to_string())
             })?;
-        response
-            .json::<Value>()
-            .await
-            .map_err(|error| format!("Could not parse Minecraft {version_id} metadata: {error}"))?
+        response.json::<Value>().await.map_err(|error| {
+            crate::tr("rust.error.catalog.metadata-parse")
+                .replace("%0", version_id)
+                .replace("%1", &error.to_string())
+        })?
     };
     Ok(metadata
         .pointer("/javaVersion/majorVersion")
