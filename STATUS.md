@@ -17,13 +17,13 @@ Implementation is ongoing; feature parity remains incomplete.
 - Manual GitHub release checks with release notes, bounded executable download, SHA-256 verification, and a Windows replacement/restart handoff; a tag-triggered workflow publishes the assets.
 - Source-style US first-run notice with a required acknowledgment before launcher controls can be used.
 - Windows ARM first-run OpenGL compatibility notice with the source's five-second install countdown and support action.
+- First-run game-folder conflict detection and destination selection with browse, path validation, and no-copy warning; settings also has a native folder picker.
 - Ely.by OAuth client secret is supplied through `LEGACYLAUNCHER_ELY_CLIENT_SECRET`; no client secret is checked into this public repository.
 
 ## Still open
 
 - Validate the executable download and Windows updater handoff against a published release artifact (the repository currently has no releases).
 - The Java source's new-feature dialog has no call site in this checkout.
-- First-run game-directory migration.
 - Remaining scenes, settings, account variants, loader variants, and compatibility behaviors from the Java source.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.

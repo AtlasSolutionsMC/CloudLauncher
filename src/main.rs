@@ -28,7 +28,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -330,6 +330,10 @@ struct LauncherApp {
     support_menu_pos: Pos2,
     show_support_window: bool,
     show_first_run_notice: bool,
+    show_first_run_folder_notice: bool,
+    first_run_folder_current_directory: PathBuf,
+    first_run_folder_path: String,
+    first_run_folder_error: Option<String>,
     show_arm_compat_notice: bool,
     arm_compat_notice_started_at: Option<Instant>,
     show_diagnostic_consent: bool,
@@ -426,8 +430,16 @@ impl LauncherApp {
             ),
         };
         let first_run_pending = !settings_path().is_file();
-        let show_arm_compat_notice = first_run_pending && is_windows_arm_host();
         let settings = load_settings();
+        let first_run_folder_current_directory = PathBuf::from(settings.game_directory.trim());
+        let first_run_folder_suggestion = first_run_pending
+            .then(|| first_run_game_directory_suggestion(&first_run_folder_current_directory))
+            .flatten();
+        let show_first_run_folder_notice = first_run_folder_suggestion.is_some();
+        let first_run_folder_path = first_run_folder_suggestion
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let show_arm_compat_notice = first_run_pending && is_windows_arm_host();
         let auto_launch_pending = settings.auto_login && settings.selected_account.is_some();
         let notice_events = settings
             .notices_enabled
@@ -437,6 +449,9 @@ impl LauncherApp {
             settings,
             assets: Some(assets),
             show_first_run_notice: first_run_pending,
+            show_first_run_folder_notice,
+            first_run_folder_current_directory,
+            first_run_folder_path,
             show_arm_compat_notice,
             version_catalog_events: Some(spawn_catalog_fetch()),
             version_catalog_loading: true,
@@ -2023,7 +2038,7 @@ impl LauncherApp {
             if ui
                 .add_enabled(
                     !self.version_catalog_loading,
-                    egui::Button::new("Refresh catalog"),
+                    egui::Button::new(tr("rust.ui.versions.refresh-catalog")),
                 )
                 .clicked()
             {
@@ -2153,7 +2168,7 @@ impl LauncherApp {
                         }
                         if is_installed
                             && ui
-                                .add_enabled(!busy, egui::Button::new("Remove").small())
+                                .add_enabled(!busy, egui::Button::new(tr("rust.ui.remove")).small())
                                 .clicked()
                         {
                             self.confirm_remove_version = Some(version.clone());
@@ -2541,7 +2556,7 @@ impl eframe::App for LauncherApp {
                                             && !self.ely_signin_pending
                                             && !self.ely_legacy_signin_pending
                                             && !self.launching,
-                                        egui::Button::new("Add Microsoft account…"),
+                                        egui::Button::new(tr("rust.ui.account.add-microsoft")),
                                     )
                                     .clicked()
                                 {
@@ -2553,7 +2568,7 @@ impl eframe::App for LauncherApp {
                                             && !self.ely_signin_pending
                                             && !self.ely_legacy_signin_pending
                                             && !self.launching,
-                                        egui::Button::new("Add Ely.by account…"),
+                                        egui::Button::new(tr("rust.ui.account.add-ely")),
                                     )
                                     .clicked()
                                 {
@@ -2565,7 +2580,7 @@ impl eframe::App for LauncherApp {
                                             && !self.ely_signin_pending
                                             && !self.ely_legacy_signin_pending
                                             && !self.launching,
-                                        egui::Button::new("Add Ely.by Legacy account…"),
+                                        egui::Button::new(tr("rust.ui.account.add-ely-legacy")),
                                     )
                                     .clicked()
                                 {
@@ -2952,7 +2967,11 @@ impl eframe::App for LauncherApp {
                             self.server_list_root = None;
                             self.show_settings_menu = false;
                         }
-                        if ui.button(tr("loginform.button.settings.notices")).clicked() {
+                        if ui
+                            .button("!")
+                            .on_hover_text(tr("loginform.button.settings.notices"))
+                            .clicked()
+                        {
                             self.show_notices_window = true;
                             self.show_settings_menu = false;
                             if self.notice_list.is_empty() && !self.notices_loading {
@@ -3138,7 +3157,10 @@ impl eframe::App for LauncherApp {
                     }
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(!self.notices_loading, egui::Button::new("Refresh"))
+                            .add_enabled(
+                                !self.notices_loading,
+                                egui::Button::new(tr("loginform.button.refresh")),
+                            )
                             .clicked()
                         {
                             self.refresh_notices();
@@ -3499,7 +3521,7 @@ impl eframe::App for LauncherApp {
                                     && !self.microsoft_signin_pending
                                     && !self.ely_legacy_signin_pending
                                     && !self.launching,
-                                egui::Button::new("Continue in browser"),
+                                egui::Button::new(tr("rust.ui.account.ely-continue-browser")),
                             )
                             .clicked()
                         {
@@ -3536,9 +3558,9 @@ impl eframe::App for LauncherApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let cancel_label = if self.ely_legacy_signin_pending {
-                            "Cancel sign-in"
+                            tr("rust.ui.account.cancel-sign-in")
                         } else {
-                            "Cancel"
+                            tr("ui.cancel")
                         };
                         if ui.button(cancel_label).clicked() {
                             if self.ely_legacy_signin_pending {
@@ -3551,7 +3573,7 @@ impl eframe::App for LauncherApp {
                         if ui
                             .add_enabled(
                                 !self.ely_legacy_signin_pending && !self.launching,
-                                egui::Button::new("Sign in"),
+                                egui::Button::new(tr("rust.ui.account.sign-in")),
                             )
                             .clicked()
                         {
@@ -3586,7 +3608,7 @@ impl eframe::App for LauncherApp {
                         if ui
                             .add_enabled(
                                 !self.profile_creation_pending,
-                                egui::Button::new("Cancel"),
+                                egui::Button::new(tr("ui.cancel")),
                             )
                             .clicked()
                         {
@@ -3596,7 +3618,7 @@ impl eframe::App for LauncherApp {
                         if ui
                             .add_enabled(
                                 !self.profile_creation_pending,
-                                egui::Button::new("Create profile"),
+                                egui::Button::new(tr("rust.ui.account.create-profile")),
                             )
                             .clicked()
                         {
@@ -3621,6 +3643,7 @@ impl eframe::App for LauncherApp {
                 }
             }
             let mut open = true;
+            let mut browse_game_directory = false;
             egui::Window::new(settings_page_title(title))
                 .open(&mut open)
                 .collapsible(false)
@@ -3637,6 +3660,12 @@ impl eframe::App for LauncherApp {
                                 && PathBuf::from(self.settings.game_directory.trim()).is_absolute()
                             {
                                 self.persist();
+                            }
+                            if ui
+                                .small_button(tr("rust.settings.gamedir.browse"))
+                                .clicked()
+                            {
+                                browse_game_directory = true;
                             }
                             if ui.small_button(tr("rust.settings.gamedir.default")).clicked() {
                                 self.settings.game_directory =
@@ -4465,7 +4494,7 @@ impl eframe::App for LauncherApp {
                                     && !self.ely_signin_pending
                                     && !self.ely_legacy_signin_pending
                                     && !self.launching,
-                                egui::Button::new("Add Ely.by Legacy account…"),
+                                egui::Button::new(tr("rust.ui.account.add-ely-legacy")),
                             )
                             .clicked()
                         {
@@ -4544,6 +4573,26 @@ impl eframe::App for LauncherApp {
                     }
                     _ => {}
                 });
+            if browse_game_directory {
+                let current_directory = self.game_dir_path();
+                let mut dialog =
+                    rfd::FileDialog::new().set_title(tr("settings.client.gamedir.prompt"));
+                if current_directory.is_dir() {
+                    dialog = dialog.set_directory(current_directory);
+                }
+                if let Some(selected) = dialog.pick_folder() {
+                    if selected.is_dir() && fs::read_dir(&selected).is_ok() {
+                        self.settings.game_directory = selected
+                            .canonicalize()
+                            .unwrap_or(selected)
+                            .to_string_lossy()
+                            .into_owned();
+                        self.persist();
+                    } else {
+                        self.status = tr("settings.client.gamedir.noaccess").to_owned();
+                    }
+                }
+            }
             if !open {
                 self.settings_page = None;
             }
@@ -4777,7 +4826,98 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        if self.show_arm_compat_notice && !self.show_first_run_notice {
+        if self.show_first_run_folder_notice && !self.show_first_run_notice {
+            let mut open = true;
+            let mut browse = false;
+            let mut skip = false;
+            let mut apply = false;
+            egui::Window::new(tr("newfolder.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_size([540.0, 270.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(510.0);
+                    ui.heading(tr("newfolder.head"));
+                    ui.label(tr("newfolder.body"));
+                    ui.add_space(8.0);
+                    ui.label(tr("newfolder.select.title"));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.first_run_folder_path)
+                                .desired_width(380.0),
+                        );
+                        if ui.button(tr("newfolder.select.browse")).clicked() {
+                            browse = true;
+                        }
+                    });
+                    if let Some(error) = &self.first_run_folder_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("newfolder.button.cancel")).clicked() {
+                            skip = true;
+                        }
+                        if ui.button(tr("newfolder.button.ok")).clicked() {
+                            apply = true;
+                        }
+                    });
+                });
+
+            if browse {
+                let current_selection = PathBuf::from(self.first_run_folder_path.trim());
+                let starting_directory = if current_selection.is_dir() {
+                    Some(current_selection)
+                } else {
+                    current_selection
+                        .parent()
+                        .filter(|parent| parent.is_dir())
+                        .map(Path::to_path_buf)
+                };
+                let mut dialog = rfd::FileDialog::new().set_title(tr("newfolder.select.prompt"));
+                if let Some(directory) = starting_directory {
+                    dialog = dialog.set_directory(directory);
+                }
+                if let Some(selected) = dialog.pick_folder() {
+                    self.first_run_folder_path = selected.to_string_lossy().into_owned();
+                    self.first_run_folder_error = None;
+                }
+            }
+
+            if apply {
+                let selected = PathBuf::from(self.first_run_folder_path.trim());
+                if !selected.is_absolute() || !selected.is_dir() || fs::read_dir(&selected).is_err()
+                {
+                    self.first_run_folder_error = Some(tr("newfolder.select.error").to_owned());
+                } else if path_is_same_or_nested(
+                    &selected,
+                    &self.first_run_folder_current_directory,
+                ) {
+                    self.first_run_folder_error =
+                        Some(tr("newfolder.select.error.inside").to_owned());
+                } else {
+                    self.settings.game_directory = selected
+                        .canonicalize()
+                        .unwrap_or(selected)
+                        .to_string_lossy()
+                        .into_owned();
+                    self.persist();
+                    self.show_first_run_folder_notice = false;
+                    self.first_run_folder_error = None;
+                }
+            }
+
+            if skip || !open {
+                self.show_first_run_folder_notice = false;
+                self.first_run_folder_error = None;
+            }
+        }
+
+        if self.show_arm_compat_notice
+            && !self.show_first_run_notice
+            && !self.show_first_run_folder_notice
+        {
             let started_at = *self
                 .arm_compat_notice_started_at
                 .get_or_insert_with(Instant::now);
@@ -5909,6 +6049,76 @@ fn default_game_directory() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(".minecraft")
+}
+
+fn first_run_game_directory_suggestion(current_directory: &Path) -> Option<PathBuf> {
+    if !source_directory_needs_migration_warning(current_directory) {
+        return None;
+    }
+
+    let mut suggestions = Vec::new();
+    if cfg!(windows) {
+        suggestions.push(PathBuf::from(r"D:\Games\Minecraft"));
+        suggestions.push(PathBuf::from(r"C:\Games\Minecraft"));
+    }
+
+    let system_root = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if cfg!(target_os = "macos") {
+        let application_support = system_root.join("Library").join("Application Support");
+        suggestions.push(application_support.join(".minecraft"));
+        suggestions.push(application_support.join("Minecraft"));
+        suggestions.push(application_support.join(".tlauncher").join("develop"));
+    } else {
+        suggestions.push(system_root.join(".minecraft"));
+        suggestions.push(system_root.join("Minecraft"));
+        suggestions.push(system_root.join(".tlauncher").join("develop"));
+    }
+
+    suggestions.into_iter().find(|candidate| {
+        !path_is_same_or_nested(candidate, current_directory)
+            && !source_directory_needs_migration_warning(candidate)
+    })
+}
+
+fn source_directory_needs_migration_warning(path: &Path) -> bool {
+    if !path.exists() {
+        return fs::create_dir_all(path).is_err();
+    }
+    if !path.is_dir() {
+        return true;
+    }
+
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return true,
+    };
+    match entries.next() {
+        None => false,
+        Some(Err(_)) => true,
+        Some(Ok(_)) => !path.join("tlauncher_profiles.json").is_file(),
+    }
+}
+
+fn path_is_same_or_nested(candidate: &Path, directory: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = resolved.to_string_lossy().replace('/', "\\");
+        if cfg!(windows) {
+            text.trim_end_matches('\\').to_ascii_lowercase()
+        } else {
+            text.trim_end_matches('\\').to_owned()
+        }
+    }
+
+    let candidate = normalized(candidate);
+    let directory = normalized(directory);
+    candidate == directory
+        || candidate
+            .strip_prefix(&directory)
+            .is_some_and(|remainder| remainder.starts_with('\\'))
 }
 
 fn is_windows_arm_host() -> bool {
