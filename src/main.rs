@@ -3,6 +3,7 @@ mod bootstrap;
 mod catalog;
 mod connectivity;
 mod crash;
+mod diagnostics;
 mod ely;
 mod ely_legacy;
 mod github_update;
@@ -1078,13 +1079,14 @@ impl LauncherApp {
 
     fn diagnostic_report(&self) -> String {
         let mut report = format!(
-            "Legacy Launcher Rust diagnostic report\nLauncher version: {}\nPlatform: {} {}\nMinecraft version: {}\nMod loader: {} {}\n\nRecent game output:\n",
+            "Legacy Launcher Rust diagnostic report\nLauncher version: {}\nPlatform: {} {}\nMinecraft version: {}\nMod loader: {} {}\n\n{}\n\nRecent game output:\n",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.settings.selected_version,
             self.settings.loader_type,
             self.settings.loader_build,
+            diagnostics::system_info(),
         );
         let lines = self
             .game_log
