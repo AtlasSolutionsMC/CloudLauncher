@@ -38,6 +38,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 
 - [x] Add/edit/remove/select offline accounts.
 - [x] Add/remove/select Microsoft accounts and persist their Minecraft profiles.
+- [x] Link the login account selector directly to Manage accounts and distinguish Ely.by Legacy from OAuth accounts.
 - [x] Port the account-type help dialog and the US Buy Minecraft action from the source account-add flow.
 - [x] Add/manage/import Ely.by OAuth accounts, protect credentials with DPAPI, and refresh tokens before launch.
 - [x] Add/manage/import Ely.by Legacy accounts, protect credentials with DPAPI, and refresh tokens before launch.

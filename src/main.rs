@@ -3293,7 +3293,8 @@ impl eframe::App for LauncherApp {
                                         .selectable_value(
                                             &mut self.settings.selected_account,
                                             Some(account.id.clone()),
-                                            format!("{} (Ely.by)", account.display_name),
+                                            tr("rust.ui.account.ely-label")
+                                                .replace("%0", &account.display_name),
                                         )
                                         .changed()
                                     {
@@ -3305,7 +3306,8 @@ impl eframe::App for LauncherApp {
                                         .selectable_value(
                                             &mut self.settings.selected_account,
                                             Some(account.id.clone()),
-                                            format!("{} (Ely.by)", account.display_name),
+                                            tr("rust.ui.account.ely-legacy-label")
+                                                .replace("%0", &account.display_name),
                                         )
                                         .changed()
                                     {
@@ -3366,6 +3368,9 @@ impl eframe::App for LauncherApp {
                                     .clicked()
                                 {
                                     open_url("https://minecraft.net/store/minecraft");
+                                }
+                                if ui.button(tr("loginform.button.settings.account")).clicked() {
+                                    self.settings_page = Some("Manage accounts");
                                 }
                             });
 

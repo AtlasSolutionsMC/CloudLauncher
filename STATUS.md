@@ -10,6 +10,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Login panel placement can be selected from all nine positions supported by the Java launcher and is imported from `legacy.properties`.
 - Offline, Microsoft, Ely.by OAuth, and Ely.by Legacy account flows.
 - Account type guidance with Microsoft/offline/Ely.by descriptions, plus source-style Buy Minecraft and Ely.by registration links.
+- Login account dropdown opens Manage accounts directly and labels Ely.by Legacy accounts distinctly from Ely.by OAuth.
 - Optional `--requireMinecraftAccount` account-add gate with the source US warning and Mojang-import exception.
 - Minecraft version catalog and lifecycle, custom inherited versions, Java runtime management, Forge/NeoForge/Fabric/LegacyFabric/Quilt launch paths, and source Forge mod-pack argument compatibility.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostic upload.
@@ -42,7 +43,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 95 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 96 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 
