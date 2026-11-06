@@ -7,6 +7,7 @@ const SIGNATURES: &str = include_str!("../assets/crash/signature.json");
 pub struct CrashSuggestion {
     pub title: String,
     pub body: String,
+    pub permit_help: bool,
     pub actions: Vec<CrashSuggestionAction>,
 }
 
@@ -90,6 +91,10 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         result.push(CrashSuggestion {
             title,
             body: clean_html(&body),
+            permit_help: signature
+                .get("permitHelp")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             actions,
         });
 

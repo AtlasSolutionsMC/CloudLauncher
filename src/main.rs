@@ -6552,6 +6552,13 @@ impl eframe::App for LauncherApp {
         if let Some(mut report) = self.crash_report.clone() {
             let mut open = true;
             let mut selected_action = None;
+            let mut request_crash_help = false;
+            let mut open_crash_logs = false;
+            let mut dismiss_crash = false;
+            let permit_help = report
+                .suggestions
+                .first()
+                .is_none_or(|suggestion| suggestion.permit_help);
             egui::Window::new(tr("rust.ui.window.crash"))
                 .open(&mut open)
                 .default_size([660.0, 520.0])
@@ -6606,9 +6613,33 @@ impl eframe::App for LauncherApp {
                                     .interactive(false),
                             );
                         });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if permit_help && ui.button(tr("crash.buttons.support")).clicked() {
+                            request_crash_help = true;
+                        }
+                        if ui.button(tr("crash.buttons.logs")).clicked() {
+                            open_crash_logs = true;
+                        }
+                        if ui.button(tr("crash.buttons.exit")).clicked() {
+                            dismiss_crash = true;
+                        }
+                    });
                 });
-            if !open {
+            if !open || dismiss_crash {
                 self.crash_report = None;
+            }
+            if request_crash_help {
+                self.show_diagnostic_consent = true;
+                self.diagnostic_send_enabled = true;
+                self.diagnostic_error = None;
+            }
+            if open_crash_logs {
+                if let Some(path) = report.path.as_ref().filter(|path| path.is_file()) {
+                    open_path(path);
+                } else {
+                    self.show_log_window = true;
+                }
             }
             if let Some(action) = selected_action {
                 match action {
@@ -8289,6 +8320,7 @@ fn collect_crash_report(
             .map(|body| crash::CrashSuggestion {
                 title: tr("rust.ui.crash.fallback-title").to_owned(),
                 body,
+                permit_help: true,
                 actions: Vec::new(),
             })
             .collect();
