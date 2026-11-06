@@ -4463,15 +4463,20 @@ impl eframe::App for LauncherApp {
                         if !self.settings.settings_blocked {
                             let folder = icon_button(ui, "folder", &folder_icon, folder_icon_tint);
                             if folder.clicked() {
-                                let opening = !self.show_folder_menu;
-                                self.show_folder_menu = opening;
-                                if opening {
-                                    self.show_support_menu = false;
-                                    self.show_settings_menu = false;
-                                    toolbar_popup_opened_this_frame = true;
+                                if self.version_is_installed() {
+                                    let opening = !self.show_folder_menu;
+                                    self.show_folder_menu = opening;
+                                    if opening {
+                                        self.show_support_menu = false;
+                                        self.show_settings_menu = false;
+                                        toolbar_popup_opened_this_frame = true;
+                                    }
+                                    self.folder_menu_pos =
+                                        folder.rect.left_bottom() + Vec2::new(0.0, 1.0);
+                                } else {
+                                    self.show_folder_menu = false;
+                                    open_path(&self.game_dir_path());
                                 }
-                                self.folder_menu_pos =
-                                    folder.rect.left_bottom() + Vec2::new(0.0, 1.0);
                             }
                             folder.on_hover_text(tr("loginform.button.folder"));
                         }
@@ -4565,7 +4570,8 @@ impl eframe::App for LauncherApp {
                                 self.show_folder_menu = false;
                             }
                         }
-                        if self.settings.loader_type != "none"
+                        let version_id = self.settings.selected_version.to_ascii_lowercase();
+                        if (version_id.contains("forge") || version_id.contains("fabric"))
                             && ui.button(tr("loginform.button.folder.mods")).clicked()
                         {
                             let mods = self
@@ -4584,16 +4590,8 @@ impl eframe::App for LauncherApp {
                             }
                             self.show_folder_menu = false;
                         }
-                        if ui.button(tr("loginform.button.folder.logs")).clicked() {
-                            self.selected_log_path = None;
-                            self.show_log_window = true;
-                            self.show_folder_menu = false;
-                        }
                         if ui.button(tr("loginform.button.folder.root")).clicked() {
                             open_path(&self.game_dir_path());
-                            self.show_folder_menu = false;
-                        }
-                        if ui.small_button(tr("support.button.close")).clicked() {
                             self.show_folder_menu = false;
                         }
                     });
