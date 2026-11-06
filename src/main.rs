@@ -5591,15 +5591,16 @@ impl eframe::App for LauncherApp {
                                 let age = SystemTime::now()
                                     .duration_since(*modified)
                                     .unwrap_or_default();
-                                let age_label = if age.as_secs() < 60 {
-                                    format!("{}s ago", age.as_secs())
+                                let (age_key, age_value) = if age.as_secs() < 60 {
+                                    ("rust.ui.logs.age.seconds", age.as_secs())
                                 } else if age.as_secs() < 3_600 {
-                                    format!("{}m ago", age.as_secs() / 60)
+                                    ("rust.ui.logs.age.minutes", age.as_secs() / 60)
                                 } else if age.as_secs() < 86_400 {
-                                    format!("{}h ago", age.as_secs() / 3_600)
+                                    ("rust.ui.logs.age.hours", age.as_secs() / 3_600)
                                 } else {
-                                    format!("{}d ago", age.as_secs() / 86_400)
+                                    ("rust.ui.logs.age.days", age.as_secs() / 86_400)
                                 };
+                                let age_label = tr(age_key).replace("%0", &age_value.to_string());
                                 let label = format!(
                                     "{}  ·  {age_label}",
                                     path.file_name()
