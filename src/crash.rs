@@ -45,7 +45,7 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
     if !root.is_object() {
         return Vec::new();
     }
-    let variables = root.get("variables").and_then(Value::as_object);
+    let variables = runtime_variables(&root);
     let buttons = root.get("buttons").and_then(Value::as_array);
     let mut result = Vec::new();
     let version_context = format!("{version_id}-{loader}");
@@ -66,7 +66,7 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         let Some(pattern) = signature.get("pattern").and_then(Value::as_str) else {
             continue;
         };
-        let pattern = expand_vars(pattern, variables);
+        let pattern = expand_vars(pattern, Some(&variables));
         let Ok(pattern) = Regex::new(&format!("^(?:{pattern})$")) else {
             // Java's signature database occasionally uses syntax unsupported by Rust's
             // regex engine. Ignore just that rule and retain the rest of the catalog.
@@ -77,7 +77,7 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         }
 
         if let Some(version_pattern) = signature.get("version").and_then(Value::as_str) {
-            let version_pattern = expand_vars(version_pattern, variables);
+            let version_pattern = expand_vars(version_pattern, Some(&variables));
             let Ok(version_pattern) = Regex::new(&format!("^(?:{version_pattern})$")) else {
                 continue;
             };
@@ -86,20 +86,20 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
             }
         }
 
-        let title = localized(signature.get("title"), variables).unwrap_or_else(|| {
+        let title = localized(signature.get("title"), Some(&variables)).unwrap_or_else(|| {
             signature
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or(crate::tr("rust.crash.issue.known"))
                 .replace('-', " ")
         });
-        let body = localized(signature.get("body"), variables).unwrap_or_default();
+        let body = localized(signature.get("body"), Some(&variables)).unwrap_or_default();
         let actions = signature
             .get("buttons")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|button| resolve_button(button, buttons, variables))
+            .filter_map(|button| resolve_button(button, buttons, Some(&variables)))
             .collect();
         result.push(CrashSuggestion {
             title,
@@ -117,6 +117,31 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         }
     }
     result
+}
+
+fn runtime_variables(root: &Value) -> serde_json::Map<String, Value> {
+    let mut variables = serde_json::Map::new();
+    let os = match std::env::consts::OS {
+        "windows" => "WINDOWS",
+        "linux" => "LINUX",
+        "macos" => "OSX",
+        _ => "UNKNOWN",
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" | "i686" => "x86",
+        "aarch64" => "arm64",
+        _ => std::env::consts::ARCH,
+    };
+    variables.insert("os".to_owned(), Value::String(os.to_owned()));
+    variables.insert("arch".to_owned(), Value::String(arch.to_owned()));
+    variables.insert("locale".to_owned(), Value::String("en_US".to_owned()));
+    if let Some(source_variables) = root.get("variables").and_then(Value::as_object) {
+        for (key, value) in source_variables {
+            variables.insert(key.clone(), value.clone());
+        }
+    }
+    variables
 }
 
 /// Fetch the source launcher’s external crash rules and use them only when

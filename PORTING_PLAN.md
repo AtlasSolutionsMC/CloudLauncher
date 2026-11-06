@@ -123,7 +123,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Preserve the source `minecraft.crash` preference, including legacy import, and skip crash scanning when disabled.
 - [x] Preserve the source `gui.logger.fullcommand` opt-in and only include the sanitized launch command in logs when enabled.
 - [x] Port the bundled US English crash signatures, richer explanations, and supported suggested-fix actions.
-- [x] Fetch the source crash-signature catalog from ExtraVersionList repositories, decode marked gzip/bzip2 payloads, validate its structure, and replace bundled rules only when the remote revision is newer.
+- [x] Fetch the source crash-signature catalog from ExtraVersionList repositories, decode marked gzip/bzip2 payloads, validate its structure, expand source `os`/`arch`/`locale` variables, and replace bundled rules only when the remote revision is newer.
 - [x] Add normal log browsing, preview/copy, and log/game-folder actions in the launcher UI.
 - [x] Fetch and show personal US English notices, including persisted one-week hiding and supported URL/scene/promoted-server actions.
 - [x] Render optional personal-feed notice banners and merge available notice server actions into the in-game list.
