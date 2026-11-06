@@ -6,7 +6,7 @@ use std::time::Duration;
 
 const VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
-const EXTRA_VERSION_REPOS: &[&str] = &[
+const DEFAULT_EXTRA_VERSION_REPOS: &[&str] = &[
     "https://repo.llaun.ch/",
     "https://repo.legacylauncher.ru/",
     "https://repo.legacylauncherservices.com/",
@@ -30,7 +30,10 @@ struct ExtraVersionEntry {
     release_time: String,
 }
 
-pub async fn fetch_manifest() -> Result<MojangVersionManifest, String> {
+pub async fn fetch_manifest(
+    configured_repositories: &[String],
+) -> Result<MojangVersionManifest, String> {
+    let extra_repositories = extra_version_repositories(configured_repositories);
     let client = crate::http::client_builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -52,7 +55,7 @@ pub async fn fetch_manifest() -> Result<MojangVersionManifest, String> {
         .map_err(|error| crate::tr("rust.error.catalog.parse").replace("%0", &error.to_string()))?;
 
     let mut extra_entries = Vec::new();
-    for base in EXTRA_VERSION_REPOS {
+    for base in &extra_repositories {
         let url = format!("{base}versions/versions.json");
         let Ok(response) = client
             .get(&url)
@@ -112,6 +115,7 @@ fn valid_version_id(value: &str) -> bool {
 pub async fn fetch_required_java_major(
     version_id: &str,
     manifest: &MojangVersionManifest,
+    configured_repositories: &[String],
 ) -> Result<Option<u32>, String> {
     let version = manifest
         .versions
@@ -124,12 +128,13 @@ pub async fn fetch_required_java_major(
         .map_err(|error| {
             crate::tr("rust.error.catalog.java-check-client").replace("%0", &error.to_string())
         })?;
-    let metadata = if let Some(path) = EXTRA_VERSION_REPOS
+    let extra_repositories = extra_version_repositories(configured_repositories);
+    let metadata = if let Some(path) = extra_repositories
         .iter()
         .find_map(|base| version.url.strip_prefix(base))
     {
         let mut metadata = None;
-        for base in EXTRA_VERSION_REPOS {
+        for base in &extra_repositories {
             let url = format!("{base}{path}");
             let Ok(response) = client
                 .get(&url)
@@ -178,4 +183,25 @@ pub async fn fetch_required_java_major(
         .pointer("/javaVersion/majorVersion")
         .and_then(Value::as_u64)
         .and_then(|major| u32::try_from(major).ok()))
+}
+
+fn extra_version_repositories(configured_repositories: &[String]) -> Vec<String> {
+    let mut repositories = Vec::new();
+    for repository in configured_repositories
+        .iter()
+        .map(String::as_str)
+        .chain(DEFAULT_EXTRA_VERSION_REPOS.iter().copied())
+    {
+        let mut base = repository.trim().to_owned();
+        if base.is_empty() {
+            continue;
+        }
+        if !base.ends_with('/') {
+            base.push('/');
+        }
+        if !repositories.contains(&base) {
+            repositories.push(base);
+        }
+    }
+    repositories
 }

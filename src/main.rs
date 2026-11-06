@@ -646,6 +646,7 @@ struct LauncherApp {
     command_line_overrides: CommandLineOverrides,
     persisted_settings: SavedSettings,
     external_settings_file: Option<ExternalSettingsFile>,
+    extra_version_repositories: Vec<String>,
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
     version_catalog_loading: bool,
@@ -885,13 +886,14 @@ impl LauncherApp {
             command_line_overrides,
             persisted_settings,
             external_settings_file,
+            extra_version_repositories: Vec::new(),
             require_minecraft_account,
             show_first_run_notice: first_run_pending,
             show_first_run_folder_notice,
             first_run_folder_current_directory,
             first_run_folder_path,
             show_arm_compat_notice,
-            version_catalog_events: Some(spawn_catalog_fetch()),
+            version_catalog_events: Some(spawn_catalog_fetch(Vec::new())),
             version_catalog_loading: true,
             show_log_window: show_global_logger,
             show_live_launcher_log: show_global_logger,
@@ -1315,7 +1317,12 @@ impl LauncherApp {
         if self.version_catalog_loading {
             return;
         }
-        self.version_catalog_events = Some(spawn_catalog_fetch());
+        self.start_version_catalog_fetch();
+    }
+
+    fn start_version_catalog_fetch(&mut self) {
+        self.version_catalog_events =
+            Some(spawn_catalog_fetch(self.extra_version_repositories.clone()));
         self.version_catalog_loading = true;
         self.set_logged_status(
             LogLevel::Info,
@@ -2432,6 +2439,7 @@ impl LauncherApp {
         let crash_version = version.clone();
         let crash_loader = format!("{}-{}", preferences.loader_type, preferences.loader_build);
         let version_manifest = self.version_manifest.clone();
+        let extra_version_repositories = self.extra_version_repositories.clone();
         let memory_release_time = self.version_release_time(&version);
         let game_log = self.game_log.clone();
         let launcher_log = self.launcher_log.clone();
@@ -2614,6 +2622,7 @@ impl LauncherApp {
                             &game_dir,
                             &version,
                             version_manifest.as_ref(),
+                            &extra_version_repositories,
                         ) => {
                             Some(result)
                         }
@@ -2659,6 +2668,7 @@ impl LauncherApp {
                         &version,
                         &preferences,
                         version_manifest.as_ref(),
+                        &extra_version_repositories,
                     )
                     .await
                 } else {
@@ -3519,6 +3529,14 @@ impl eframe::App for LauncherApp {
                     self.notices_disable_allowed =
                         configuration.allows_notice_disable(&self.settings.client_id);
                     self.allow_ely_everywhere = configuration.allow_ely_everywhere;
+                    if !configuration.extra_version_repositories.is_empty()
+                        && self.extra_version_repositories
+                            != configuration.extra_version_repositories
+                    {
+                        self.extra_version_repositories =
+                            configuration.extra_version_repositories.clone();
+                        self.start_version_catalog_fetch();
+                    }
                     if !self.notices_disable_allowed {
                         self.settings.notices_enabled = true;
                         if !notices_were_enabled {
@@ -7382,7 +7400,9 @@ impl eframe::App for LauncherApp {
     }
 }
 
-fn spawn_catalog_fetch() -> Receiver<Result<MojangVersionManifest, String>> {
+fn spawn_catalog_fetch(
+    repositories: Vec<String>,
+) -> Receiver<Result<MojangVersionManifest, String>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let result = tokio::runtime::Builder::new_multi_thread()
@@ -7391,7 +7411,7 @@ fn spawn_catalog_fetch() -> Receiver<Result<MojangVersionManifest, String>> {
             .map_err(|error| tr("rust.error.runtime.catalog").replace("%0", &error.to_string()))
             .and_then(|runtime| {
                 runtime
-                    .block_on(catalog::fetch_manifest())
+                    .block_on(catalog::fetch_manifest(&repositories))
                     .map_err(|error| error)
             });
         let _ = sender.send(result);
@@ -11673,6 +11693,7 @@ async fn verify_java_compatibility(
     game_dir: &std::path::Path,
     version_id: &str,
     version_manifest: Option<&MojangVersionManifest>,
+    extra_version_repositories: &[String],
 ) -> Result<String, String> {
     let path = java_path.to_owned();
     let (major, version_text) = tokio::task::spawn_blocking(move || inspect_java(&path))
@@ -11684,10 +11705,12 @@ async fn verify_java_compatibility(
     let required_major = match required_major {
         Some(required) => Some(required),
         None => match version_manifest {
-            Some(manifest) => catalog::fetch_required_java_major(version_id, manifest)
-                .await
-                .ok()
-                .flatten(),
+            Some(manifest) => {
+                catalog::fetch_required_java_major(version_id, manifest, extra_version_repositories)
+                    .await
+                    .ok()
+                    .flatten()
+            }
             None => None,
         },
     };
@@ -11714,16 +11737,19 @@ async fn selected_java_major_for_experiments(
     version_id: &str,
     preferences: &SavedSettings,
     version_manifest: Option<&MojangVersionManifest>,
+    extra_version_repositories: &[String],
 ) -> Option<u32> {
     if preferences.java_mode == "recommended" {
         if let Some(major) = local_required_java_major(game_dir, version_id) {
             return Some(major);
         }
         return match version_manifest {
-            Some(manifest) => catalog::fetch_required_java_major(version_id, manifest)
-                .await
-                .ok()
-                .flatten(),
+            Some(manifest) => {
+                catalog::fetch_required_java_major(version_id, manifest, extra_version_repositories)
+                    .await
+                    .ok()
+                    .flatten()
+            }
             None => None,
         };
     }

@@ -10,7 +10,7 @@ use rsa::{
 use serde_json::{Map, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::{collections::HashSet, io::Read};
 
 const MAX_COMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
@@ -25,6 +25,7 @@ pub struct Configuration {
     pub feedback_url: Option<String>,
     allow_notice_disable_modulo: u32,
     pub allow_ely_everywhere: bool,
+    pub extra_version_repositories: Vec<String>,
 }
 
 impl Configuration {
@@ -203,6 +204,18 @@ async fn parse_configuration(
         .get("ely")
         .and_then(Value::as_bool)
         .unwrap_or_default();
+    let mut seen_repositories = HashSet::new();
+    configuration.extra_version_repositories = options
+        .get("repositories")
+        .and_then(Value::as_object)
+        .and_then(|repositories| repositories.get("extra_version_repo"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(safe_repository_base)
+        .filter(|repository| seen_repositories.insert(repository.clone()))
+        .collect();
     if let Some(notices) = options
         .get("notices")
         .and_then(Value::as_object)
@@ -284,4 +297,21 @@ async fn parse_configuration(
             .and_then(notices::safe_http_url);
     }
     Ok(configuration)
+}
+
+fn safe_repository_base(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Some(url.to_string())
 }
