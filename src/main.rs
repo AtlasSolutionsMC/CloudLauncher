@@ -3529,6 +3529,10 @@ impl eframe::App for LauncherApp {
                     minecraft_java_rs_core::net::client::set_repository_overrides(
                         configuration.repositories.clone(),
                     );
+                    spawn_crash_signature_fetch(
+                        configuration.extra_version_repositories.clone(),
+                        Arc::clone(&self.launcher_log),
+                    );
                     self.notices_disable_allowed =
                         configuration.allows_notice_disable(&self.settings.client_id);
                     self.allow_ely_everywhere = configuration.allow_ely_everywhere;
@@ -7482,6 +7486,43 @@ fn spawn_bootstrap_fetch() -> Receiver<Result<bootstrap::Configuration, String>>
         let _ = sender.send(result);
     });
     receiver
+}
+
+fn spawn_crash_signature_fetch(
+    repositories: Vec<String>,
+    launcher_log: Arc<Mutex<VecDeque<LogRecord>>>,
+) {
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                tr("rust.error.runtime.crash-signatures").replace("%0", &error.to_string())
+            })
+            .and_then(|runtime| {
+                runtime.block_on(crash::refresh_external_signatures(&repositories))
+            });
+        match result {
+            Ok(Some(revision)) => record_launcher_log_event(
+                &launcher_log,
+                LogLevel::Info,
+                LogTarget::Crash,
+                &tr("rust.log.crash.signatures.updated").replace("%0", &revision.to_string()),
+            ),
+            Ok(None) => record_launcher_log_event(
+                &launcher_log,
+                LogLevel::Debug,
+                LogTarget::Crash,
+                &tr("rust.log.crash.signatures.current"),
+            ),
+            Err(error) => record_launcher_log_event(
+                &launcher_log,
+                LogLevel::Debug,
+                LogTarget::Crash,
+                &tr("rust.log.crash.signatures.failed").replace("%0", &error),
+            ),
+        }
+    });
 }
 
 fn spawn_diagnostic_upload(report: String) -> Receiver<Result<String, String>> {
