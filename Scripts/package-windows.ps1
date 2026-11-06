@@ -1,15 +1,21 @@
+param([string]$SourceExe)
+
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$sourceExe = Join-Path $projectRoot 'target\x86_64-pc-windows-gnu\release\legacylauncher-rust.exe'
-if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
-    throw "Release executable was not found at $sourceExe. Run Scripts\build-windows.ps1 first."
+if ([string]::IsNullOrWhiteSpace($SourceExe)) {
+    $SourceExe = Join-Path $projectRoot 'target\x86_64-pc-windows-gnu\release\legacylauncher-rust.exe'
+} else {
+    $SourceExe = (Resolve-Path -LiteralPath $SourceExe -ErrorAction Stop).Path
+}
+if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
+    throw "Release executable was not found at $SourceExe. Run Scripts\build-windows.ps1 or pass the built executable path."
 }
 
 $stage = Join-Path $projectRoot 'dist\LegacyLauncher-Rust'
 $archive = Join-Path $projectRoot 'dist\LegacyLauncher-Rust-portable.zip'
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
-Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $stage 'LegacyLauncher-Rust.exe') -Force
+Copy-Item -LiteralPath $SourceExe -Destination (Join-Path $stage 'LegacyLauncher-Rust.exe') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $stage -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'PORTING_PLAN.md') -Destination $stage -Force
 

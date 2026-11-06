@@ -2872,14 +2872,27 @@ impl LauncherApp {
                         };
                         match wait_result {
                             Some(Ok(status)) => {
-                                let code = status.code().unwrap_or(-1);
+                                let code = process_exit_code(&status);
                                 if crash_detection_enabled && !status.success() {
+                                    let crash_runtime = match launcher.game_data() {
+                                        Some(game_data) => {
+                                            let java_path = game_data.minecraft_java.path.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                crash::collect_runtime_info(&java_path)
+                                            })
+                                            .await
+                                            .unwrap_or_default()
+                                        }
+                                        None => crash::CrashRuntimeInfo::default(),
+                                    };
                                     if let Some(report) = collect_crash_report(
                                         &crash_game_dir,
                                         &game_log,
                                         launch_started,
                                         &crash_version,
                                         &crash_loader,
+                                        code,
+                                        &crash_runtime,
                                     ) {
                                         if let Ok(mut pending) = pending_crash_report.lock() {
                                             *pending = Some(report);
@@ -8780,6 +8793,8 @@ fn collect_crash_report(
     launch_started: SystemTime,
     version: &str,
     loader: &str,
+    exit_code: i32,
+    runtime: &crash::CrashRuntimeInfo,
 ) -> Option<CrashReport> {
     let cutoff = launch_started
         .checked_sub(Duration::from_secs(3))
@@ -8796,7 +8811,7 @@ fn collect_crash_report(
     if log.trim().is_empty() {
         return None;
     }
-    let mut suggestions = crash::diagnose(&log, version, loader);
+    let mut suggestions = crash::diagnose(&log, version, loader, exit_code, runtime);
     if suggestions.is_empty() {
         suggestions = diagnose_crash_fallback(&log)
             .into_iter()
@@ -8844,6 +8859,21 @@ fn newest_recent_log(
         })
         .max_by_key(|(_, modified)| *modified)
         .map(|(path, _)| path)
+}
+
+fn process_exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        return status.signal().map(|signal| 128 + signal).unwrap_or(-1);
+    }
+    #[cfg(not(unix))]
+    {
+        -1
+    }
 }
 
 fn list_managed_java_runtimes(root: &std::path::Path) -> Vec<PathBuf> {

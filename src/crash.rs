@@ -3,7 +3,9 @@ use flate2::read::GzDecoder;
 use regex::Regex;
 use serde_json::Value;
 use std::io::Read;
+use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 const SIGNATURES: &str = include_str!("../assets/crash/signature.json");
 const MAX_SIGNATURE_BYTES: usize = 16 * 1024 * 1024;
@@ -29,6 +31,14 @@ pub struct CrashSuggestionAction {
     pub kind: CrashActionKind,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CrashRuntimeInfo {
+    pub java_version: Option<String>,
+    pub java_is_32_bit: Option<bool>,
+    pub system_is_64_bit: bool,
+    pub graphics_cards: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum CrashActionKind {
     OpenUrl(String),
@@ -40,7 +50,13 @@ pub enum CrashActionKind {
     SetJvmArgument(String),
 }
 
-pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestion> {
+pub fn diagnose(
+    log: &str,
+    version_id: &str,
+    loader: &str,
+    exit_code: i32,
+    runtime: &CrashRuntimeInfo,
+) -> Vec<CrashSuggestion> {
     let root = current_signature_catalog();
     if !root.is_object() {
         return Vec::new();
@@ -63,6 +79,60 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         {
             continue;
         }
+
+        if let Some(signature_exit_code) = signature.get("exitCode").and_then(Value::as_i64)
+            && signature_exit_code != 0
+            && signature_exit_code != i64::from(exit_code)
+        {
+            continue;
+        }
+
+        if let Some(operating_systems) = signature.get("os").and_then(Value::as_array)
+            && !operating_systems.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|entry| entry.eq_ignore_ascii_case(current_os_name()))
+            })
+        {
+            continue;
+        }
+
+        if let Some(java_pattern) = signature.get("jre").and_then(Value::as_str) {
+            let Some(java_version) = runtime.java_version.as_deref() else {
+                continue;
+            };
+            let java_pattern = expand_vars(java_pattern, Some(&variables));
+            let Ok(java_pattern) = Regex::new(&format!("^(?:{java_pattern})$")) else {
+                continue;
+            };
+            if !java_pattern.is_match(java_version) {
+                continue;
+            }
+        }
+
+        if let Some(graphics_card_pattern) = signature.get("graphicsCard").and_then(Value::as_str) {
+            let graphics_card_pattern = expand_vars(graphics_card_pattern, Some(&variables));
+            let Ok(graphics_card_pattern) = Regex::new(&format!("^(?:{graphics_card_pattern})$"))
+            else {
+                continue;
+            };
+            if runtime.graphics_cards.is_empty()
+                || !runtime
+                    .graphics_cards
+                    .iter()
+                    .any(|card| graphics_card_pattern.is_match(card))
+            {
+                continue;
+            }
+        } else if signature
+            .get("archIssue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && !(runtime.java_is_32_bit == Some(true) && runtime.system_is_64_bit)
+        {
+            continue;
+        }
+
         let Some(pattern) = signature.get("pattern").and_then(Value::as_str) else {
             continue;
         };
@@ -81,7 +151,8 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
             let Ok(version_pattern) = Regex::new(&format!("^(?:{version_pattern})$")) else {
                 continue;
             };
-            if !version_pattern.is_match(&version_context) {
+            if !version_pattern.is_match(version_id) && !version_pattern.is_match(&version_context)
+            {
                 continue;
             }
         }
@@ -117,6 +188,181 @@ pub fn diagnose(log: &str, version_id: &str, loader: &str) -> Vec<CrashSuggestio
         }
     }
     result
+}
+
+/// Probe the Java executable selected by the completed Minecraft installation.
+/// The source launcher evaluates these values from inside the game JVM; this
+/// bounded subprocess probe supplies equivalent values before showing crash help.
+pub fn collect_runtime_info(java_path: &str) -> CrashRuntimeInfo {
+    let root = current_signature_catalog();
+    let signatures = root.get("signatures").and_then(Value::as_array);
+    let needs_java = signatures.into_iter().flatten().any(|signature| {
+        signature.get("jre").is_some()
+            || signature
+                .get("archIssue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    });
+    let needs_graphics = signatures.into_iter().flatten().any(|signature| {
+        signature
+            .get("graphicsCard")
+            .and_then(Value::as_str)
+            .is_some()
+    });
+
+    let (java_version, java_is_32_bit) = if needs_java {
+        probe_java(java_path)
+    } else {
+        (None, None)
+    };
+    CrashRuntimeInfo {
+        java_version,
+        java_is_32_bit,
+        system_is_64_bit: system_is_64_bit(),
+        graphics_cards: if needs_graphics {
+            installed_graphics_cards()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn current_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "windows",
+        "linux" => "linux",
+        "macos" => "osx",
+        _ => "unknown",
+    }
+}
+
+fn system_is_64_bit() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return ["PROCESSOR_ARCHITEW6432", "PROCESSOR_ARCHITECTURE"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .any(|architecture| {
+                matches!(
+                    architecture.to_ascii_lowercase().as_str(),
+                    "amd64" | "ia64" | "arm64"
+                )
+            })
+            || cfg!(target_pointer_width = "64");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cfg!(target_pointer_width = "64")
+    }
+}
+
+fn probe_java(java_path: &str) -> (Option<String>, Option<bool>) {
+    let path = std::path::Path::new(java_path);
+    let mut candidates = Vec::new();
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("javaw.exe"))
+    {
+        candidates.push(path.with_file_name("java.exe"));
+    }
+    candidates.push(path.to_path_buf());
+
+    for candidate in candidates.into_iter().filter(|path| path.is_file()) {
+        let mut command = Command::new(candidate);
+        command
+            .arg("-XshowSettings:properties")
+            .arg("-version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let Some(output) = command_output_with_timeout(command, Duration::from_secs(8)) else {
+            continue;
+        };
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let java_version =
+            property_value(&text, "java.version").or_else(|| java_version_from_banner(&text));
+        let java_is_32_bit = property_value(&text, "sun.arch.data.model")
+            .and_then(|value| match value.as_str() {
+                "32" => Some(true),
+                "64" => Some(false),
+                _ => None,
+            })
+            .or_else(|| {
+                let lower = text.to_ascii_lowercase();
+                if lower.contains("32-bit") {
+                    Some(true)
+                } else if lower.contains("64-bit") {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+        return (java_version, java_is_32_bit);
+    }
+    (None, None)
+}
+
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+    let mut child = command.spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn property_value(output: &str, property: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        name.trim().eq(property).then(|| value.trim().to_owned())
+    })
+}
+
+fn java_version_from_banner(output: &str) -> Option<String> {
+    let marker = "version \"";
+    let start = output.find(marker)? + marker.len();
+    let rest = &output[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_owned())
+}
+
+fn installed_graphics_cards() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        const DISPLAY_CLASS: &str =
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+        let output = Command::new("reg.exe")
+            .args(["query", DISPLAY_CLASS, "/s", "/v", "DriverDesc"])
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        return text
+            .lines()
+            .filter_map(|line| {
+                let (_, value) = line.split_once("REG_SZ")?;
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            })
+            .collect();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
 }
 
 fn runtime_variables(root: &Value) -> serde_json::Map<String, Value> {
