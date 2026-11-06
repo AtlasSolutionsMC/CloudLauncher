@@ -1325,7 +1325,7 @@ impl LauncherApp {
             &self.launcher_log,
             LogLevel::Info,
             LogTarget::Update,
-            "Downloading a verified launcher update.",
+            &tr("rust.log.update.download"),
         );
     }
 
@@ -1351,7 +1351,7 @@ impl LauncherApp {
             &self.launcher_log,
             LogLevel::Info,
             LogTarget::Notices,
-            "Refreshing the US notice feed.",
+            &tr("rust.log.notices.refresh"),
         );
     }
 
@@ -1461,7 +1461,7 @@ impl LauncherApp {
             &self.launcher_log,
             LogLevel::Info,
             LogTarget::Diagnostics,
-            "Sending a diagnostic report after user consent.",
+            &tr("rust.log.diagnostics.uploading"),
         );
     }
 
@@ -3513,7 +3513,7 @@ impl eframe::App for LauncherApp {
                         &self.launcher_log,
                         LogLevel::Info,
                         LogTarget::Bootstrap,
-                        "Loaded and verified signed bootstrap configuration.",
+                        &tr("rust.log.bootstrap.loaded"),
                     );
                 }
                 Err(error) => {
@@ -3543,7 +3543,7 @@ impl eframe::App for LauncherApp {
                         &self.launcher_log,
                         LogLevel::Info,
                         LogTarget::Notices,
-                        &format!("Loaded {} US notice(s).", notices.len()),
+                        &tr("rust.log.notices.loaded").replace("%0", &notices.len().to_string()),
                     );
                     self.personal_notice_list = notices;
                     self.notice_error = None;
@@ -3576,7 +3576,7 @@ impl eframe::App for LauncherApp {
                         &self.launcher_log,
                         LogLevel::Info,
                         LogTarget::Diagnostics,
-                        "Diagnostic report upload completed.",
+                        &tr("rust.log.diagnostics.uploaded"),
                     );
                     self.diagnostic_result_url = Some(url);
                     self.diagnostic_error = None;

@@ -19,6 +19,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostics with Windows, model, language, DirectX, CPU/memory, and graphics provider/driver details.
 - Source crash-analysis and full-command logging preferences, with legacy settings migration.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
+- Update, bootstrap, notice, and diagnostic lifecycle log messages are loaded from the US locale, including the dynamic loaded-notice count.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.
 - Legacy `gui.font.old` migration with the source revert/dismiss prompt; restoring the earlier size applies live in Rust.
 - Source command-line configuration for an external Java properties or Rust JSON settings file, including the source schema-version gate; version, directory, Java, arguments, window, background, fullscreen, theme, runtime root, delayed auto-launch, username/type account selection, and help/debug startup behavior.
