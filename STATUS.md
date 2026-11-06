@@ -14,7 +14,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Optional `--requireMinecraftAccount` account-add gate with the source US warning and Mojang-import exception.
 - Minecraft version catalog and lifecycle, custom inherited versions, Java runtime management, Forge/NeoForge/Fabric/LegacyFabric/Quilt launch paths, and source Forge mod-pack argument compatibility.
 - Pre-launch Fractureiser signature scan of nested mods JARs, matching the Java detector's three bytecode signatures; migrate and persist scan version, offer long-scan continue/skip, and stop launch with a detection dialog when infected.
-- Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostic upload with Windows/CPU/memory/GPU details.
+- Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostics with Windows, model, language, DirectX, CPU/memory, and graphics provider/driver details.
 - Source crash-analysis and full-command logging preferences, with legacy settings migration.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.

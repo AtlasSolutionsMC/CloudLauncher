@@ -27,7 +27,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Port startup connectivity checks and the source-style warning window for Mojang metadata, Legacy Launcher repositories, bootstrap hosts, and Ely.by.
 - [ ] Port the remaining scene and dialog flows found under `launcher/src/main/java/net/legacylauncher/ui`.
 - [x] Add opt-in diagnostic upload, success link actions, sensitive-line filtering, and a local-save fallback using the source Pasta endpoint.
-- [x] Include Windows version/build, processor, memory, and graphics adapter/driver details in the opt-in diagnostic report without collecting hardware serial numbers or device IDs.
+- [x] Include Windows version/build, system manufacturer/model, language, DirectX registry version, processor, memory, and graphics provider/driver/date details in the opt-in diagnostic report without collecting hardware serial numbers or device IDs.
 - [x] Move version filters, notices/account controls, and launch/download event labels into the US locale resource; every literal `tr("key")` in Rust currently resolves to a US property.
 - [ ] Finish moving remaining backend/network and dynamic notice/crash error wording into the locale; Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server, import, background-image, and crash fallback errors are localized.
 - [ ] Load all visible strings from the US locale resource and match the source layout at common Windows scales.

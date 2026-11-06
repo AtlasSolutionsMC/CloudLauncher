@@ -22,6 +22,27 @@ fn windows_system_info() -> Vec<String> {
         lines.push("Operating system: Windows (version unavailable)".to_owned());
     }
 
+    if let Some(values) = query_registry_key(r"HKLM\HARDWARE\DESCRIPTION\System\BIOS") {
+        for (label, key) in [
+            ("System manufacturer", "SystemManufacturer"),
+            ("System model", "SystemProductName"),
+        ] {
+            if let Some(value) = values.get(key).filter(|value| !value.is_empty()) {
+                lines.push(format!("{label}: {value}"));
+            }
+        }
+    }
+    if let Some(values) = query_registry_key(r"HKCU\Control Panel\International")
+        && let Some(language) = values.get("LocaleName").filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Language: {language}"));
+    }
+    if let Some(values) = query_registry_key(r"HKLM\SOFTWARE\Microsoft\DirectX")
+        && let Some(version) = values.get("Version").filter(|value| !value.is_empty())
+    {
+        lines.push(format!("DirectX registry version: {version}"));
+    }
+
     if let Ok(processor) = std::env::var("PROCESSOR_IDENTIFIER") {
         let processor = processor.trim();
         if !processor.is_empty() {
@@ -54,17 +75,7 @@ fn windows_system_info() -> Vec<String> {
 
 #[cfg(windows)]
 fn query_windows_version() -> Option<String> {
-    let output = Command::new("reg.exe")
-        .args([
-            "query",
-            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let values = parse_registry_values(&String::from_utf8_lossy(&output.stdout));
+    let values = query_registry_key(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion")?;
     let product = values.get("ProductName")?;
     let display_version = values.get("DisplayVersion");
     let build = values.get("CurrentBuild");
@@ -79,6 +90,18 @@ fn query_windows_version() -> Option<String> {
         version.push_str(&format!(" (build {build})"));
     }
     Some(version)
+}
+
+#[cfg(windows)]
+fn query_registry_key(path: &str) -> Option<BTreeMap<String, String>> {
+    let output = Command::new("reg.exe")
+        .args(["query", path])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_registry_values(&String::from_utf8_lossy(&output.stdout)))
 }
 
 #[cfg(windows)]
@@ -97,7 +120,15 @@ fn display_adapters() -> Vec<String> {
 
     let text = String::from_utf8_lossy(&output.stdout);
     let mut current_key = String::new();
-    let mut values_by_key = BTreeMap::<String, (Option<String>, Option<String>)>::new();
+    let mut values_by_key = BTreeMap::<
+        String,
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >::new();
     for line in text.lines().map(str::trim) {
         if line.starts_with("HKEY_LOCAL_MACHINE\\") {
             current_key.clear();
@@ -112,17 +143,28 @@ fn display_adapters() -> Vec<String> {
         match name {
             "DriverDesc" if !value.is_empty() => entry.0 = Some(value),
             "DriverVersion" if !value.is_empty() => entry.1 = Some(value),
+            "ProviderName" if !value.is_empty() => entry.2 = Some(value),
+            "DriverDate" if !value.is_empty() => entry.3 = Some(value),
             _ => {}
         }
     }
 
     values_by_key
         .into_values()
-        .filter_map(|(description, driver)| {
+        .filter_map(|(description, driver, provider, date)| {
             let description = description?;
-            Some(match driver {
-                Some(driver) => format!("{description} (driver {driver})"),
-                None => description,
+            let details = [
+                provider.map(|value| format!("provider {value}")),
+                driver.map(|value| format!("driver {value}")),
+                date.map(|value| format!("driver date {value}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            Some(if details.is_empty() {
+                description
+            } else {
+                format!("{description} ({})", details.join(", "))
             })
         })
         .collect()
