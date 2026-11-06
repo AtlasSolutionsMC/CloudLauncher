@@ -56,7 +56,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Import and expose the source's nine login-form positions.
 - [x] Import `gui.font`, clamp it to the source's 12–18 pt range, and apply it as launcher-wide UI scaling with a live preferences control.
 - [x] Import `gui.font.old` and show the source's revert/dismiss font-size prompt, applying the restored value immediately with live Rust UI scaling.
-- [x] Port the source command-line game configuration options for version, game directory, Java path, arguments, resolution, background, fullscreen, theme, JRE root, and auto-launch; keep overrides out of persisted settings.
+- [x] Port the source command-line game configuration options for version, game directory, Java path, arguments, resolution, background, fullscreen, theme, JRE root, and auto-launch, plus `--username`/`--usertype` account selection.
 - [x] Import `gui.laf.v1.state` and the pre-FlatLaf `gui.systemlookandfeel` setting, then expose the source Off/System/Auto/Dark/Light modes as live system-aware UI themes.
 - [x] Import `gui.background` image paths and add a live background image picker/reset; video backgrounds remain unsupported.
 - [x] Import `gui.logger.width/height/x/y`, use them as the log viewer's initial geometry, and persist its size and position after moving/resizing.

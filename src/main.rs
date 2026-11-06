@@ -468,6 +468,8 @@ struct CommandLineOverrides {
     fullscreen: Option<bool>,
     theme_path: Option<String>,
     java_runtime_directory: Option<String>,
+    username: Option<String>,
+    user_type: Option<String>,
     launch_automatically: bool,
 }
 
@@ -504,6 +506,9 @@ impl CommandLineOverrides {
         }
         if let Some(value) = &self.java_runtime_directory {
             settings.java_runtime_directory.clone_from(value);
+        }
+        if let Some(username) = &self.username {
+            select_command_line_account(settings, username, self.user_type.as_deref());
         }
         if self.launch_automatically {
             settings.auto_login = true;
@@ -9809,6 +9814,8 @@ fn parse_command_line_overrides(arguments: &[String]) -> CommandLineOverrides {
             "fullscreen" => overrides.fullscreen = parse_legacy_bool(&value),
             "theme" => overrides.theme_path = Some(value),
             "jre-dir" => overrides.java_runtime_directory = Some(value),
+            "username" => overrides.username = Some(value),
+            "usertype" => overrides.user_type = Some(value),
             _ => {}
         }
     }
@@ -9826,6 +9833,78 @@ fn parse_command_line_overrides(arguments: &[String]) -> CommandLineOverrides {
         );
     }
     overrides
+}
+
+fn select_command_line_account(
+    settings: &mut SavedSettings,
+    username: &str,
+    user_type: Option<&str>,
+) {
+    let mut accounts = Vec::new();
+    for account in &settings.accounts {
+        let kind = if settings
+            .migrated_mojang_accounts
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(account))
+        {
+            "mojang"
+        } else {
+            "plain"
+        };
+        if account == username {
+            accounts.push((account.clone(), kind));
+        }
+    }
+    accounts.extend(
+        settings
+            .microsoft_accounts
+            .iter()
+            .filter(|account| account.username == username)
+            .map(|account| (account.id.clone(), "minecraft")),
+    );
+    accounts.extend(
+        settings
+            .ely_accounts
+            .iter()
+            .filter(|account| account.display_name == username)
+            .map(|account| (account.id.clone(), "ely")),
+    );
+    accounts.extend(
+        settings
+            .ely_legacy_accounts
+            .iter()
+            .filter(|account| account.display_name == username)
+            .map(|account| (account.id.clone(), "ely_legacy")),
+    );
+
+    match accounts.as_slice() {
+        [] if user_type.is_none_or(|kind| kind == "plain") => {
+            if username.trim().is_empty() {
+                return;
+            }
+            if !settings.accounts.iter().any(|account| account == username) {
+                settings.accounts.push(username.to_owned());
+            }
+            settings.selected_account = Some(username.to_owned());
+        }
+        [] => {}
+        [account] => settings.selected_account = Some(account.0.clone()),
+        matches => {
+            let matching = user_type
+                .map(|kind| {
+                    matches
+                        .iter()
+                        .filter(|(_, account_kind)| *account_kind == kind)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if matching.len() == 1 {
+                settings.selected_account = Some(matching[0].0.clone());
+            } else if user_type.is_none() {
+                settings.selected_account = Some(matches[0].0.clone());
+            }
+        }
+    }
 }
 
 fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
