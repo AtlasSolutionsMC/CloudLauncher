@@ -33,6 +33,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [ ] Load all visible strings from the US locale resource and match the source layout at common Windows scales.
 - [x] Wire the login toolbar to support, game-folder/mods-folder, catalog refresh, and settings actions.
 - [x] Port the source's nine login-form positions and migrate `gui.direction.loginform`.
+- [x] Show the source US autologin tip when the user enables automatic launch.
 - [ ] Match the original toolbar popup details and verify common Windows scales visually. The Rust menu now follows the source's Launcher, Versions, Accounts order and only shows Notices when the feed has entries; Rust-only About, Servers, and update actions moved into launcher preferences. Multi-scale visual verification remains open.
 
 ### 2. Accounts and authentication

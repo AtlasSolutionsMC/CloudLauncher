@@ -672,6 +672,7 @@ struct LauncherApp {
     force_update_confirmed_version: Option<String>,
     outdated_version_confirmation: Option<PendingVersionUpdateConfirmation>,
     version_update_prompt_bypassed: Option<String>,
+    show_autologin_tip: bool,
     auto_launch_pending: bool,
     auto_launch_deadline: Option<Instant>,
     launcher_window_state_seen: bool,
@@ -4387,7 +4388,9 @@ impl eframe::App for LauncherApp {
                         )
                         .changed()
                     {
-                        if !self.settings.auto_login {
+                        if self.settings.auto_login {
+                            self.show_autologin_tip = true;
+                        } else {
                             self.auto_launch_deadline = None;
                         }
                         self.persist();
@@ -7508,6 +7511,25 @@ impl eframe::App for LauncherApp {
                         }
                     }
                 }
+            }
+        }
+
+        if self.show_autologin_tip {
+            let mut close_tip = false;
+            egui::Modal::new(Id::unique("autologin_tip")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(tr("loginform.checkbox.autologin.tip.title"));
+                ui.add_space(6.0);
+                ui.label(tr("loginform.checkbox.autologin.tip"));
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("feedback.button.okay")).clicked() {
+                        close_tip = true;
+                    }
+                });
+            });
+            if close_tip {
+                self.show_autologin_tip = false;
             }
         }
 
