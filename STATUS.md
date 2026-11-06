@@ -21,6 +21,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - `connection.ssl` migration and live TLS certificate/hostname verification across launcher and Minecraft download HTTP clients; disabling it is explicit, off by default, and shows a warning.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
 - Update, bootstrap, notice, and diagnostic lifecycle log messages are loaded from the US locale, including the dynamic loaded-notice count.
+- Settings toolbar popup follows the source's Launcher, Versions, Accounts order and conditionally adds Notices; Rust-only About, Servers, and update actions are available from launcher preferences.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.
 - Legacy `gui.font.old` migration with the source revert/dismiss prompt; restoring the earlier size applies live in Rust.
 - Source command-line configuration for an external Java properties or Rust JSON settings file, including the source schema-version gate; version, directory, Java, arguments, window, background, fullscreen, theme, runtime root, delayed auto-launch, username/type account selection, and help/debug startup behavior.

@@ -4263,10 +4263,6 @@ impl eframe::App for LauncherApp {
                             self.settings_page = Some("Launcher & game preferences");
                             self.show_settings_menu = false;
                         }
-                        if ui.button(tr("settings.tab.about")).clicked() {
-                            self.settings_page = Some("About us");
-                            self.show_settings_menu = false;
-                        }
                         if ui.button(tr("loginform.button.settings.version")).clicked() {
                             self.settings_page = Some("Manage versions");
                             self.show_settings_menu = false;
@@ -4275,34 +4271,11 @@ impl eframe::App for LauncherApp {
                             self.settings_page = Some("Manage accounts");
                             self.show_settings_menu = false;
                         }
-                        if ui.button(tr("rust.settings.page.servers")).clicked() {
-                            self.settings_page = Some("Manage servers");
-                            self.server_list_root = None;
-                            self.show_settings_menu = false;
-                        }
-                        if ui
-                            .button("!")
-                            .on_hover_text(tr("loginform.button.settings.notices"))
-                            .clicked()
-                        {
-                            self.show_notices_window = true;
-                            self.show_settings_menu = false;
-                            if self.notice_list.is_empty() && !self.notices_loading {
-                                self.refresh_notices();
+                        if !self.notice_list.is_empty() {
+                            if ui.button(tr("loginform.button.settings.notices")).clicked() {
+                                self.show_notices_window = true;
+                                self.show_settings_menu = false;
                             }
-                        }
-                        ui.separator();
-                        let update_label = if self.update_checking {
-                            tr("update.checking")
-                        } else {
-                            tr("update.check.button")
-                        };
-                        if ui
-                            .add_enabled(!self.update_checking, egui::Button::new(update_label))
-                            .clicked()
-                        {
-                            self.start_update_check();
-                            self.show_settings_menu = false;
                         }
                     });
                 });
@@ -5566,6 +5539,29 @@ impl eframe::App for LauncherApp {
                     }
                     "Launcher & game preferences" => {
                         ui.label(tr("rust.settings.locale.english-us"));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.small_button(tr("settings.tab.about")).clicked() {
+                                self.settings_page = Some("About us");
+                            }
+                            if ui.small_button(tr("rust.settings.page.servers")).clicked() {
+                                self.settings_page = Some("Manage servers");
+                                self.server_list_root = None;
+                            }
+                            let update_label = if self.update_checking {
+                                tr("update.checking")
+                            } else {
+                                tr("update.check.button")
+                            };
+                            if ui
+                                .add_enabled(
+                                    !self.update_checking,
+                                    egui::Button::new(update_label).small(),
+                                )
+                                .clicked()
+                            {
+                                self.start_update_check();
+                            }
+                        });
                         ui.horizontal(|ui| {
                             ui.label(tr("settings.switch-to-beta.label"));
                             if ui
