@@ -60,6 +60,7 @@ struct SavedSettings {
     selected_version: String,
     auto_login: bool,
     auto_login_timeout_secs: u8,
+    settings_blocked: bool,
     feedback_acknowledged: bool,
     force_update: bool,
     beta_updates: bool,
@@ -391,6 +392,7 @@ impl Default for SavedSettings {
             selected_version: "26.3".to_owned(),
             auto_login: false,
             auto_login_timeout_secs: 3,
+            settings_blocked: false,
             feedback_acknowledged: false,
             force_update: false,
             beta_updates: false,
@@ -3621,13 +3623,15 @@ impl eframe::App for LauncherApp {
                             }
                             support.on_hover_text(tr("loginform.button.support"));
 
-                            let folder = icon_button(ui, "folder", &folder_icon);
-                            if folder.clicked() {
-                                self.show_folder_menu = !self.show_folder_menu;
-                                self.folder_menu_pos =
-                                    folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
+                            if !self.settings.settings_blocked {
+                                let folder = icon_button(ui, "folder", &folder_icon);
+                                if folder.clicked() {
+                                    self.show_folder_menu = !self.show_folder_menu;
+                                    self.folder_menu_pos =
+                                        folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
+                                }
+                                folder.on_hover_text(tr("loginform.button.folder"));
                             }
-                            folder.on_hover_text(tr("loginform.button.folder"));
 
                             let refresh = icon_button(ui, "refresh", &refresh_icon);
                             if refresh.clicked() {
@@ -3642,13 +3646,15 @@ impl eframe::App for LauncherApp {
                             }
                             refresh.on_hover_text(tr("loginform.button.refresh"));
 
-                            let settings = icon_button(ui, "settings", &settings_icon);
-                            if settings.clicked() {
-                                self.show_settings_menu = !self.show_settings_menu;
-                                self.settings_menu_pos =
-                                    settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
+                            if !self.settings.settings_blocked {
+                                let settings = icon_button(ui, "settings", &settings_icon);
+                                if settings.clicked() {
+                                    self.show_settings_menu = !self.show_settings_menu;
+                                    self.settings_menu_pos =
+                                        settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
+                                }
+                                settings.on_hover_text(tr("loginform.button.settings"));
                             }
-                            settings.on_hover_text(tr("loginform.button.settings"));
                         });
                     });
             });
@@ -8944,6 +8950,13 @@ fn import_legacy_settings(
             settings.auto_login_timeout_secs = timeout;
         }
         apply("login.auto.timeout", timeout.map(|_| ()));
+    }
+    if let Some(value) = properties.get("gui.settings.blocked") {
+        let blocked = parse_legacy_bool(value);
+        if let Some(blocked) = blocked {
+            settings.settings_blocked = blocked;
+        }
+        apply("gui.settings.blocked", blocked.map(|_| ()));
     }
     if let Some(value) = properties.get("feedback") {
         let acknowledged = parse_legacy_bool(value);
