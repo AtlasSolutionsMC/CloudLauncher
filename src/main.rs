@@ -356,8 +356,15 @@ struct LaunchUiMessage {
     target: LogTarget,
 }
 
+struct LaunchErrorDialog {
+    title: String,
+    message: String,
+    details: Option<String>,
+}
+
 enum LaunchUiEvent {
     Message(LaunchUiMessage),
+    ErrorDialog(LaunchErrorDialog),
     LongMalwareScanConfirmation(tokio::sync::oneshot::Sender<bool>),
     MalwareDetected(malware::MalwareDetection),
     GameStarted,
@@ -757,6 +764,7 @@ struct LauncherApp {
     game_log: Arc<Mutex<VecDeque<String>>>,
     pending_crash_report: Arc<Mutex<Option<CrashReport>>>,
     crash_report: Option<CrashReport>,
+    launch_error_dialog: Option<LaunchErrorDialog>,
     malware_scan_confirmation: Option<tokio::sync::oneshot::Sender<bool>>,
     malware_detection: Option<malware::MalwareDetection>,
     cancel_requested: Arc<AtomicBool>,
@@ -2479,11 +2487,18 @@ impl LauncherApp {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let details = error.to_string();
                     send_launch_message(
                         &update_tx,
                         LogLevel::Error,
                         LogTarget::Launcher,
-                        tr("rust.status.runtime.start-error").replace("%0", &error.to_string()),
+                        tr("rust.status.runtime.start-error").replace("%0", &details),
+                    );
+                    send_launch_error_dialog(
+                        &update_tx,
+                        tr("launcher.error.title"),
+                        tr("launcher.error.unknown"),
+                        Some(details),
                     );
                     let _ = done_tx.send(LaunchUiEvent::Finished);
                     return;
@@ -2496,6 +2511,12 @@ impl LauncherApp {
                         result = authenticate_microsoft_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
+                                send_launch_error_dialog(
+                                    &update_tx,
+                                    tr("account.manager.error.title"),
+                                    error.clone(),
+                                    None,
+                                );
                                 send_launch_message(
                                     &update_tx,
                                     LogLevel::Error,
@@ -2520,6 +2541,12 @@ impl LauncherApp {
                         result = authenticate_ely_legacy_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
+                                send_launch_error_dialog(
+                                    &update_tx,
+                                    tr("account.manager.error.title"),
+                                    error.clone(),
+                                    None,
+                                );
                                 send_launch_message(
                                     &update_tx,
                                     LogLevel::Error,
@@ -2544,6 +2571,12 @@ impl LauncherApp {
                         result = authenticate_ely_account(&account) => match result {
                             Ok(authenticator) => authenticator,
                             Err(error) => {
+                                send_launch_error_dialog(
+                                    &update_tx,
+                                    tr("account.manager.error.title"),
+                                    error.clone(),
+                                    None,
+                                );
                                 send_launch_message(
                                     &update_tx,
                                     LogLevel::Error,
@@ -2584,6 +2617,12 @@ impl LauncherApp {
                             );
                         }
                         Ok(Err(error)) => {
+                            send_launch_error_dialog(
+                                &update_tx,
+                                tr("launcher.error.title"),
+                                error.clone(),
+                                None,
+                            );
                             send_launch_message(
                                 &update_tx,
                                 LogLevel::Error,
@@ -2593,22 +2632,36 @@ impl LauncherApp {
                             return;
                         }
                         Err(error) => {
+                            let message = tr("rust.status.java.detection-error")
+                                .replace("%0", &error.to_string());
+                            send_launch_error_dialog(
+                                &update_tx,
+                                tr("launcher.error.title"),
+                                message.clone(),
+                                None,
+                            );
                             send_launch_message(
                                 &update_tx,
                                 LogLevel::Error,
                                 LogTarget::JavaRuntime,
-                                tr("rust.status.java.detection-error")
-                                    .replace("%0", &error.to_string()),
+                                message,
                             );
                             return;
                         }
                     },
                     "custom" if preferences.java_path.trim().is_empty() => {
+                        let message = tr("rust.status.java.custom-required").to_owned();
                         send_launch_message(
                             &update_tx,
                             LogLevel::Warn,
                             LogTarget::JavaRuntime,
-                            tr("rust.status.java.custom-required"),
+                            message.clone(),
+                        );
+                        send_launch_error_dialog(
+                            &update_tx,
+                            tr("launcher.error.title"),
+                            message,
+                            None,
                         );
                         return;
                     }
@@ -2647,6 +2700,12 @@ impl LauncherApp {
                             );
                         }
                         Err(error) => {
+                            send_launch_error_dialog(
+                                &update_tx,
+                                tr("launcher.error.title"),
+                                error.clone(),
+                                None,
+                            );
                             send_launch_message(
                                 &update_tx,
                                 LogLevel::Error,
@@ -2792,11 +2851,19 @@ impl LauncherApp {
                         return;
                     }
                     Some(Err(error)) => {
+                        let message = tr("rust.status.game.launch-error")
+                            .replace("%0", &error.to_string());
                         send_launch_message(
                             &update_tx,
                             LogLevel::Error,
                             LogTarget::Minecraft,
-                            tr("rust.status.game.launch-error").replace("%0", &error.to_string()),
+                            message.clone(),
+                        );
+                        send_launch_error_dialog(
+                            &update_tx,
+                            tr("launcher.error.title"),
+                            message,
+                            None,
                         );
                         drop(event_tx);
                         let _ = listener.await;
@@ -2902,12 +2969,19 @@ impl LauncherApp {
                                 let _ = event_tx.send(LaunchEvent::Close(code)).await;
                             }
                             Some(Err(error)) => {
+                                let message = tr("rust.status.game.monitor-error")
+                                    .replace("%0", &error.to_string());
                                 send_launch_message(
                                     &update_tx,
                                     LogLevel::Error,
                                     LogTarget::Minecraft,
-                                    tr("rust.status.game.monitor-error")
-                                        .replace("%0", &error.to_string()),
+                                    message.clone(),
+                                );
+                                send_launch_error_dialog(
+                                    &update_tx,
+                                    tr("launcher.error.title"),
+                                    message,
+                                    None,
                                 );
                             }
                             None => {
@@ -2923,11 +2997,19 @@ impl LauncherApp {
                         }
                     }
                     Err(error) => {
+                        let message = tr("rust.status.game.launch-error")
+                            .replace("%0", &error.to_string());
                         send_launch_message(
                             &update_tx,
                             LogLevel::Error,
                             LogTarget::Minecraft,
-                            tr("rust.status.game.launch-error").replace("%0", &error.to_string()),
+                            message.clone(),
+                        );
+                        send_launch_error_dialog(
+                            &update_tx,
+                            tr("launcher.error.title"),
+                            message,
+                            None,
                         );
                     }
                 }
@@ -2976,11 +3058,18 @@ impl LauncherApp {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let details = error.to_string();
                     send_launch_message(
                         &update_tx,
                         LogLevel::Error,
                         LogTarget::Launcher,
-                        tr("rust.status.runtime.start-error").replace("%0", &error.to_string()),
+                        tr("rust.status.runtime.start-error").replace("%0", &details),
+                    );
+                    send_launch_error_dialog(
+                        &update_tx,
+                        tr("launcher.error.title"),
+                        tr("launcher.error.unknown"),
+                        Some(details),
                     );
                     let _ = done_tx.send(LaunchUiEvent::Finished);
                     return;
@@ -3020,12 +3109,19 @@ impl LauncherApp {
                         );
                     }
                     Some(Err(error)) => {
+                        let message = tr("rust.status.versions.install-failed")
+                            .replace("%0", &error.to_string());
                         send_launch_message(
                             &update_tx,
                             LogLevel::Error,
                             LogTarget::VersionManager,
-                            tr("rust.status.versions.install-failed")
-                                .replace("%0", &error.to_string()),
+                            message.clone(),
+                        );
+                        send_launch_error_dialog(
+                            &update_tx,
+                            tr("launcher.error.title"),
+                            message,
+                            None,
                         );
                     }
                     None => {
@@ -3369,6 +3465,9 @@ impl eframe::App for LauncherApp {
                         self.launch_progress = Some(progress);
                     }
                     self.status = message.message;
+                }
+                LaunchUiEvent::ErrorDialog(dialog) => {
+                    self.launch_error_dialog = Some(dialog);
                 }
                 LaunchUiEvent::LongMalwareScanConfirmation(reply) => {
                     self.malware_scan_confirmation = Some(reply);
@@ -6950,6 +7049,46 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        if let Some(dialog) = self.launch_error_dialog.as_ref() {
+            let title = dialog.title.clone();
+            let message = dialog.message.clone();
+            let details = dialog.details.clone();
+            let mut close = false;
+            egui::Modal::new(Id::unique("launch_error_dialog")).show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.heading(title);
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(message).color(Color32::LIGHT_RED)).wrap());
+                if let Some(mut details) = details {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut details)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(500.0)
+                            .desired_rows(8)
+                            .interactive(false),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr("support.button.close")).clicked() {
+                            close = true;
+                        }
+                        if ui.button(tr("launcher.error.copy-details")).clicked() {
+                            ctx.copy_text(details.clone());
+                        }
+                    });
+                } else {
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = ui.button(tr("support.button.close")).clicked();
+                    });
+                }
+            });
+            if close {
+                self.launch_error_dialog = None;
+            }
+        }
+
         if let Some(detection) = self.malware_detection.clone() {
             let mut open = true;
             let mut close = false;
@@ -8436,6 +8575,19 @@ fn send_launch_message(
         message: message.into(),
         level,
         target,
+    }));
+}
+
+fn send_launch_error_dialog(
+    sender: &mpsc::Sender<LaunchUiEvent>,
+    title: &str,
+    message: impl Into<String>,
+    details: Option<String>,
+) {
+    let _ = sender.send(LaunchUiEvent::ErrorDialog(LaunchErrorDialog {
+        title: title.to_owned(),
+        message: message.into(),
+        details,
     }));
 }
 
