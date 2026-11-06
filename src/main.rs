@@ -674,6 +674,7 @@ struct LauncherApp {
     new_account_ely_skins: bool,
     editing_account: Option<String>,
     show_ely_legacy_dialog: bool,
+    editing_ely_legacy_account: Option<String>,
     ely_legacy_username: String,
     ely_legacy_password: String,
     ely_legacy_signin_events:
@@ -2115,6 +2116,14 @@ impl LauncherApp {
         }
         self.ely_legacy_username.clear();
         self.ely_legacy_password.clear();
+        self.editing_ely_legacy_account = None;
+        self.show_ely_legacy_dialog = true;
+    }
+
+    fn open_edit_ely_legacy_dialog(&mut self, account: &ElyLegacyAccountProfile) {
+        self.ely_legacy_username.clone_from(&account.username);
+        self.ely_legacy_password.clear();
+        self.editing_ely_legacy_account = Some(account.id.clone());
         self.show_ely_legacy_dialog = true;
     }
 
@@ -2201,6 +2210,16 @@ impl LauncherApp {
                         return;
                     }
                 };
+                let editing_account =
+                    self.editing_ely_legacy_account
+                        .as_ref()
+                        .and_then(|account_id| {
+                            self.settings
+                                .ely_legacy_accounts
+                                .iter()
+                                .find(|saved| &saved.id == account_id)
+                                .cloned()
+                        });
                 if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
                     self.set_logged_status(
                         LogLevel::Error,
@@ -2210,12 +2229,34 @@ impl LauncherApp {
                     );
                     return;
                 }
-                self.settings
-                    .ely_legacy_accounts
-                    .retain(|saved| saved.uuid != account.uuid);
+                if let Some(previous) = editing_account.as_ref()
+                    && previous.id != account.id
+                    && let Err(error) = vault::remove_account(&previous.storage_key())
+                {
+                    let cleanup_error = vault::remove_account(&account.storage_key()).err();
+                    let details = cleanup_error.map_or_else(
+                        || error.to_string(),
+                        |cleanup| {
+                            format!("{error}; could not roll back new credentials: {cleanup}")
+                        },
+                    );
+                    self.set_logged_status(
+                        LogLevel::Error,
+                        LogTarget::Authentication,
+                        tr("rust.status.account.ely.remove-error").replace("%0", &details),
+                    );
+                    return;
+                }
+                self.settings.ely_legacy_accounts.retain(|saved| {
+                    saved.uuid != account.uuid
+                        && editing_account
+                            .as_ref()
+                            .is_none_or(|previous| saved.id != previous.id)
+                });
                 self.settings.ely_legacy_accounts.push(account.clone());
                 self.settings.selected_account = Some(account.id);
                 self.show_ely_legacy_dialog = false;
+                self.editing_ely_legacy_account = None;
                 self.ely_legacy_password.clear();
                 self.set_logged_status(
                     LogLevel::Info,
@@ -5743,7 +5784,12 @@ impl eframe::App for LauncherApp {
 
         if self.show_ely_legacy_dialog {
             let mut open = true;
-            egui::Window::new(tr("rust.ui.window.account.ely-legacy"))
+            let title = if self.editing_ely_legacy_account.is_some() {
+                tr("rust.ui.window.account.ely-legacy-edit")
+            } else {
+                tr("rust.ui.window.account.ely-legacy")
+            };
+            egui::Window::new(title)
                 .open(&mut open)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .collapsible(false)
@@ -5774,6 +5820,7 @@ impl eframe::App for LauncherApp {
                                 );
                             } else {
                                 self.show_ely_legacy_dialog = false;
+                                self.editing_ely_legacy_account = None;
                             }
                         }
                         if ui
@@ -5794,6 +5841,7 @@ impl eframe::App for LauncherApp {
                 self.cancel_requested.store(true, Ordering::Release);
             } else if !open {
                 self.show_ely_legacy_dialog = false;
+                self.editing_ely_legacy_account = None;
             }
         }
 
@@ -6912,6 +6960,7 @@ impl eframe::App for LauncherApp {
                             }
                         }
                         let ely_legacy_accounts = self.settings.ely_legacy_accounts.clone();
+                        let mut edit_ely_legacy_account = None;
                         let mut remove_ely_legacy_account = None;
                         for account in ely_legacy_accounts {
                             ui.horizontal(|ui| {
@@ -6920,10 +6969,16 @@ impl eframe::App for LauncherApp {
                                     self.settings.selected_account = Some(account.id.clone());
                                     self.persist();
                                 }
+                                if ui.small_button(tr("rust.settings.account.edit")).clicked() {
+                                    edit_ely_legacy_account = Some(account.clone());
+                                }
                                 if ui.small_button(tr("rust.ui.remove")).clicked() {
                                     remove_ely_legacy_account = Some(account);
                                 }
                             });
+                        }
+                        if let Some(account) = edit_ely_legacy_account {
+                            self.open_edit_ely_legacy_dialog(&account);
                         }
                         if let Some(account) = remove_ely_legacy_account {
                             match vault::remove_account(&account.storage_key()) {
