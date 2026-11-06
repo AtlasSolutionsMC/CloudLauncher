@@ -29,7 +29,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Add opt-in diagnostic upload, success link actions, sensitive-line filtering, and a local-save fallback using the source Pasta endpoint.
 - [x] Include Windows version/build, system manufacturer/model, language, DirectX registry version, processor, memory, and graphics provider/driver/date details in the opt-in diagnostic report without collecting hardware serial numbers or device IDs.
 - [x] Move version filters, notices/account controls, and launch/download event labels into the US locale resource; every literal `tr("key")` in Rust currently resolves to a US property.
-- [ ] Finish moving remaining backend/network and dynamic notice/crash error wording into the locale; Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server, import, background-image, and crash fallback errors are localized. The update, bootstrap, notices, and diagnostic lifecycle log messages now also resolve from the US locale.
+- [ ] Finish moving remaining backend/network and dynamic notice/crash error wording into the locale; Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server, settings import/export, background-image, and crash fallback errors are localized. The update, bootstrap, notices, and diagnostic lifecycle log messages now also resolve from the US locale.
 - [ ] Load all visible strings from the US locale resource and match the source layout at common Windows scales.
 - [x] Wire the login toolbar to support, game-folder/mods-folder, catalog refresh, and settings actions.
 - [x] Port the source's nine login-form positions and migrate `gui.direction.loginform`.

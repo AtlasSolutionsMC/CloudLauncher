@@ -10478,15 +10478,18 @@ fn write_external_settings_file(
                 .filter(|parent| !parent.as_os_str().is_empty())
             {
                 fs::create_dir_all(parent).map_err(|error| {
-                    format!(
-                        "Could not create settings directory {}: {error}",
-                        parent.display()
-                    )
+                    tr("rust.error.settings.create-directory")
+                        .replace("%0", &parent.display().to_string())
+                        .replace("%1", &error.to_string())
                 })?;
             }
-            let bytes = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
+            let bytes = serde_json::to_vec_pretty(settings).map_err(|error| {
+                tr("rust.error.settings.serialize-json").replace("%0", &error.to_string())
+            })?;
             fs::write(path, bytes).map_err(|error| {
-                format!("Could not write settings file {}: {error}", path.display())
+                tr("rust.error.settings.write-file")
+                    .replace("%0", &path.display().to_string())
+                    .replace("%1", &error.to_string())
             })
         }
         ExternalSettingsFile::LegacyProperties(path) => write_legacy_properties(path, settings),
@@ -10725,10 +10728,9 @@ fn write_legacy_properties(path: &Path, settings: &SavedSettings) -> Result<(), 
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
-            return Err(format!(
-                "Could not read settings file {}: {error}",
-                path.display()
-            ));
+            return Err(tr("rust.error.settings.read-file")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string()));
         }
     };
     let properties = legacy_properties_from_settings(settings);
@@ -10804,14 +10806,16 @@ fn write_legacy_properties(path: &Path, settings: &SavedSettings) -> Result<(), 
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Could not create settings directory {}: {error}",
-                parent.display()
-            )
+            tr("rust.error.settings.create-directory")
+                .replace("%0", &parent.display().to_string())
+                .replace("%1", &error.to_string())
         })?;
     }
-    fs::write(path, contents)
-        .map_err(|error| format!("Could not write settings file {}: {error}", path.display()))
+    fs::write(path, contents).map_err(|error| {
+        tr("rust.error.settings.write-file")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })
 }
 
 #[derive(Default)]
