@@ -456,6 +456,8 @@ impl Default for SavedSettings {
 
 struct Assets {
     background: TextureHandle,
+    background_light: TextureHandle,
+    background_dark: TextureHandle,
     support: TextureHandle,
     folder: TextureHandle,
     refresh: TextureHandle,
@@ -467,6 +469,7 @@ struct LegacyThemePalette {
     foreground: Option<Color32>,
     semi_foreground: Option<Color32>,
     background: Option<Color32>,
+    dark_theme_enabled: Option<bool>,
     panel_background: Option<Color32>,
     success: Option<Color32>,
     failure: Option<Color32>,
@@ -515,6 +518,8 @@ impl LegacyThemePalette {
 struct LauncherApp {
     settings: SavedSettings,
     assets: Option<Assets>,
+    background_theme_dark: Option<bool>,
+    background_custom_loaded: bool,
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
     version_catalog_loading: bool,
@@ -631,13 +636,22 @@ struct LauncherApp {
 
 impl LauncherApp {
     fn new(cc: &eframe::CreationContext<'_>, require_minecraft_account: bool) -> Self {
+        let background_light = load_texture(
+            &cc.egui_ctx,
+            "background-light",
+            include_bytes!("../assets/plains.jpg"),
+            false,
+        );
+        let background_dark = load_texture(
+            &cc.egui_ctx,
+            "background-dark",
+            include_bytes!("../assets/dark/plains.jpg"),
+            false,
+        );
         let mut assets = Assets {
-            background: load_texture(
-                &cc.egui_ctx,
-                "background",
-                include_bytes!("../assets/plains.jpg"),
-                false,
-            ),
+            background: background_light.clone(),
+            background_light,
+            background_dark,
             support: load_texture(
                 &cc.egui_ctx,
                 "support",
@@ -665,6 +679,7 @@ impl LauncherApp {
         };
         let first_run_pending = !settings_path().is_file();
         let settings = load_settings();
+        let background_custom_loaded = !settings.background_path.trim().is_empty();
         let show_global_logger = settings.logger_mode == "global";
         let background_load_error = if settings.background_path.trim().is_empty() {
             None
@@ -701,6 +716,8 @@ impl LauncherApp {
         let mut app = Self {
             settings,
             assets: Some(assets),
+            background_theme_dark: None,
+            background_custom_loaded: background_custom_loaded && background_load_error.is_none(),
             require_minecraft_account,
             show_first_run_notice: first_run_pending,
             show_first_run_folder_notice,
@@ -3048,6 +3065,30 @@ impl eframe::App for LauncherApp {
         };
         ctx.set_theme(theme_preference);
         let theme = ctx.theme();
+        let dark_theme_assets = self
+            .legacy_theme_palette
+            .as_ref()
+            .and_then(|palette| palette.dark_theme_enabled)
+            .unwrap_or_else(|| {
+                theme == egui::Theme::Dark
+                    || self
+                        .legacy_theme_palette
+                        .as_ref()
+                        .and_then(|palette| palette.background)
+                        .is_some_and(legacy_background_prefers_dark_assets)
+            });
+        if self.background_theme_dark != Some(dark_theme_assets) {
+            self.background_theme_dark = Some(dark_theme_assets);
+            if !self.background_custom_loaded {
+                if let Some(assets) = &mut self.assets {
+                    assets.background = if dark_theme_assets {
+                        assets.background_dark.clone()
+                    } else {
+                        assets.background_light.clone()
+                    };
+                }
+            }
+        }
         let mut style = (*ctx.style_of(theme)).clone();
         style.visuals = theme.default_visuals();
         if theme == egui::Theme::Dark {
@@ -5338,14 +5379,14 @@ impl eframe::App for LauncherApp {
                             }
                             if ui.button(tr("rust.settings.background.default")).clicked() {
                                 self.settings.background_path.clear();
+                                self.background_custom_loaded = false;
                                 self.persist();
                                 if let Some(assets) = &mut self.assets {
-                                    assets.background = load_texture(
-                                        ui.ctx(),
-                                        "background",
-                                        include_bytes!("../assets/plains.jpg"),
-                                        false,
-                                    );
+                                    assets.background = if self.background_theme_dark.unwrap_or(false) {
+                                        assets.background_dark.clone()
+                                    } else {
+                                        assets.background_light.clone()
+                                    };
                                 }
                             }
                         });
@@ -6467,6 +6508,7 @@ impl eframe::App for LauncherApp {
                     match load_texture_from_path(ctx, "background", &path) {
                         Ok(background) => {
                             self.settings.background_path = path.to_string_lossy().into_owned();
+                            self.background_custom_loaded = true;
                             if let Some(assets) = &mut self.assets {
                                 assets.background = background;
                             }
@@ -9565,6 +9607,9 @@ fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
         foreground: color("foreground"),
         semi_foreground: color("semiforeground"),
         background: color("background"),
+        dark_theme_enabled: properties
+            .get("darkTheme.enabled")
+            .map(|value| value.trim().eq_ignore_ascii_case("true")),
         panel_background: color("panelbackground"),
         success: color("success"),
         failure: color("failure"),
@@ -9608,6 +9653,10 @@ fn parse_legacy_theme_color(value: &str) -> Option<Color32> {
         channels[2],
         channels.get(3).copied().unwrap_or(255),
     ))
+}
+
+fn legacy_background_prefers_dark_assets(background: Color32) -> bool {
+    background.r() <= 64 && background.g() <= 64 && background.b() <= 64
 }
 
 fn apply_legacy_theme_palette(style: &mut egui::Style, palette: &LegacyThemePalette) {

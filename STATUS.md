@@ -1,6 +1,6 @@
 # Port status
 
-Updated: 2026-11-06 (Asia/Bangkok)
+Updated: 2026-11-07 (Asia/Bangkok)
 
 Implementation is ongoing; feature parity remains incomplete.
 
@@ -23,6 +23,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Legacy `gui.laf.v1.state` and pre-FlatLaf `gui.systemlookandfeel` migration with live Off/System/Auto/Dark/Light UI theme selection.
 - Legacy `gui.background` image migration and live image selection/reset; video backgrounds are still open.
 - Legacy `gui.theme` file migration and selection; foreground, secondary foreground, background, panel, success/failure, borders, shadow, corner-radius, and toolbar icon color properties are applied to the Rust UI.
+- Legacy `darkTheme.enabled` background asset selection, including source-style system/theme background fallback and keeping user-selected backgrounds active until reset.
 - Legacy log-window dimensions and position migration, with current viewer geometry saved across launches.
 - Source `gui.logger` Global/None mode with a 1 MiB live launcher buffer, a rolling 12 MiB launcher log with ten backups, live sanitized logs, log-file browsing, a stop-game action, and close-to-disable behavior. In-memory records now retain timestamp, severity, and subsystem; launch/download, auth, Java, mods, servers, catalog, update, bootstrap, notice, diagnostics, settings import, and crash events have explicit categories. Status updates now log directly with a level and subsystem. Unhandled Rust panics also write redacted details and a forced backtrace to the rolling log; full Java Log4j coverage comparison remains open.
 - Migration and persistence for the selected Minecraft version and maximized launcher window state.
@@ -50,11 +51,11 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 99 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 101 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 
-Latest Windows x64 release build and portable ZIP packaging passed on 2026-11-06.
+Latest Windows x64 release build and portable ZIP packaging passed on 2026-11-07.
 
 From the project directory:
 
