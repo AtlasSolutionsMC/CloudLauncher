@@ -9262,6 +9262,16 @@ fn import_legacy_settings(
     if properties.is_empty() {
         return Err(tr("rust.error.import.settings-empty").to_owned());
     }
+    let compatible_version = properties
+        .get("settings.version")
+        .map(|value| value.trim().parse::<f64>().ok() == Some(3.0))
+        .unwrap_or(true);
+    if !compatible_version {
+        return Ok(LegacySettingsImportSummary {
+            applied: 0,
+            skipped: properties.len(),
+        });
+    }
     let mut summary = LegacySettingsImportSummary::default();
     let mut apply = |key: &str, result: Option<()>| {
         if properties.contains_key(key) {
@@ -9854,6 +9864,7 @@ fn legacy_properties_from_settings(settings: &SavedSettings) -> BTreeMap<String,
     let mut put = |key: &str, value: String| {
         properties.insert(key.to_owned(), value);
     };
+    put("settings.version", "3".to_owned());
     put("client", settings.client_id.clone());
     let mut experiments = settings
         .legacy_experiments
