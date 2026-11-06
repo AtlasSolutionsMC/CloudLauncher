@@ -13,6 +13,17 @@ pub fn system_info() -> String {
     lines.join("\n")
 }
 
+pub fn total_physical_memory_mb() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        total_physical_memory().map(|memory| memory / 1_048_576)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 #[cfg(windows)]
 fn windows_system_info() -> Vec<String> {
     let mut lines = Vec::new();

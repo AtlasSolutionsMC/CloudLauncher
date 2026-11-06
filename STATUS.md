@@ -13,6 +13,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Login account dropdown opens Manage accounts directly and labels Ely.by Legacy accounts distinctly from Ely.by OAuth.
 - Optional `--requireMinecraftAccount` account-add gate with the source US warning and Mojang-import exception.
 - Minecraft version catalog and lifecycle, custom inherited versions, Java runtime management, Forge/NeoForge/Fabric/LegacyFabric/Quilt launch paths, and source Forge mod-pack argument compatibility.
+- Source Auto memory allocation by Minecraft release family and available RAM, including Forge scaling, the Auto/manual setting, and migration of the retired `minecraft.memory` preference.
 - Pre-launch Fractureiser signature scan of nested mods JARs, matching the Java detector's three bytecode signatures; migrate and persist scan version, offer long-scan continue/skip, and stop launch with a detection dialog when infected.
 - Crash dialogs honor the Java signature catalog's `permitHelp` flag and include help, log, and dismiss actions.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostics with Windows, model, language, DirectX, CPU/memory, and graphics provider/driver details.
@@ -51,7 +52,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 101 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 102 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 

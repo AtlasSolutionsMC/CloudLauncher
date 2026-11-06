@@ -95,6 +95,7 @@ struct SavedSettings {
     legacy_config_path: String,
     min_memory: String,
     max_memory: String,
+    automatic_memory: bool,
     java_path: String,
     java_mode: String,
     java_runtime_directory: String,
@@ -427,6 +428,7 @@ impl Default for SavedSettings {
             legacy_config_path: default_legacy_config_path().to_string_lossy().into_owned(),
             min_memory: "512M".to_owned(),
             max_memory: "2G".to_owned(),
+            automatic_memory: true,
             java_path: String::new(),
             java_mode: "recommended".to_owned(),
             java_runtime_directory: String::new(),
@@ -1655,6 +1657,14 @@ impl LauncherApp {
         None
     }
 
+    fn version_release_time(&self, version: &str) -> Option<String> {
+        self.version_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.versions.iter().find(|entry| entry.id == version))
+            .map(|entry| entry.release_time.clone())
+            .or_else(|| self.installed_version_release_time(version))
+    }
+
     fn version_is_installed(&self) -> bool {
         self.installed_version_root(&self.settings.selected_version)
             .is_some()
@@ -2217,6 +2227,7 @@ impl LauncherApp {
         let crash_version = version.clone();
         let crash_loader = format!("{}-{}", preferences.loader_type, preferences.loader_build);
         let version_manifest = self.version_manifest.clone();
+        let memory_release_time = self.version_release_time(&version);
         let game_log = self.game_log.clone();
         let launcher_log = self.launcher_log.clone();
         if let Ok(mut lines) = game_log.lock() {
@@ -2460,6 +2471,7 @@ impl LauncherApp {
                     game_dir,
                     force_update,
                     preferences,
+                    memory_release_time.as_deref(),
                 );
                 if let Some(warning) = append_legacy_experiment_arguments(
                     &mut options,
@@ -5678,6 +5690,16 @@ impl eframe::App for LauncherApp {
                         ui.separator();
                         ui.label(tr("rust.settings.memory.heading"));
                         let mut memory_changed = false;
+                        if ui
+                            .checkbox(
+                                &mut self.settings.automatic_memory,
+                                tr("settings.java.memory.auto"),
+                            )
+                            .changed()
+                        {
+                            self.persist();
+                        }
+                        ui.label(tr("rust.settings.memory.auto-description"));
                         ui.horizontal(|ui| {
                             ui.label(tr("rust.settings.memory.minimum"));
                             memory_changed |= ui
@@ -5685,12 +5707,26 @@ impl eframe::App for LauncherApp {
                                 .changed();
                             ui.label(tr("rust.settings.memory.maximum"));
                             memory_changed |= ui
-                                .text_edit_singleline(&mut self.settings.max_memory)
+                                .add_enabled(
+                                    !self.settings.automatic_memory,
+                                    egui::TextEdit::singleline(&mut self.settings.max_memory),
+                                )
                                 .changed();
                         });
                         let min_memory = parse_memory_size(&self.settings.min_memory);
                         let max_memory = parse_memory_size(&self.settings.max_memory);
-                        if let (Some(min), Some(max)) = (min_memory, max_memory) {
+                        if self.settings.automatic_memory {
+                            if min_memory.is_some() {
+                                if memory_changed {
+                                    self.persist();
+                                }
+                            } else {
+                                ui.colored_label(
+                                    Color32::LIGHT_RED,
+                                    tr("rust.settings.memory.invalid-value"),
+                                );
+                            }
+                        } else if let (Some(min), Some(max)) = (min_memory, max_memory) {
                             if min <= max {
                                 if memory_changed {
                                     self.persist();
@@ -7214,6 +7250,7 @@ fn make_launch_options(
         path,
         force_update,
         preferences,
+        None,
     )
 }
 
@@ -7223,8 +7260,10 @@ fn make_launch_options_with_authenticator(
     path: PathBuf,
     force_update: bool,
     preferences: SavedSettings,
+    release_time: Option<&str>,
 ) -> LaunchOptions {
     let instance = instance_for_version(&version, &preferences);
+    let memory = memory_config(&preferences, &version, release_time);
     LaunchOptions {
         path,
         version,
@@ -7232,7 +7271,7 @@ fn make_launch_options_with_authenticator(
         timeout_secs: 30,
         download_concurrency: 8,
         verify_concurrency: 4,
-        memory: memory_config(&preferences),
+        memory,
         java: JavaOptions {
             path: if preferences.java_path.trim().is_empty() {
                 None
@@ -8859,10 +8898,24 @@ fn is_windows_arm_host() -> bool {
 }
 
 fn load_settings() -> SavedSettings {
-    let mut settings: SavedSettings = fs::read(settings_path())
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    let saved_bytes = fs::read(settings_path()).ok();
+    let saved_json = saved_bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+    let mut settings: SavedSettings = saved_bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .unwrap_or_default();
+    if saved_json
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|values| {
+            values.contains_key("max_memory") && !values.contains_key("automatic_memory")
+        })
+    {
+        // Preserve manual values saved by Rust builds that predate Auto mode.
+        settings.automatic_memory = false;
+    }
     settings.malware_scan_version = settings.malware_scan_version.min(2);
     settings.auto_login_timeout_secs = settings.auto_login_timeout_secs.clamp(2, 10);
     if settings.legacy_config_path.trim().is_empty() {
@@ -9389,17 +9442,23 @@ fn import_legacy_settings(
         })
     {
         let memory = value.trim();
-        let megabytes = if memory.eq_ignore_ascii_case("auto") {
-            None
-        } else {
-            memory
-                .parse::<u32>()
-                .ok()
-                .filter(|value| (256..=262_144).contains(value))
-        };
-        if let Some(megabytes) = megabytes {
+        let megabytes = memory.parse::<u32>().ok();
+        let total_memory_mb = diagnostics::total_physical_memory_mb()
+            .unwrap_or(8192)
+            .min(i32::MAX as u64) as u32;
+        let old_memory_was_auto = key == "minecraft.memory"
+            && megabytes == Some(default_legacy_xmx_mib(total_memory_mb, usize::BITS >= 64));
+        if memory.eq_ignore_ascii_case("auto") || old_memory_was_auto || megabytes == Some(0) {
+            settings.automatic_memory = true;
+            apply(key, Some(()));
+        } else if let Some(megabytes) = megabytes.filter(|value| (256..=262_144).contains(value)) {
+            settings.automatic_memory = false;
             settings.max_memory = format!("{megabytes}M");
             settings.min_memory = format!("{}M", (megabytes / 2).clamp(128, 1024));
+            apply(key, Some(()));
+        } else if key == "minecraft.xmx" {
+            // The Java MemorySlider falls back to Auto for unrecognized values.
+            settings.automatic_memory = true;
             apply(key, Some(()));
         } else {
             apply(key, None);
@@ -10560,7 +10619,110 @@ fn parse_memory_size(value: &str) -> Option<u64> {
         .flatten()
 }
 
-fn memory_config(preferences: &SavedSettings) -> MemoryConfig {
+fn default_legacy_xmx_mib(total_memory_mb: u32, is_64_bit: bool) -> u32 {
+    if !is_64_bit || total_memory_mb <= 2_000 {
+        total_memory_mb.min(1_024)
+    } else if total_memory_mb <= 2_500 {
+        1_536
+    } else {
+        2_048
+    }
+}
+
+fn legacy_release_at_or_after(release_time: &str, threshold: &str) -> bool {
+    use time::format_description::well_known::Rfc3339;
+
+    match (
+        time::OffsetDateTime::parse(release_time, &Rfc3339),
+        time::OffsetDateTime::parse(threshold, &Rfc3339),
+    ) {
+        (Ok(release_time), Ok(threshold)) => release_time >= threshold,
+        _ => false,
+    }
+}
+
+fn legacy_auto_xmx_mib(
+    version: &str,
+    release_time: Option<&str>,
+    total_memory_mb: u32,
+    is_64_bit: bool,
+    is_forge: bool,
+) -> u32 {
+    const ONE_GIB: u32 = 1_024;
+    const TWO_GIB: u32 = 2_048;
+    const THREE_GIB: u32 = 3_072;
+    const FOUR_GIB: u32 = 4_096;
+
+    let total_memory_mb = total_memory_mb.max(1);
+    let default_requirement = || {
+        if total_memory_mb < 3_500 {
+            TWO_GIB
+        } else if total_memory_mb < 5_500 {
+            THREE_GIB
+        } else {
+            FOUR_GIB
+        }
+    };
+    let requirement = if release_time
+        .is_some_and(|time| legacy_release_at_or_after(time, "2021-07-13T12:54:19+00:00"))
+    {
+        default_requirement()
+    } else if release_time
+        .is_some_and(|time| legacy_release_at_or_after(time, "2018-02-14T17:34:13+00:00"))
+    {
+        TWO_GIB
+    } else if release_time
+        .is_some_and(|time| legacy_release_at_or_after(time, "2009-05-13T20:11:00+00:00"))
+    {
+        ONE_GIB
+    } else {
+        // The Java source falls back to the latest requirement when a version
+        // has no usable release date or predates the first table entry.
+        default_requirement()
+    };
+
+    let rounding_base = if total_memory_mb < 4_779 { 256 } else { 1_024 };
+    let fraction = if total_memory_mb < 2_048 { 0.5 } else { 0.75 };
+    let rounded_safe_memory = ((f64::from(total_memory_mb) * fraction / f64::from(rounding_base))
+        .round() as u32)
+        .saturating_mul(rounding_base);
+    let safe_max = total_memory_mb.min(1_024).max(rounded_safe_memory);
+    let is_forge = is_forge || version.to_ascii_lowercase().contains("forge");
+    let requested = if total_memory_mb >= 6_000 && is_forge {
+        requirement.saturating_mul(2).min(safe_max)
+    } else {
+        requirement
+    };
+    let actual = safe_max.min(requested);
+    if is_64_bit { actual } else { actual.min(1_024) }
+}
+
+fn memory_config(
+    preferences: &SavedSettings,
+    version: &str,
+    release_time: Option<&str>,
+) -> MemoryConfig {
+    if preferences.automatic_memory {
+        let total_memory_mb = diagnostics::total_physical_memory_mb()
+            .unwrap_or(8_192)
+            .min(i32::MAX as u64) as u32;
+        let max_memory_mb = legacy_auto_xmx_mib(
+            version,
+            release_time,
+            total_memory_mb,
+            usize::BITS >= 64,
+            matches!(preferences.loader_type.as_str(), "forge" | "neoforge"),
+        );
+        let min_memory_mb = parse_memory_size(&preferences.min_memory)
+            .map(|memory| memory.div_ceil(1_048_576).min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(1_024)
+            .min(max_memory_mb);
+        return MemoryConfig {
+            min: format!("{min_memory_mb}M"),
+            max: format!("{max_memory_mb}M"),
+        };
+    }
+
     match (
         parse_memory_size(&preferences.min_memory),
         parse_memory_size(&preferences.max_memory),

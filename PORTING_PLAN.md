@@ -91,6 +91,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Match Recommended, Current System Java, and Custom Java modes; check a chosen executable against the selected game's Java requirement.
 - [x] Show installed managed Java executables, open the runtime folder, and select a discovered executable as a custom Java path.
 - [x] Configure the managed-runtime root, retain the existing game-folder runtime default, and import `minecraft.jre.dir`.
+- [x] Port the source Auto memory mode using per-version RAM requirements, safe-memory clamping, Forge recommendations, and the legacy `minecraft.memory` fallback migration.
 - [x] Port optimized JVM profiles (None, Default, G1GC, Shenandoah, ZGC), current-Java trust-store compatibility, and `%command%` wrapper commands.
 - [x] Save and show the actual managed/custom Java executable and detected major version for the selected game's last successful install.
 - [x] Set game directory, memory, Java executable, screen size/fullscreen, and JVM/game arguments.
