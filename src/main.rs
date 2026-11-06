@@ -669,6 +669,7 @@ struct LauncherApp {
     version_search: String,
     version_kind_filter: String,
     confirm_remove_version: Option<String>,
+    version_install_force_confirmation: Option<String>,
     force_update_confirmation: Option<PendingVersionUpdateConfirmation>,
     force_update_confirmed_version: Option<String>,
     outdated_version_confirmation: Option<PendingVersionUpdateConfirmation>,
@@ -1631,6 +1632,33 @@ impl LauncherApp {
             self.persist();
         }
         self.confirm_remove_version = None;
+    }
+
+    fn request_version_install(&mut self, version: String, force_update: bool) {
+        if force_update {
+            let has_remote_version = self
+                .version_manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.versions.iter().any(|entry| entry.id == version));
+            if !has_remote_version {
+                let title = tr("version.manager.downloader.error.title").to_owned();
+                let message = tr("version.manager.downloader.error.local").replace("%0", &version);
+                self.set_logged_status(LogLevel::Error, LogTarget::VersionManager, message.clone());
+                self.launch_error_dialog = Some(LaunchErrorDialog {
+                    title,
+                    message,
+                    details: None,
+                });
+                return;
+            }
+            if self.installed_version_root(&version).is_some()
+                && !self.installed_version_is_outdated(&version)
+            {
+                self.version_install_force_confirmation = Some(version);
+                return;
+            }
+        }
+        self.start_version_install(version, force_update);
     }
 
     fn start_update_check(&mut self) {
@@ -3425,7 +3453,7 @@ impl LauncherApp {
         });
     }
 
-    fn start_version_install(&mut self, version: String) {
+    fn start_version_install(&mut self, version: String, force_update: bool) {
         if self.launching {
             return;
         }
@@ -3451,7 +3479,12 @@ impl LauncherApp {
         self.set_logged_status(
             LogLevel::Info,
             LogTarget::VersionManager,
-            tr("rust.status.game.installing").replace("%0", &version),
+            tr(if force_update {
+                "rust.status.versions.force-updating"
+            } else {
+                "rust.status.game.installing"
+            })
+            .replace("%0", &version),
         );
 
         thread::spawn(move || {
@@ -3485,7 +3518,7 @@ impl LauncherApp {
                     version.clone(),
                     "VersionManager".to_owned(),
                     game_dir,
-                    true,
+                    force_update,
                     preferences,
                 );
                 let mut launcher = Launcher::new(options);
@@ -3699,6 +3732,7 @@ impl LauncherApp {
         let entries = self.visible_catalog_entries();
         let installed: HashSet<String> = self.installed_versions().into_iter().collect();
         let busy = self.launching;
+        let mut install_action = None;
         egui::ScrollArea::vertical()
             .max_height(330.0)
             .auto_shrink([false; 2])
@@ -3726,12 +3760,24 @@ impl LauncherApp {
                         } else {
                             "rust.ui.versions.install"
                         });
-                        if ui
-                            .add_enabled(!busy, egui::Button::new(install_label).small())
-                            .clicked()
-                        {
-                            self.start_version_install(version.clone());
-                        }
+                        ui.add_enabled_ui(!busy, |ui| {
+                            ui.menu_button(install_label, |ui| {
+                                if ui
+                                    .button(tr("version.manager.downloader.menu.ordinary"))
+                                    .clicked()
+                                {
+                                    install_action = Some((version.clone(), false));
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(tr("version.manager.downloader.menu.force"))
+                                    .clicked()
+                                {
+                                    install_action = Some((version.clone(), true));
+                                    ui.close();
+                                }
+                            });
+                        });
                         if is_installed
                             && ui
                                 .add_enabled(!busy, egui::Button::new(tr("rust.ui.remove")).small())
@@ -3742,6 +3788,9 @@ impl LauncherApp {
                     });
                 }
             });
+        if let Some((version, force_update)) = install_action {
+            self.request_version_install(version, force_update);
+        }
     }
 }
 
@@ -7562,6 +7611,37 @@ impl eframe::App for LauncherApp {
             }
             if let Some(remove_libraries) = remove_libraries {
                 self.remove_version_from_disk(&version, remove_libraries);
+            }
+        }
+
+        if let Some(version) = self.version_install_force_confirmation.clone() {
+            let mut decision = None;
+            egui::Modal::new(Id::unique(("version_install_force_confirmation", &version))).show(
+                ctx,
+                |ui| {
+                    ui.set_width(440.0);
+                    ui.heading(tr("version.manager.downloader.warning.title"));
+                    ui.add_space(6.0);
+                    ui.label(
+                        tr("version.manager.downloader.warning.force.single")
+                            .replace("%0", &version),
+                    );
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr("ui.no")).clicked() {
+                            decision = Some(false);
+                        }
+                        if ui.button(tr("ui.yes")).clicked() {
+                            decision = Some(true);
+                        }
+                    });
+                },
+            );
+            if let Some(confirmed) = decision {
+                self.version_install_force_confirmation = None;
+                if confirmed {
+                    self.start_version_install(version, true);
+                }
             }
         }
 
