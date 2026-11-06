@@ -50,7 +50,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Port the bootstrap `--requireMinecraftAccount` gate for new offline/Ely accounts, show the US license-required notice, and retain imported Mojang identity for the source-compatible exception.
 - [x] Import offline, Microsoft, Ely.by OAuth, and Ely.by Legacy accounts from `tlauncher_profiles.json`, preserving offline UUIDs and moving online credentials into DPAPI storage.
 - [x] Import supported Java launcher game, display, Java, argument, directory, and launch-action settings from `legacy.properties`.
-- [x] Import `login.auto` and its 2–10 second `login.auto.timeout`; show the source-style cancel countdown before automatic launch. Also import `login.version`, `gui.size`, and `gui.window`; use the source's 1000×600 initial launcher size, expose editable dimensions, and preserve maximized state.
+- [x] Import `login.auto` and its 2–10 second `login.auto.timeout`; show the source-style cancel countdown before automatic launch. Also import `login.version`, `gui.size`, and `gui.window`; use the source's 1000×600 initial launcher size, expose editable dimensions, preserve maximized state, and apply imported display/background/logger/notice/update settings immediately.
 - [x] Import notice visibility, promoted-notice preference, and per-notice hide expiries from `legacy.properties`.
 - [x] Keep `notice.enabled` separate from the `gui.notices.enabled` launcher notice panel; enforce the source's signed `allowNoticeDisable` rule using the client UUID hash.
 - [x] Import the crash scanning and full launch command logging preferences.

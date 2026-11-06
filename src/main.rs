@@ -1083,6 +1083,91 @@ impl LauncherApp {
         );
     }
 
+    fn apply_imported_settings_effects(
+        &mut self,
+        previous: &SavedSettings,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        let mut background_load_error = None;
+        ctx.set_zoom_factor(self.settings.launcher_font_size / 12.0);
+        http::set_certificate_validation(self.settings.verify_tls_certificates);
+
+        if previous.launcher_window_width != self.settings.launcher_window_width
+            || previous.launcher_window_height != self.settings.launcher_window_height
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                self.settings.launcher_window_width as f32,
+                self.settings.launcher_window_height as f32,
+            )));
+        }
+        if previous.launcher_maximized != self.settings.launcher_maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+                self.settings.launcher_maximized,
+            ));
+        }
+
+        if previous.background_path != self.settings.background_path {
+            if self.settings.background_path.trim().is_empty() {
+                self.background_custom_loaded = false;
+                if let Some(assets) = &mut self.assets {
+                    assets.background = if self.background_theme_dark.unwrap_or(false) {
+                        assets.background_dark.clone()
+                    } else {
+                        assets.background_light.clone()
+                    };
+                }
+            } else {
+                self.background_custom_loaded = false;
+                if let Some(assets) = &mut self.assets {
+                    assets.background = if self.background_theme_dark.unwrap_or(false) {
+                        assets.background_dark.clone()
+                    } else {
+                        assets.background_light.clone()
+                    };
+                }
+                let path = PathBuf::from(self.settings.background_path.trim());
+                match load_texture_from_path(ctx, "background", &path) {
+                    Ok(background) => {
+                        self.background_custom_loaded = true;
+                        if let Some(assets) = &mut self.assets {
+                            assets.background = background;
+                        }
+                    }
+                    Err(error) => background_load_error = Some(error),
+                }
+            }
+        }
+
+        if previous.game_directory != self.settings.game_directory
+            || previous.separate_game_directories != self.settings.separate_game_directories
+        {
+            self.server_list_root = None;
+        }
+        if previous.logger_mode != self.settings.logger_mode {
+            self.show_log_window =
+                self.settings.logger_mode == "global" || self.command_line_overrides.debug_mode;
+            self.show_live_launcher_log = self.show_log_window;
+            self.show_live_game_log = false;
+        }
+        if previous.notices_enabled != self.settings.notices_enabled {
+            self.notice_events = None;
+            self.notices_loading = false;
+            self.personal_notice_list.clear();
+            self.refresh_notices();
+            self.rebuild_notice_list(ctx);
+        }
+        if previous.beta_updates != self.settings.beta_updates {
+            self.update_check_events = None;
+            self.update_checking = false;
+            self.available_release = None;
+            self.update_prompt_pending = false;
+            self.show_update_dialog = false;
+            self.start_update_check();
+        }
+
+        background_load_error
+    }
+
     fn set_logged_status(
         &mut self,
         level: LogLevel,
@@ -6602,20 +6687,36 @@ impl eframe::App for LauncherApp {
                                 } else {
                                     PathBuf::from(self.settings.legacy_config_path.trim())
                                 };
+                                let previous_settings = self.settings.clone();
                                 match import_legacy_settings(&path, &mut self.settings) {
                                     Ok(summary) => {
                                         self.persisted_settings = self.settings.clone();
                                         self.command_line_overrides.apply(&mut self.settings);
-                                        self.set_logged_status(
-                                            LogLevel::Info,
-                                            LogTarget::Settings,
-                                            tr("rust.status.import.settings.success")
-                                                .replace("%0", &summary.applied.to_string())
-                                                .replace("%1", &summary.skipped.to_string()),
+                                        let background_error = self.apply_imported_settings_effects(
+                                            &previous_settings,
+                                            ctx,
                                         );
-                                        ui.ctx().set_zoom_factor(
-                                            self.settings.launcher_font_size / 12.0,
-                                        );
+                                        if let Some(error) = background_error {
+                                            self.set_logged_status(
+                                                LogLevel::Error,
+                                                LogTarget::Settings,
+                                                error,
+                                            );
+                                        } else {
+                                            self.set_logged_status(
+                                                LogLevel::Info,
+                                                LogTarget::Settings,
+                                                tr("rust.status.import.settings.success")
+                                                    .replace(
+                                                        "%0",
+                                                        &summary.applied.to_string(),
+                                                    )
+                                                    .replace(
+                                                        "%1",
+                                                        &summary.skipped.to_string(),
+                                                    ),
+                                            );
+                                        }
                                         self.persist();
                                     }
                                     Err(error) => {
