@@ -93,7 +93,7 @@ async fn send_request<T: Serialize>(
     body: &T,
     username: &str,
 ) -> Result<(Profile, Credentials), String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|error| {

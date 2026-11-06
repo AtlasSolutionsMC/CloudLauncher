@@ -31,7 +31,7 @@ struct ExtraVersionEntry {
 }
 
 pub async fn fetch_manifest() -> Result<MojangVersionManifest, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| {
@@ -118,7 +118,7 @@ pub async fn fetch_required_java_major(
         .iter()
         .find(|entry| entry.id == version_id)
         .ok_or_else(|| crate::tr("rust.error.catalog.version-missing").replace("%0", version_id))?;
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| {

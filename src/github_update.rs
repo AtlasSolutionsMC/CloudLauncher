@@ -51,7 +51,7 @@ struct GithubAsset {
 }
 
 pub async fn check_for_update(include_prereleases: bool) -> Result<CheckResult, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -172,7 +172,7 @@ pub async fn download_and_handoff(release: Release) -> Result<(), String> {
         return Err(crate::tr("rust.error.update.asset-url").to_owned());
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(180))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()

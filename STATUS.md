@@ -18,6 +18,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Crash dialogs honor the Java signature catalog's `permitHelp` flag and include help, log, and dismiss actions.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostics with Windows, model, language, DirectX, CPU/memory, and graphics provider/driver details.
 - Source crash-analysis and full-command logging preferences, with legacy settings migration.
+- `connection.ssl` migration and live TLS certificate/hostname verification across launcher and Minecraft download HTTP clients; disabling it is explicit, off by default, and shows a warning.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
 - Update, bootstrap, notice, and diagnostic lifecycle log messages are loaded from the US locale, including the dynamic loaded-notice count.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.

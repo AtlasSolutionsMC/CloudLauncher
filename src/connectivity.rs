@@ -51,7 +51,7 @@ impl Report {
 }
 
 pub async fn check() -> Report {
-    let client = match Client::builder()
+    let client = match crate::http::client_builder()
         .timeout(Duration::from_secs(5))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()

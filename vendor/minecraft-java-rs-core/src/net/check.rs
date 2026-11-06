@@ -6,7 +6,7 @@ use std::time::Duration;
 /// Content instantly, so there's no body to parse and the round-trip is fast).
 /// Falls back to `false` on any error including timeout.
 pub async fn check_internet() -> bool {
-    let client = match reqwest::Client::builder()
+    let client = match crate::net::client::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {

@@ -34,7 +34,7 @@ pub struct Notification {
 
 pub async fn fetch() -> Result<Configuration, String> {
     let brand = option_env!("LEGACYLAUNCHER_SHORT_BRAND").unwrap_or("develop");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()

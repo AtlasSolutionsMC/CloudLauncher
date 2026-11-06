@@ -1,11 +1,32 @@
 //! Centralised reqwest client construction and transport-error description.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::Deserialize;
+
+static VERIFY_CERTIFICATES: AtomicBool = AtomicBool::new(true);
+
+/// Set TLS certificate and hostname validation for subsequently built clients.
+pub fn set_certificate_validation(verify: bool) {
+    VERIFY_CERTIFICATES.store(verify, Ordering::Release);
+}
+
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if VERIFY_CERTIFICATES.load(Ordering::Acquire) {
+        builder
+    } else {
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+    }
+}
 
 /// A DNS resolver that returns only IPv4 addresses.
 ///
@@ -145,10 +166,10 @@ pub fn build_client(
     force_ipv4: bool,
     dns: Option<IpAddr>,
 ) -> reqwest::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = client_builder().timeout(Duration::from_secs(timeout_secs));
     match dns {
         Some(ip) => {
-            let boot = reqwest::Client::builder()
+            let boot = client_builder()
                 .timeout(Duration::from_secs(timeout_secs))
                 .build()?;
             let endpoint = match ip {

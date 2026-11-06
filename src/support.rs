@@ -2,7 +2,7 @@ pub async fn upload_diagnostic_report(report: String) -> Result<String, String> 
     if report.trim().is_empty() {
         return Err(crate::tr("rust.error.support.report-empty").to_owned());
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| {

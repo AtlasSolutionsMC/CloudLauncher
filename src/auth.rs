@@ -383,7 +383,7 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(Duration::from_secs(30))
         .user_agent("LegacyLauncher-Rust/0.1")
         .build()

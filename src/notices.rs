@@ -43,7 +43,7 @@ pub async fn fetch(client_id: &str) -> Result<Vec<Notice>, String> {
         .append_pair("bootstrap_name", "legacylauncher-rust")
         .append_pair("bootstrap_version", env!("CARGO_PKG_VERSION"))
         .append_pair("locale", "en_US");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| {

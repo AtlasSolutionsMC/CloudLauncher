@@ -7,6 +7,7 @@ mod diagnostics;
 mod ely;
 mod ely_legacy;
 mod github_update;
+mod http;
 mod malware;
 mod notices;
 mod support;
@@ -101,6 +102,7 @@ struct SavedSettings {
     java_runtime_directory: String,
     optimized_java_args: String,
     use_current_trust_store: bool,
+    verify_tls_certificates: bool,
     wrapper_command: String,
     legacy_experiments: HashSet<String>,
     screen_width: u32,
@@ -434,6 +436,7 @@ impl Default for SavedSettings {
             java_runtime_directory: String::new(),
             optimized_java_args: "default".to_owned(),
             use_current_trust_store: true,
+            verify_tls_certificates: true,
             wrapper_command: String::new(),
             legacy_experiments: HashSet::new(),
             screen_width: 925,
@@ -829,6 +832,7 @@ impl LauncherApp {
         }
         let persisted_settings = settings.clone();
         command_line_overrides.apply(&mut settings);
+        http::set_certificate_validation(settings.verify_tls_certificates);
         let background_custom_loaded = !settings.background_path.trim().is_empty();
         let show_global_logger =
             settings.logger_mode == "global" || command_line_overrides.debug_mode;
@@ -930,6 +934,14 @@ impl LauncherApp {
             LogTarget::Settings,
             &format!("Settings file: {}", settings_path().display()),
         );
+        if !app.settings.verify_tls_certificates {
+            record_launcher_log_event(
+                &app.launcher_log,
+                LogLevel::Warn,
+                LogTarget::Settings,
+                &tr("rust.log.connection.insecure-tls"),
+            );
+        }
         if let Some(file) = &app.external_settings_file {
             let path = match file {
                 ExternalSettingsFile::LegacyProperties(path)
@@ -957,6 +969,7 @@ impl LauncherApp {
         let mut saved_settings = self.settings.clone();
         self.command_line_overrides
             .restore_persisted_values(&mut saved_settings, &self.persisted_settings);
+        http::set_certificate_validation(saved_settings.verify_tls_certificates);
         if let Ok(bytes) = serde_json::to_vec_pretty(&saved_settings) {
             let _ = fs::write(path, bytes);
         }
@@ -6133,6 +6146,29 @@ impl eframe::App for LauncherApp {
                         {
                             self.persist();
                         }
+                        if ui
+                            .checkbox(
+                                &mut self.settings.verify_tls_certificates,
+                                tr("rust.settings.network.verify-tls"),
+                            )
+                            .changed()
+                        {
+                            if !self.settings.verify_tls_certificates {
+                                record_launcher_log_event(
+                                    &self.launcher_log,
+                                    LogLevel::Warn,
+                                    LogTarget::Settings,
+                                    &tr("rust.log.connection.insecure-tls"),
+                                );
+                            }
+                            self.persist();
+                        }
+                        if !self.settings.verify_tls_certificates {
+                            ui.colored_label(
+                                Color32::YELLOW,
+                                tr("rust.settings.network.insecure-tls.warning"),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             ui.label(tr("settings.jre.window.configure.wrapper-command"));
                             if ui
@@ -9633,6 +9669,13 @@ fn import_legacy_settings(
         settings.wrapper_command = value.trim().to_owned();
         apply("minecraft.wrapper-command", Some(()));
     }
+    if let Some(value) = properties.get("connection.ssl") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.verify_tls_certificates = enabled;
+        }
+        apply("connection.ssl", enabled.map(|_| ()));
+    }
     if let Some(value) = properties.get("minecraft.jre.type") {
         let mode = value.trim().to_ascii_lowercase();
         let valid = matches!(mode.as_str(), "recommended" | "current" | "custom");
@@ -9958,6 +10001,10 @@ fn legacy_properties_from_settings(settings: &SavedSettings) -> BTreeMap<String,
     put(
         "minecraft.jre.change-trust-store",
         settings.use_current_trust_store.to_string(),
+    );
+    put(
+        "connection.ssl",
+        settings.verify_tls_certificates.to_string(),
     );
     put(
         "minecraft.wrapper-command",
