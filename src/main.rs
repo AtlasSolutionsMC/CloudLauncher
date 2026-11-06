@@ -211,6 +211,12 @@ struct PendingPromotedServerLaunch {
     family_versions: Vec<String>,
 }
 
+#[derive(Clone)]
+struct PendingForceUpdateConfirmation {
+    version: String,
+    server: Option<SavedServer>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct MinecraftServerList {
@@ -662,6 +668,8 @@ struct LauncherApp {
     version_search: String,
     version_kind_filter: String,
     confirm_remove_version: Option<String>,
+    force_update_confirmation: Option<PendingForceUpdateConfirmation>,
+    force_update_confirmed_version: Option<String>,
     auto_launch_pending: bool,
     auto_launch_deadline: Option<Instant>,
     launcher_window_state_seen: bool,
@@ -2643,6 +2651,31 @@ impl LauncherApp {
             return;
         }
         let force_update = self.settings.force_update;
+        if force_update {
+            let has_remote_version = self
+                .version_manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.versions.iter().any(|entry| entry.id == version));
+            if !has_remote_version {
+                let title = tr("forceupdate.local.title").to_owned();
+                let message = tr("forceupdate.local").to_owned();
+                self.set_logged_status(LogLevel::Error, LogTarget::VersionManager, message.clone());
+                self.launch_error_dialog = Some(LaunchErrorDialog {
+                    title,
+                    message,
+                    details: None,
+                });
+                return;
+            }
+
+            let confirmation_accepted =
+                self.force_update_confirmed_version.take().as_deref() == Some(version.as_str());
+            if self.version_is_installed() && !confirmation_accepted {
+                self.force_update_confirmation =
+                    Some(PendingForceUpdateConfirmation { version, server });
+                return;
+            }
+        }
         let game_dir = self.game_root_for_version(&version);
         let promoted_servers = if self.settings.promoted_servers_in_game {
             self.promoted_servers_for_version(&version)
@@ -7346,6 +7379,32 @@ impl eframe::App for LauncherApp {
                 });
             if close_dialog {
                 self.confirm_remove_version = None;
+            }
+        }
+
+        if let Some(confirmation) = self.force_update_confirmation.clone() {
+            let mut decision = None;
+            egui::Modal::new(Id::unique("force_update_confirmation")).show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.heading(tr("forceupdate.question.title"));
+                ui.add_space(6.0);
+                ui.label(tr("forceupdate.question"));
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("ui.no")).clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.button(tr("ui.yes")).clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+            if let Some(confirmed) = decision {
+                self.force_update_confirmation = None;
+                if confirmed && self.settings.selected_version == confirmation.version {
+                    self.force_update_confirmed_version = Some(confirmation.version);
+                    self.start_selected_game_on_server(confirmation.server);
+                }
             }
         }
 

@@ -77,6 +77,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Fetch the official manifest and filter/search release, snapshot, old beta/alpha, and installed versions.
 - [x] Port version-category defaults, enable/disable filters, the only-installed and pre-1.7.10 filters, and import these values from `legacy.properties`.
 - [x] Install, verify/repair, refresh, and remove versions from the manager screen.
+- [x] Port source Force update guards: reject local-only builds with the localized error, require confirmation before reinstalling an installed remote version, and preserve the selected server when confirming quick play.
 - [x] Load installed custom version JSON, resolve `inheritsFrom` parents locally or from Mojang, merge libraries/arguments/downloads, and reject cycles or unsafe IDs.
 - [x] Fetch Legacy Launcher's ExtraVersionList alongside Mojang from the source host mirrors, prefer signed-bootstrap `extra_version_repo` mirrors when present, retain all extra release types, and route selected versions through the launch backend; normalize repository-relative JSON URLs and fail over between mirrors.
 - [x] Match source category defaults, old-release/old-alpha/old-beta handling, only-installed filtering, and local/remote catalog visibility; import these controls from `legacy.properties`.
