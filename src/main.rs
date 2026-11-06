@@ -3645,6 +3645,7 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
+        let mut toolbar_popup_opened_this_frame = false;
         if !self.launcher_log_initialized {
             self.launcher_log_initialized = true;
             record_launcher_log_line(&self.launcher_log, tr("rust.log.launcher-started"));
@@ -4447,7 +4448,13 @@ impl eframe::App for LauncherApp {
                     ui.horizontal(|ui| {
                         let support = icon_button(ui, "support", &support_icon, support_icon_tint);
                         if support.clicked() {
-                            self.show_support_menu = !self.show_support_menu;
+                            let opening = !self.show_support_menu;
+                            self.show_support_menu = opening;
+                            if opening {
+                                self.show_folder_menu = false;
+                                self.show_settings_menu = false;
+                                toolbar_popup_opened_this_frame = true;
+                            }
                             self.support_menu_pos =
                                 support.rect.left_bottom() + Vec2::new(0.0, 1.0);
                         }
@@ -4456,7 +4463,13 @@ impl eframe::App for LauncherApp {
                         if !self.settings.settings_blocked {
                             let folder = icon_button(ui, "folder", &folder_icon, folder_icon_tint);
                             if folder.clicked() {
-                                self.show_folder_menu = !self.show_folder_menu;
+                                let opening = !self.show_folder_menu;
+                                self.show_folder_menu = opening;
+                                if opening {
+                                    self.show_support_menu = false;
+                                    self.show_settings_menu = false;
+                                    toolbar_popup_opened_this_frame = true;
+                                }
                                 self.folder_menu_pos =
                                     folder.rect.left_bottom() + Vec2::new(0.0, 1.0);
                             }
@@ -4480,7 +4493,13 @@ impl eframe::App for LauncherApp {
                             let settings =
                                 icon_button(ui, "settings", &settings_icon, settings_icon_tint);
                             if settings.clicked() {
-                                self.show_settings_menu = !self.show_settings_menu;
+                                let opening = !self.show_settings_menu;
+                                self.show_settings_menu = opening;
+                                if opening {
+                                    self.show_support_menu = false;
+                                    self.show_folder_menu = false;
+                                    toolbar_popup_opened_this_frame = true;
+                                }
                                 self.settings_menu_pos =
                                     settings.rect.left_bottom() + Vec2::new(0.0, 1.0);
                             }
@@ -4525,7 +4544,7 @@ impl eframe::App for LauncherApp {
         }
 
         if self.show_folder_menu {
-            egui::Area::new(Id::unique("folder_popup"))
+            let popup = egui::Area::new(Id::unique("folder_popup"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(self.folder_menu_pos)
                 .show(ctx, |ui| {
@@ -4579,10 +4598,15 @@ impl eframe::App for LauncherApp {
                         }
                     });
                 });
+            if !toolbar_popup_opened_this_frame
+                && toolbar_popup_should_close(ctx, popup.response.rect)
+            {
+                self.show_folder_menu = false;
+            }
         }
 
         if self.show_support_menu {
-            egui::Area::new(Id::unique("support_popup"))
+            let popup = egui::Area::new(Id::unique("support_popup"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(self.support_menu_pos)
                 .show(ctx, |ui| {
@@ -4599,6 +4623,11 @@ impl eframe::App for LauncherApp {
                         }
                     });
                 });
+            if !toolbar_popup_opened_this_frame
+                && toolbar_popup_should_close(ctx, popup.response.rect)
+            {
+                self.show_support_menu = false;
+            }
         }
 
         if self.show_support_window {
@@ -4755,7 +4784,7 @@ impl eframe::App for LauncherApp {
         }
 
         if self.show_settings_menu {
-            egui::Area::new(Id::unique("settings_popup"))
+            let popup = egui::Area::new(Id::unique("settings_popup"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(self.settings_menu_pos)
                 .show(ctx, |ui| {
@@ -4784,6 +4813,11 @@ impl eframe::App for LauncherApp {
                         }
                     });
                 });
+            if !toolbar_popup_opened_this_frame
+                && toolbar_popup_should_close(ctx, popup.response.rect)
+            {
+                self.show_settings_menu = false;
+            }
         }
 
         if self.show_update_dialog {
@@ -9623,6 +9657,17 @@ fn diagnose_crash_fallback(log: &str) -> Vec<String> {
         suggestions.push(tr("rust.crash.fallback.mod-conflict").to_owned());
     }
     suggestions
+}
+
+fn toolbar_popup_should_close(ctx: &egui::Context, popup_rect: egui::Rect) -> bool {
+    ctx.input(|input| {
+        input.key_pressed(egui::Key::Escape)
+            || (input.pointer.any_pressed()
+                && input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|position| !popup_rect.contains(position)))
+    })
 }
 
 fn icon_button(

@@ -35,7 +35,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Port the source's nine login-form positions and migrate `gui.direction.loginform`.
 - [x] Show the source US autologin tip when the user enables automatic launch.
 - [x] Port the source Force update checkbox's ten-toggle easter egg label.
-- [ ] Match the original toolbar popup details and verify common Windows scales visually. Rust popups now anchor at the source button origin; the settings menu follows the source's Launcher, Versions, Accounts order and only shows Notices when the feed has entries. Rust-only About, Servers, and update actions moved into launcher preferences. Multi-scale visual verification remains open.
+- [ ] Match the original toolbar popup details and verify common Windows scales visually. Rust popups now anchor at the source button origin, close on outside click/Escape, and only one toolbar popup can be open; the settings menu follows the source's Launcher, Versions, Accounts order and only shows Notices when the feed has entries. Rust-only About, Servers, and update actions moved into launcher preferences. Multi-scale visual verification remains open.
 
 ### 2. Accounts and authentication
 
