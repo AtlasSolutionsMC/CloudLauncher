@@ -206,31 +206,65 @@ async fn read_limited(
     url: &str,
     limit: usize,
 ) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| crate::tr("rust.error.update.download").replace("%0", &error.to_string()))?
-        .error_for_status()
-        .map_err(|error| {
-            crate::tr("rust.error.update.asset-http").replace("%0", &error.to_string())
-        })?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(crate::tr("rust.error.update.asset-large").to_owned());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        crate::tr("rust.error.update.asset-read").replace("%0", &error.to_string())
-    })? {
-        if bytes.len().saturating_add(chunk.len()) > limit {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = match client.get(url).send().await {
+            Ok(response)
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error() =>
+            {
+                last_error = Some(
+                    crate::tr("rust.error.update.asset-http")
+                        .replace("%0", &response.status().to_string()),
+                );
+                None
+            }
+            Ok(response) => Some(response.error_for_status().map_err(|error| {
+                crate::tr("rust.error.update.asset-http").replace("%0", &error.to_string())
+            })?),
+            Err(error) => {
+                last_error =
+                    Some(crate::tr("rust.error.update.download").replace("%0", &error.to_string()));
+                None
+            }
+        };
+        let Some(mut response) = response else {
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(200_u64 << attempt)).await;
+            }
+            continue;
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
             return Err(crate::tr("rust.error.update.asset-large").to_owned());
         }
-        bytes.extend_from_slice(&chunk);
+
+        let mut bytes = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= limit => {
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(Some(_)) => {
+                    return Err(crate::tr("rust.error.update.asset-large").to_owned());
+                }
+                Ok(None) => return Ok(bytes),
+                Err(error) => {
+                    last_error = Some(
+                        crate::tr("rust.error.update.asset-read").replace("%0", &error.to_string()),
+                    );
+                    break;
+                }
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200_u64 << attempt)).await;
+        }
     }
-    Ok(bytes)
+    Err(last_error.unwrap_or_else(|| crate::tr("rust.error.update.download").to_owned()))
 }
 
 fn checksum_for_asset(checksums: &[u8], asset_name: &str) -> Result<String, String> {
