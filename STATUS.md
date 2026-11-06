@@ -21,6 +21,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.
 - Legacy `gui.font.old` migration with the source revert/dismiss prompt; restoring the earlier size applies live in Rust.
+- Source command-line game configuration for version, directory, Java, arguments, window, background, fullscreen, theme, runtime root, and delayed auto-launch; these per-run overrides are excluded from saved settings.
 - Legacy `gui.laf.v1.state` and pre-FlatLaf `gui.systemlookandfeel` migration with live Off/System/Auto/Dark/Light UI theme selection.
 - Legacy `gui.background` image migration and live image selection/reset; video backgrounds are still open.
 - Legacy `gui.theme` file migration and selection; foreground, secondary foreground, background, panel, success/failure, borders, shadow, corner-radius, and toolbar icon color properties are applied to the Rust UI.
@@ -52,7 +53,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 102 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 103 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 

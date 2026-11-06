@@ -456,6 +456,109 @@ impl Default for SavedSettings {
     }
 }
 
+#[derive(Default)]
+struct CommandLineOverrides {
+    game_directory: Option<String>,
+    java_path: Option<String>,
+    selected_version: Option<String>,
+    jvm_args: Option<String>,
+    game_args: Option<String>,
+    window_size: Option<(u32, u32)>,
+    background_path: Option<String>,
+    fullscreen: Option<bool>,
+    theme_path: Option<String>,
+    java_runtime_directory: Option<String>,
+    launch_automatically: bool,
+}
+
+impl CommandLineOverrides {
+    fn apply(&self, settings: &mut SavedSettings) {
+        if let Some(value) = &self.game_directory {
+            settings.game_directory.clone_from(value);
+        }
+        if let Some(value) = &self.java_path {
+            settings.java_path.clone_from(value);
+            settings.java_mode = "custom".to_owned();
+        }
+        if let Some(value) = &self.selected_version {
+            settings.selected_version.clone_from(value);
+        }
+        if let Some(value) = &self.jvm_args {
+            settings.jvm_args.clone_from(value);
+        }
+        if let Some(value) = &self.game_args {
+            settings.game_args.clone_from(value);
+        }
+        if let Some((width, height)) = self.window_size {
+            settings.screen_width = width;
+            settings.screen_height = height;
+        }
+        if let Some(value) = &self.background_path {
+            settings.background_path.clone_from(value);
+        }
+        if let Some(value) = self.fullscreen {
+            settings.fullscreen = value;
+        }
+        if let Some(value) = &self.theme_path {
+            settings.legacy_theme_path.clone_from(value);
+        }
+        if let Some(value) = &self.java_runtime_directory {
+            settings.java_runtime_directory.clone_from(value);
+        }
+        if self.launch_automatically {
+            settings.auto_login = true;
+        }
+    }
+
+    fn restore_persisted_values(&self, settings: &mut SavedSettings, persisted: &SavedSettings) {
+        if self.game_directory.is_some() {
+            settings
+                .game_directory
+                .clone_from(&persisted.game_directory);
+        }
+        if self.java_path.is_some() {
+            settings.java_path.clone_from(&persisted.java_path);
+            settings.java_mode.clone_from(&persisted.java_mode);
+        }
+        if self.selected_version.is_some() {
+            settings
+                .selected_version
+                .clone_from(&persisted.selected_version);
+        }
+        if self.jvm_args.is_some() {
+            settings.jvm_args.clone_from(&persisted.jvm_args);
+        }
+        if self.game_args.is_some() {
+            settings.game_args.clone_from(&persisted.game_args);
+        }
+        if self.window_size.is_some() {
+            settings.screen_width = persisted.screen_width;
+            settings.screen_height = persisted.screen_height;
+        }
+        if self.background_path.is_some() {
+            settings
+                .background_path
+                .clone_from(&persisted.background_path);
+        }
+        if self.fullscreen.is_some() {
+            settings.fullscreen = persisted.fullscreen;
+        }
+        if self.theme_path.is_some() {
+            settings
+                .legacy_theme_path
+                .clone_from(&persisted.legacy_theme_path);
+        }
+        if self.java_runtime_directory.is_some() {
+            settings
+                .java_runtime_directory
+                .clone_from(&persisted.java_runtime_directory);
+        }
+        if self.launch_automatically {
+            settings.auto_login = persisted.auto_login;
+        }
+    }
+}
+
 struct Assets {
     background: TextureHandle,
     background_light: TextureHandle,
@@ -522,6 +625,8 @@ struct LauncherApp {
     assets: Option<Assets>,
     background_theme_dark: Option<bool>,
     background_custom_loaded: bool,
+    command_line_overrides: CommandLineOverrides,
+    persisted_settings: SavedSettings,
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
     version_catalog_loading: bool,
@@ -637,7 +742,11 @@ struct LauncherApp {
 }
 
 impl LauncherApp {
-    fn new(cc: &eframe::CreationContext<'_>, require_minecraft_account: bool) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        require_minecraft_account: bool,
+        command_line_overrides: CommandLineOverrides,
+    ) -> Self {
         let background_light = load_texture(
             &cc.egui_ctx,
             "background-light",
@@ -680,7 +789,9 @@ impl LauncherApp {
             ),
         };
         let first_run_pending = !settings_path().is_file();
-        let settings = load_settings();
+        let mut settings = load_settings();
+        let persisted_settings = settings.clone();
+        command_line_overrides.apply(&mut settings);
         let background_custom_loaded = !settings.background_path.trim().is_empty();
         let show_global_logger = settings.logger_mode == "global";
         let background_load_error = if settings.background_path.trim().is_empty() {
@@ -720,6 +831,8 @@ impl LauncherApp {
             assets: Some(assets),
             background_theme_dark: None,
             background_custom_loaded: background_custom_loaded && background_load_error.is_none(),
+            command_line_overrides,
+            persisted_settings,
             require_minecraft_account,
             show_first_run_notice: first_run_pending,
             show_first_run_folder_notice,
@@ -782,7 +895,10 @@ impl LauncherApp {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self.settings) {
+        let mut saved_settings = self.settings.clone();
+        self.command_line_overrides
+            .restore_persisted_values(&mut saved_settings, &self.persisted_settings);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&saved_settings) {
             let _ = fs::write(path, bytes);
         }
     }
@@ -6121,6 +6237,8 @@ impl eframe::App for LauncherApp {
                                 };
                                 match import_legacy_settings(&path, &mut self.settings) {
                                     Ok(summary) => {
+                                        self.persisted_settings = self.settings.clone();
+                                        self.command_line_overrides.apply(&mut self.settings);
                                         self.set_logged_status(
                                             LogLevel::Info,
                                             LogTarget::Settings,
@@ -9635,6 +9753,81 @@ fn parse_legacy_bool(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_cli_window_size(value: &str) -> Option<(u32, u32)> {
+    let mut dimensions = value
+        .split(|character| matches!(character, ';' | 'x' | 'X' | ','))
+        .map(str::trim)
+        .map(str::parse::<u32>);
+    let width = dimensions.next()?.ok()?;
+    let height = dimensions.next()?.ok()?;
+    if dimensions.next().is_some()
+        || !(320..=7680).contains(&width)
+        || !(240..=4320).contains(&height)
+    {
+        return None;
+    }
+    Some((width, height))
+}
+
+fn parse_command_line_overrides(arguments: &[String]) -> CommandLineOverrides {
+    let mut overrides = CommandLineOverrides::default();
+    let mut java_directory = None;
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        index += 1;
+        let Some(argument) = argument.strip_prefix("--") else {
+            continue;
+        };
+        let (name, inline_value) = argument
+            .split_once('=')
+            .map_or((argument, None), |(name, value)| {
+                (name, Some(value.to_owned()))
+            });
+        if name == "launch" {
+            overrides.launch_automatically = true;
+            continue;
+        }
+        let value = inline_value.or_else(|| {
+            arguments
+                .get(index)
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+                .inspect(|_| index += 1)
+        });
+        let Some(value) = value else { continue };
+        match name {
+            "directory" => overrides.game_directory = Some(value),
+            "java-executable" => overrides.java_path = Some(value),
+            "java-directory" => java_directory = Some(value),
+            "version" => overrides.selected_version = Some(value),
+            "javaargs" => overrides.jvm_args = Some(value),
+            "margs" => overrides.game_args = Some(value),
+            "window" => overrides.window_size = parse_cli_window_size(&value),
+            "background" => overrides.background_path = Some(value),
+            "fullscreen" => overrides.fullscreen = parse_legacy_bool(&value),
+            "theme" => overrides.theme_path = Some(value),
+            "jre-dir" => overrides.java_runtime_directory = Some(value),
+            _ => {}
+        }
+    }
+
+    if overrides.java_path.is_none()
+        && let Some(directory) = java_directory
+    {
+        let java_executable = if cfg!(windows) { "javaw.exe" } else { "java" };
+        overrides.java_path = Some(
+            PathBuf::from(directory)
+                .join("bin")
+                .join(java_executable)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    overrides
+}
+
 fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
     if path.trim().is_empty() {
         return None;
@@ -11092,10 +11285,11 @@ pub(crate) fn open_url(url: &str) {
 
 fn main() -> eframe::Result {
     install_process_panic_logger();
-    let require_minecraft_account = std::env::args_os().skip(1).any(|argument| {
-        let argument = argument.to_string_lossy();
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let require_minecraft_account = arguments.iter().any(|argument| {
         argument == "--requireMinecraftAccount" || argument == "--require-minecraft-account"
     });
+    let command_line_overrides = parse_command_line_overrides(&arguments);
     let saved_settings = load_settings();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -11111,6 +11305,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Legacy Launcher — Rust",
         options,
-        Box::new(move |cc| Ok(Box::new(LauncherApp::new(cc, require_minecraft_account)))),
+        Box::new(move |cc| {
+            Ok(Box::new(LauncherApp::new(
+                cc,
+                require_minecraft_account,
+                command_line_overrides,
+            )))
+        }),
     )
 }
