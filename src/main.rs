@@ -1586,6 +1586,53 @@ impl LauncherApp {
         );
     }
 
+    fn remove_version_from_disk(&mut self, version: &str, remove_libraries: bool) {
+        let version_root = self
+            .installed_version_root(version)
+            .unwrap_or_else(|| self.game_root_for_version(version));
+        match remove_installed_version(
+            &version_root,
+            version,
+            remove_libraries,
+            self.settings.screen_width > 0 && self.settings.screen_height > 0,
+        ) {
+            Ok(removed_libraries) => {
+                let invalidated = invalidate_game_data_cache(&version_root, version).unwrap_or(0);
+                let message = if remove_libraries && removed_libraries > 0 {
+                    tr("rust.status.versions.removed-libraries")
+                        .replace("%0", version)
+                        .replace("%1", &removed_libraries.to_string())
+                } else if invalidated == 0 {
+                    tr("rust.status.versions.removed").replace("%0", version)
+                } else {
+                    tr("rust.status.versions.removed-caches")
+                        .replace("%0", version)
+                        .replace("%1", &invalidated.to_string())
+                };
+                self.set_logged_status(LogLevel::Info, LogTarget::VersionManager, message);
+            }
+            Err(error) => self.set_logged_status(
+                LogLevel::Error,
+                LogTarget::VersionManager,
+                tr("rust.status.versions.remove-error").replace("%0", &error.to_string()),
+            ),
+        }
+        if self.settings.selected_version == version
+            && !self
+                .installed_versions()
+                .iter()
+                .any(|installed| installed == version)
+        {
+            self.settings.selected_version = self
+                .available_versions()
+                .into_iter()
+                .find(|candidate| candidate != version)
+                .unwrap_or_else(|| "latest_release".to_owned());
+            self.persist();
+        }
+        self.confirm_remove_version = None;
+    }
+
     fn start_update_check(&mut self) {
         if self.update_checking {
             return;
@@ -7488,6 +7535,7 @@ impl eframe::App for LauncherApp {
 
         if let Some(version) = self.confirm_remove_version.clone() {
             let mut close_dialog = false;
+            let mut remove_libraries = None;
             egui::Window::new(tr("rust.ui.window.version.remove"))
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .collapsible(false)
@@ -7498,51 +7546,22 @@ impl eframe::App for LauncherApp {
                         if ui.button(tr("support.button.cancel")).clicked() {
                             close_dialog = true;
                         }
-                        if ui.button(tr("rust.ui.versions.remove")).clicked() {
-                            let version_root = self
-                                .installed_version_root(&version)
-                                .unwrap_or_else(|| self.game_root_for_version(&version));
-                            match remove_installed_version(&version_root, &version) {
-                                Ok(()) => {
-                                    let invalidated =
-                                        invalidate_game_data_cache(&version_root, &version)
-                                            .unwrap_or(0);
-                                    let message = if invalidated == 0 {
-                                        tr("rust.status.versions.removed").replace("%0", &version)
-                                    } else {
-                                        tr("rust.status.versions.removed-caches")
-                                            .replace("%0", &version)
-                                            .replace("%1", &invalidated.to_string())
-                                    };
-                                    self.set_logged_status(
-                                        LogLevel::Info,
-                                        LogTarget::VersionManager,
-                                        message,
-                                    );
-                                    if self.settings.selected_version == version {
-                                        self.settings.selected_version = self
-                                            .available_versions()
-                                            .into_iter()
-                                            .find(|candidate| candidate != &version)
-                                            .unwrap_or_else(|| "latest_release".to_owned());
-                                        self.persist();
-                                    }
-                                }
-                                Err(error) => {
-                                    self.set_logged_status(
-                                        LogLevel::Error,
-                                        LogTarget::VersionManager,
-                                        tr("rust.status.versions.remove-error")
-                                            .replace("%0", &error.to_string()),
-                                    );
-                                }
-                            }
-                            close_dialog = true;
+                        if ui.button(tr("version.manager.delete.menu.jar")).clicked() {
+                            remove_libraries = Some(false);
+                        }
+                        if ui
+                            .button(tr("version.manager.delete.menu.libraries"))
+                            .clicked()
+                        {
+                            remove_libraries = Some(true);
                         }
                     });
                 });
             if close_dialog {
                 self.confirm_remove_version = None;
+            }
+            if let Some(remove_libraries) = remove_libraries {
+                self.remove_version_from_disk(&version, remove_libraries);
             }
         }
 
@@ -12292,7 +12311,12 @@ fn valid_version_id(version: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "._+-".contains(character))
 }
 
-fn remove_installed_version(game_dir: &std::path::Path, version: &str) -> std::io::Result<()> {
+fn remove_installed_version(
+    game_dir: &std::path::Path,
+    version: &str,
+    remove_libraries: bool,
+    custom_resolution_enabled: bool,
+) -> std::io::Result<usize> {
     if !valid_version_id(version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -12317,7 +12341,245 @@ fn remove_installed_version(game_dir: &std::path::Path, version: &str) -> std::i
             "version path resolves outside the Minecraft versions folder",
         ));
     }
-    fs::remove_dir_all(canonical_target)
+    let library_paths = if remove_libraries {
+        let mut visited_versions = HashSet::new();
+        let mut paths = HashSet::new();
+        collect_installed_library_paths(
+            game_dir,
+            version,
+            custom_resolution_enabled,
+            &mut visited_versions,
+            &mut paths,
+        )?;
+        paths
+    } else {
+        HashSet::new()
+    };
+
+    fs::remove_dir_all(canonical_target)?;
+    let mut removed_libraries = 0;
+    for relative_path in library_paths {
+        if let Some(path) = resolve_installed_library_path(game_dir, &relative_path)? {
+            match fs::remove_file(path) {
+                Ok(()) => removed_libraries += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(removed_libraries)
+}
+
+fn collect_installed_library_paths(
+    game_dir: &std::path::Path,
+    version: &str,
+    custom_resolution_enabled: bool,
+    visited_versions: &mut HashSet<String>,
+    paths: &mut HashSet<String>,
+) -> std::io::Result<()> {
+    if !valid_version_id(version) || !visited_versions.insert(version.to_owned()) {
+        return Ok(());
+    }
+    let metadata_path = game_dir
+        .join("versions")
+        .join(version)
+        .join(format!("{version}.json"));
+    let bytes = match fs::read(&metadata_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "version metadata exceeds the size limit",
+        ));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if let Some(libraries) = metadata
+        .get("libraries")
+        .and_then(serde_json::Value::as_array)
+    {
+        for library in libraries {
+            if library.get("mod").and_then(serde_json::Value::as_bool) == Some(true)
+                || library
+                    .get("downloadOnly")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                || library
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind != "library")
+            {
+                continue;
+            }
+            if !library_applies_to_windows(library, custom_resolution_enabled) {
+                continue;
+            }
+            let downloads = library.get("downloads");
+            let native_classifier = library
+                .get("natives")
+                .and_then(|natives| natives.get("windows"))
+                .and_then(serde_json::Value::as_str)
+                .map(|classifier| {
+                    classifier.replace("${arch}", if usize::BITS >= 64 { "64" } else { "32" })
+                });
+            let artifact_path = if let Some(classifier) = native_classifier.as_ref() {
+                downloads
+                    .and_then(|downloads| downloads.get("classifiers"))
+                    .and_then(|classifiers| classifiers.get(classifier))
+                    .and_then(|artifact| artifact.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        library
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|name| maven_library_path(name, Some(classifier)))
+                            .map(|path| path.to_string_lossy().into_owned())
+                    })
+            } else {
+                downloads
+                    .and_then(|downloads| downloads.get("artifact"))
+                    .and_then(|artifact| artifact.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        library
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|name| maven_library_path(name, None))
+                            .map(|path| path.to_string_lossy().into_owned())
+                    })
+            };
+            if let Some(path) = artifact_path {
+                paths.insert(path);
+            }
+        }
+    }
+    if let Some(parent) = metadata
+        .get("inheritsFrom")
+        .and_then(serde_json::Value::as_str)
+    {
+        collect_installed_library_paths(
+            game_dir,
+            parent,
+            custom_resolution_enabled,
+            visited_versions,
+            paths,
+        )?;
+    }
+    Ok(())
+}
+
+fn library_applies_to_windows(
+    library: &serde_json::Value,
+    custom_resolution_enabled: bool,
+) -> bool {
+    let Some(rules) = library.get("rules").and_then(serde_json::Value::as_array) else {
+        return true;
+    };
+    let mut allowed = false;
+    for rule in rules {
+        if let Some(os) = rule.get("os") {
+            if os
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name != "windows")
+                || os
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            {
+                continue;
+            }
+        }
+        let features_match = rule
+            .get("features")
+            .and_then(serde_json::Value::as_object)
+            .is_none_or(|features| {
+                features.iter().all(|(name, value)| {
+                    name == "has_custom_resolution"
+                        && value.as_bool() == Some(true)
+                        && custom_resolution_enabled
+                })
+            });
+        if !features_match {
+            continue;
+        }
+        allowed = rule
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|action| action == "allow");
+    }
+    allowed
+}
+
+fn maven_library_path(name: &str, classifier: Option<&str>) -> Option<PathBuf> {
+    let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
+    let parts = coordinate.split(':').collect::<Vec<_>>();
+    if !(3..=4).contains(&parts.len()) || parts.iter().any(|part| part.trim().is_empty()) {
+        return None;
+    }
+    let group_path = parts[0].replace('.', "/");
+    let selected_classifier = classifier.or_else(|| parts.get(3).copied());
+    let filename = match selected_classifier {
+        Some(classifier) => format!("{}-{}-{classifier}.{extension}", parts[1], parts[2]),
+        None => format!("{}-{}.{}", parts[1], parts[2], extension),
+    };
+    Some(
+        PathBuf::from(group_path)
+            .join(parts[1])
+            .join(parts[2])
+            .join(filename),
+    )
+}
+
+fn resolve_installed_library_path(
+    game_dir: &std::path::Path,
+    relative_path: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let relative_path = std::path::Path::new(relative_path);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "library path contains unsupported path components",
+        ));
+    }
+    let library_root = game_dir.join("libraries");
+    let canonical_game_dir = game_dir.canonicalize()?;
+    let canonical_root = match library_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if canonical_root.parent() != Some(canonical_game_dir.as_path()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "libraries folder resolves outside the selected Minecraft folder",
+        ));
+    }
+    let path = library_root.join(relative_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "library path resolves outside the selected Minecraft folder",
+        ));
+    }
+    Ok(Some(path))
 }
 
 fn invalidate_game_data_cache(game_dir: &std::path::Path, version: &str) -> std::io::Result<usize> {
