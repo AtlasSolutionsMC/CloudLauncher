@@ -87,6 +87,7 @@ struct SavedSettings {
     servers: Vec<SavedServer>,
     servers_cache_root: String,
     background_path: String,
+    legacy_theme_path: String,
     game_directory: String,
     legacy_profiles_path: String,
     legacy_config_path: String,
@@ -416,6 +417,7 @@ impl Default for SavedSettings {
             servers: Vec::new(),
             servers_cache_root: String::new(),
             background_path: String::new(),
+            legacy_theme_path: String::new(),
             game_directory: default_game_directory().to_string_lossy().into_owned(),
             legacy_profiles_path: String::new(),
             legacy_config_path: default_legacy_config_path().to_string_lossy().into_owned(),
@@ -454,6 +456,21 @@ struct Assets {
     folder: TextureHandle,
     refresh: TextureHandle,
     settings: TextureHandle,
+}
+
+#[derive(Default)]
+struct LegacyThemePalette {
+    foreground: Option<Color32>,
+    semi_foreground: Option<Color32>,
+    background: Option<Color32>,
+    panel_background: Option<Color32>,
+    success: Option<Color32>,
+    failure: Option<Color32>,
+    border: Option<Color32>,
+    border_main: Option<Color32>,
+    border_additional: Option<Color32>,
+    border_settings: Option<Color32>,
+    border_size: Option<f32>,
 }
 
 #[derive(Default)]
@@ -512,6 +529,8 @@ struct LauncherApp {
     selected_log_path: Option<PathBuf>,
     show_settings_menu: bool,
     settings_menu_pos: Pos2,
+    legacy_theme_palette_path: String,
+    legacy_theme_palette: Option<LegacyThemePalette>,
     update_check_events: Option<Receiver<Result<github_update::CheckResult, String>>>,
     update_checking: bool,
     available_release: Option<github_update::Release>,
@@ -2963,6 +2982,10 @@ impl eframe::App for LauncherApp {
             self.auto_launch_pending = false;
             self.start_selected_game();
         }
+        if self.legacy_theme_palette_path != self.settings.legacy_theme_path {
+            self.legacy_theme_palette = load_legacy_theme_palette(&self.settings.legacy_theme_path);
+            self.legacy_theme_palette_path = self.settings.legacy_theme_path.clone();
+        }
         let theme_preference = match self.settings.look_and_feel.as_str() {
             "off" | "system" | "auto" => egui::ThemePreference::System,
             "light" => egui::ThemePreference::Light,
@@ -2979,6 +3002,9 @@ impl eframe::App for LauncherApp {
             style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(94, 101, 104);
             style.visuals.widgets.active.bg_fill = Color32::from_rgb(64, 116, 144);
             style.visuals.selection.bg_fill = Color32::from_rgb(54, 116, 153);
+        }
+        if let Some(palette) = &self.legacy_theme_palette {
+            apply_legacy_theme_palette(&mut style, palette);
         }
         style.spacing.item_spacing = Vec2::new(0.0, 5.0);
         style.spacing.interact_size.y = 22.0;
@@ -5137,6 +5163,7 @@ impl eframe::App for LauncherApp {
             let mut open = true;
             let mut browse_game_directory = false;
             let mut browse_background_file = false;
+            let mut browse_theme_file = false;
             let mut logger_mode_changed = false;
             egui::Window::new(settings_page_title(title))
                 .open(&mut open)
@@ -5204,6 +5231,21 @@ impl eframe::App for LauncherApp {
                                         false,
                                     );
                                 }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(tr("rust.settings.theme.file"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings.legacy_theme_path)
+                                    .desired_width(280.0)
+                                    .interactive(false),
+                            );
+                            if ui.button(tr("newfolder.select.browse")).clicked() {
+                                browse_theme_file = true;
+                            }
+                            if ui.button(tr("rust.settings.theme.default")).clicked() {
+                                self.settings.legacy_theme_path.clear();
+                                self.persist();
                             }
                         });
                         ui.horizontal(|ui| {
@@ -6321,6 +6363,29 @@ impl eframe::App for LauncherApp {
                                 tr("rust.status.background.load-error").replace("%0", &error),
                             );
                         }
+                    }
+                }
+            }
+            if browse_theme_file {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title(tr("rust.settings.theme.file"))
+                    .add_filter(tr("rust.settings.theme.filter"), &["properties"])
+                    .pick_file()
+                {
+                    match fs::read(&path) {
+                        Ok(_) => {
+                            self.settings.legacy_theme_path = path
+                                .canonicalize()
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .into_owned();
+                            self.persist();
+                        }
+                        Err(error) => self.set_logged_status(
+                            LogLevel::Error,
+                            LogTarget::Settings,
+                            tr("rust.status.theme.load-error").replace("%0", &error.to_string()),
+                        ),
                     }
                 }
             }
@@ -8942,6 +9007,14 @@ fn import_legacy_settings(
         }
         apply("gui.background", valid.then_some(()));
     }
+    if let Some(value) = properties.get("gui.theme") {
+        let path = PathBuf::from(value.trim());
+        let valid = !value.trim().is_empty() && path.is_file();
+        if valid {
+            settings.legacy_theme_path = path.to_string_lossy().into_owned();
+        }
+        apply("gui.theme", valid.then_some(()));
+    }
     if let Some(value) = properties.get("gui.laf.v1.state") {
         let state = value.trim().to_ascii_lowercase();
         let valid = matches!(state.as_str(), "off" | "system" | "auto" | "dark" | "light");
@@ -9286,6 +9359,101 @@ fn parse_legacy_bool(value: &str) -> Option<bool> {
         "true" | "yes" | "1" => Some(true),
         "false" | "no" | "0" => Some(false),
         _ => None,
+    }
+}
+
+fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let properties = parse_java_properties(&String::from_utf8_lossy(&bytes));
+    let color = |key: &str| {
+        properties
+            .get(key)
+            .and_then(|value| parse_legacy_theme_color(value))
+    };
+    Some(LegacyThemePalette {
+        foreground: color("foreground"),
+        semi_foreground: color("semiforeground"),
+        background: color("background"),
+        panel_background: color("panelbackground"),
+        success: color("success"),
+        failure: color("failure"),
+        border: color("border.color"),
+        border_main: color("border.main_panel"),
+        border_additional: color("border.additional_panel"),
+        border_settings: color("border.settings_panel"),
+        border_size: properties
+            .get("border.size")
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|value| *value <= 24)
+            .map(f32::from),
+    })
+}
+
+fn parse_legacy_theme_color(value: &str) -> Option<Color32> {
+    let channels = value
+        .trim()
+        .split('.')
+        .map(str::trim)
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if !(3..=4).contains(&channels.len()) {
+        return None;
+    }
+    Some(Color32::from_rgba_unmultiplied(
+        channels[0],
+        channels[1],
+        channels[2],
+        channels.get(3).copied().unwrap_or(255),
+    ))
+}
+
+fn apply_legacy_theme_palette(style: &mut egui::Style, palette: &LegacyThemePalette) {
+    let visuals = &mut style.visuals;
+    if let Some(background) = palette.background {
+        visuals.window_fill = background;
+        visuals.panel_fill = background;
+    }
+    if let Some(panel_background) = palette.panel_background {
+        visuals.widgets.noninteractive.bg_fill = panel_background;
+        visuals.faint_bg_color = panel_background;
+        visuals.extreme_bg_color = panel_background;
+        visuals.text_edit_bg_color = Some(panel_background);
+    }
+    if let Some(foreground) = palette.foreground {
+        visuals.override_text_color = Some(foreground);
+        visuals.widgets.noninteractive.fg_stroke.color = foreground;
+        visuals.widgets.inactive.fg_stroke.color = foreground;
+        visuals.widgets.hovered.fg_stroke.color = foreground;
+        visuals.widgets.active.fg_stroke.color = foreground;
+        visuals.widgets.open.fg_stroke.color = foreground;
+    }
+    if let Some(semi_foreground) = palette.semi_foreground {
+        visuals.weak_text_color = Some(semi_foreground);
+    }
+    if let Some(success) = palette.success {
+        visuals.hyperlink_color = success;
+        visuals.selection.bg_fill = success;
+    }
+    if let Some(failure) = palette.failure {
+        visuals.error_fg_color = failure;
+    }
+    if let Some(border) = palette.border.or(palette.border_settings) {
+        visuals.window_stroke.color = border;
+        visuals.widgets.noninteractive.bg_stroke.color = border;
+    }
+    if let Some(border) = palette.border_main {
+        visuals.selection.bg_fill = border;
+    }
+    if let Some(border) = palette.border_additional {
+        visuals.widgets.hovered.bg_stroke.color = border;
+    }
+    if let Some(border) = palette.border_size {
+        visuals.window_stroke.width = border;
+        visuals.widgets.noninteractive.bg_stroke.width = border;
     }
 }
 

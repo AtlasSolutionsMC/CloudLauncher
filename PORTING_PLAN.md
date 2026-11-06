@@ -64,7 +64,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [ ] Port the remaining Java Log4j diagnostics and compare logger coverage against the Java source. In-memory log records now carry timestamps, levels, and subsystem targets; Minecraft download/process, auth, Java, mod, server, catalog, update, bootstrap, notice, diagnostic, settings-import, and crash events are categorized. A process-wide Rust panic hook now writes redacted panic details and a forced backtrace to the rolling launcher log; full per-call-site coverage is still open.
 - [x] Record source-style startup version/platform, working-directory, and settings-file context in the launcher log.
 - [x] Import `bootstrap.switchToBeta` and expose it as an opt-in prerelease update channel for the Rust self-updater.
-- [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
+- [ ] Migrate the remaining Java launcher settings and unsupported legacy account types. The Rust importer now also preserves the source `gui.theme` file path, and the launcher maps its foreground/background/status/border colors into egui; remaining settings and account-type comparison is open.
 - [x] Preserve the source `client` UUID and import/run all six `experiments.enabled` options, including runtime-gated ZGC generational support and LWJGL/JNA replacement profiles.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.
 - [x] Preserve each offline account's `elySkins` preference (defaulting to the Java source's `true` value), import it from `tlauncher_profiles.json`, and apply the matching Ely/plain/Minecraft replacement libraries from `libraries/replace.json` with repo failover and isolated launch caches.
