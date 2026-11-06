@@ -446,7 +446,9 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
         .timeout(std::time::Duration::from_secs(12))
         .user_agent(concat!("LegacyLauncher-Rust/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            crate::tr("rust.error.crash-signatures.client").replace("%0", &error.to_string())
+        })?;
     let roots: Vec<String> = if repositories.is_empty() {
         DEFAULT_SIGNATURE_REPOSITORIES
             .iter()
@@ -464,12 +466,20 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
             Ok(response) => match response.error_for_status() {
                 Ok(response) => response,
                 Err(error) => {
-                    last_error = Some(format!("GET {url}: {error}"));
+                    last_error = Some(
+                        crate::tr("rust.error.crash-signatures.request")
+                            .replace("%0", &url)
+                            .replace("%1", &error.to_string()),
+                    );
                     continue;
                 }
             },
             Err(error) => {
-                last_error = Some(format!("GET {url}: {error}"));
+                last_error = Some(
+                    crate::tr("rust.error.crash-signatures.request")
+                        .replace("%0", &url)
+                        .replace("%1", &error.to_string()),
+                );
                 continue;
             }
         };
@@ -477,7 +487,8 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
             .content_length()
             .is_some_and(|length| length > MAX_SIGNATURE_BYTES as u64)
         {
-            last_error = Some(format!("GET {url}: signature catalog exceeds size limit"));
+            last_error =
+                Some(crate::tr("rust.error.crash-signatures.response-large").replace("%0", &url));
             continue;
         }
         let mut bytes = Vec::new();
@@ -490,15 +501,19 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
                     bytes.extend_from_slice(&chunk);
                 }
                 Ok(Some(_)) => {
-                    last_error = Some(format!("GET {url}: signature catalog exceeds size limit"));
+                    last_error = Some(
+                        crate::tr("rust.error.crash-signatures.response-large").replace("%0", &url),
+                    );
                     bytes.clear();
                     break;
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    last_error = Some(format!(
-                        "GET {url}: failed to read signature catalog: {error}"
-                    ));
+                    last_error = Some(
+                        crate::tr("rust.error.crash-signatures.response-read")
+                            .replace("%0", &url)
+                            .replace("%1", &error.to_string()),
+                    );
                     bytes.clear();
                     break;
                 }
@@ -510,21 +525,27 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
         let decoded = match uncompress_marked(&bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
-                last_error = Some(format!("GET {url}: {error}"));
+                last_error = Some(
+                    crate::tr("rust.error.crash-signatures.decode")
+                        .replace("%0", &url)
+                        .replace("%1", &error),
+                );
                 continue;
             }
         };
         let catalog: Value = match serde_json::from_slice(&decoded) {
             Ok(catalog) => catalog,
             Err(error) => {
-                last_error = Some(format!("GET {url}: invalid signature JSON: {error}"));
+                last_error = Some(
+                    crate::tr("rust.error.crash-signatures.json")
+                        .replace("%0", &url)
+                        .replace("%1", &error.to_string()),
+                );
                 continue;
             }
         };
         if !valid_signature_catalog(&catalog) {
-            last_error = Some(format!(
-                "GET {url}: signature catalog is missing required fields"
-            ));
+            last_error = Some(crate::tr("rust.error.crash-signatures.invalid").replace("%0", &url));
             continue;
         }
         saw_valid_catalog = true;
@@ -536,7 +557,8 @@ pub async fn refresh_external_signatures(repositories: &[String]) -> Result<Opti
     if saw_valid_catalog {
         Ok(None)
     } else {
-        Err(last_error.unwrap_or_else(|| "no crash-signature repository available".to_owned()))
+        Err(last_error
+            .unwrap_or_else(|| crate::tr("rust.error.crash-signatures.unavailable").to_owned()))
     }
 }
 
@@ -594,18 +616,22 @@ fn uncompress_marked(input: &[u8]) -> Result<Vec<u8>, String> {
             GzDecoder::new(&input[5..])
                 .take(MAX_SIGNATURE_BYTES as u64 + 1)
                 .read_to_end(&mut output)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    crate::tr("rust.error.crash-signatures.gzip").replace("%0", &error.to_string())
+                })?;
         }
         Some(b"bzip:") => {
             BzDecoder::new(&input[5..])
                 .take(MAX_SIGNATURE_BYTES as u64 + 1)
                 .read_to_end(&mut output)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    crate::tr("rust.error.crash-signatures.bzip2").replace("%0", &error.to_string())
+                })?;
         }
         _ => output.extend_from_slice(input),
     }
     if output.len() > MAX_SIGNATURE_BYTES {
-        return Err("decompressed signature catalog exceeds size limit".to_owned());
+        return Err(crate::tr("rust.error.crash-signatures.decompressed-large").to_owned());
     }
     Ok(output)
 }
