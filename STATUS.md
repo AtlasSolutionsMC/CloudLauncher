@@ -21,7 +21,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.
 - Legacy `gui.font` migration and live launcher-wide text/UI scaling from 12 to 18 pt.
 - Legacy `gui.font.old` migration with the source revert/dismiss prompt; restoring the earlier size applies live in Rust.
-- Source command-line configuration for version, directory, Java, arguments, window, background, fullscreen, theme, runtime root, delayed auto-launch, username/type account selection, and help/debug startup behavior.
+- Source command-line configuration for an external Java properties or Rust JSON settings file, version, directory, Java, arguments, window, background, fullscreen, theme, runtime root, delayed auto-launch, username/type account selection, and help/debug startup behavior.
 - Legacy `gui.laf.v1.state` and pre-FlatLaf `gui.systemlookandfeel` migration with live Off/System/Auto/Dark/Light UI theme selection.
 - Legacy `gui.background` image migration and live image selection/reset; video backgrounds are still open.
 - Legacy `gui.theme` file migration and selection; foreground, secondary foreground, background, panel, success/failure, borders, shadow, corner-radius, and toolbar icon color properties are applied to the Rust UI.

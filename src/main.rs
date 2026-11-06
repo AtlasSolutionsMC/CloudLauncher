@@ -470,6 +470,7 @@ struct CommandLineOverrides {
     java_runtime_directory: Option<String>,
     username: Option<String>,
     user_type: Option<String>,
+    settings_path: Option<String>,
     debug_mode: bool,
     launch_automatically: bool,
 }
@@ -565,6 +566,12 @@ impl CommandLineOverrides {
     }
 }
 
+#[derive(Clone)]
+enum ExternalSettingsFile {
+    LegacyProperties(PathBuf),
+    RustJson(PathBuf),
+}
+
 struct Assets {
     background: TextureHandle,
     background_light: TextureHandle,
@@ -633,6 +640,7 @@ struct LauncherApp {
     background_custom_loaded: bool,
     command_line_overrides: CommandLineOverrides,
     persisted_settings: SavedSettings,
+    external_settings_file: Option<ExternalSettingsFile>,
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
     version_catalog_loading: bool,
@@ -794,8 +802,31 @@ impl LauncherApp {
                 true,
             ),
         };
-        let first_run_pending = !settings_path().is_file();
         let mut settings = load_settings();
+        let default_settings_exists = settings_path().is_file();
+        let custom_settings_path = command_line_overrides
+            .settings_path
+            .as_deref()
+            .map(PathBuf::from);
+        let custom_settings_exists = custom_settings_path
+            .as_ref()
+            .is_some_and(|path| path.is_file());
+        let first_run_pending = !default_settings_exists && !custom_settings_exists;
+        let mut external_settings_file = None;
+        let mut external_settings_error = None;
+        if let Some(path) = custom_settings_path {
+            match load_external_settings_file(&path, &mut settings) {
+                Ok(file) => {
+                    if !path.is_file()
+                        && let Err(error) = write_external_settings_file(&file, &settings)
+                    {
+                        external_settings_error = Some(error);
+                    }
+                    external_settings_file = Some(file);
+                }
+                Err(error) => external_settings_error = Some(error),
+            }
+        }
         let persisted_settings = settings.clone();
         command_line_overrides.apply(&mut settings);
         let background_custom_loaded = !settings.background_path.trim().is_empty();
@@ -845,6 +876,7 @@ impl LauncherApp {
             background_custom_loaded: background_custom_loaded && background_load_error.is_none(),
             command_line_overrides,
             persisted_settings,
+            external_settings_file,
             require_minecraft_account,
             show_first_run_notice: first_run_pending,
             show_first_run_folder_notice,
@@ -865,8 +897,11 @@ impl LauncherApp {
             update_checking: true,
             version_kind_filter: "all".to_owned(),
             auto_launch_pending,
-            status: background_load_error
-                .map(|error| tr("rust.status.background.load-error").replace("%0", &error))
+            status: external_settings_error
+                .or_else(|| {
+                    background_load_error
+                        .map(|error| tr("rust.status.background.load-error").replace("%0", &error))
+                })
                 .unwrap_or_default(),
             ..Default::default()
         };
@@ -895,6 +930,18 @@ impl LauncherApp {
             LogTarget::Settings,
             &format!("Settings file: {}", settings_path().display()),
         );
+        if let Some(file) = &app.external_settings_file {
+            let path = match file {
+                ExternalSettingsFile::LegacyProperties(path)
+                | ExternalSettingsFile::RustJson(path) => path,
+            };
+            record_launcher_log_event(
+                &app.launcher_log,
+                LogLevel::Debug,
+                LogTarget::Settings,
+                &format!("External settings file: {}", path.display()),
+            );
+        }
         if !app.status.is_empty() {
             let startup_error = app.status.clone();
             app.set_logged_status(LogLevel::Error, LogTarget::Launcher, startup_error);
@@ -912,6 +959,17 @@ impl LauncherApp {
             .restore_persisted_values(&mut saved_settings, &self.persisted_settings);
         if let Ok(bytes) = serde_json::to_vec_pretty(&saved_settings) {
             let _ = fs::write(path, bytes);
+        }
+        if let Some(external_settings_file) = &self.external_settings_file
+            && let Err(error) =
+                write_external_settings_file(external_settings_file, &saved_settings)
+        {
+            record_launcher_log_event(
+                &self.launcher_log,
+                LogLevel::Error,
+                LogTarget::Settings,
+                &error,
+            );
         }
     }
 
@@ -9028,7 +9086,11 @@ fn is_windows_arm_host() -> bool {
 }
 
 fn load_settings() -> SavedSettings {
-    let saved_bytes = fs::read(settings_path()).ok();
+    load_settings_from_path(&settings_path())
+}
+
+fn load_settings_from_path(path: &Path) -> SavedSettings {
+    let saved_bytes = fs::read(path).ok();
     let saved_json = saved_bytes
         .as_deref()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
@@ -9145,6 +9207,46 @@ fn load_settings() -> SavedSettings {
         )
     });
     settings
+}
+
+fn load_external_settings_file(
+    path: &Path,
+    settings: &mut SavedSettings,
+) -> Result<ExternalSettingsFile, String> {
+    let is_json_path = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    match fs::read(path) {
+        Ok(bytes) => {
+            if serde_json::from_slice::<SavedSettings>(&bytes).is_ok() {
+                *settings = load_settings_from_path(path);
+                return Ok(ExternalSettingsFile::RustJson(path.to_path_buf()));
+            }
+            if is_json_path {
+                return Err(tr("rust.error.settings.custom-json")
+                    .replace("%0", &path.display().to_string()));
+            }
+            let properties = parse_java_properties(&String::from_utf8_lossy(&bytes));
+            if properties.is_empty() && !bytes.is_empty() {
+                return Err(tr("rust.error.settings.custom-format")
+                    .replace("%0", &path.display().to_string()));
+            }
+            if !properties.is_empty() {
+                import_legacy_settings(path, settings)?;
+            }
+            Ok(ExternalSettingsFile::LegacyProperties(path.to_path_buf()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if is_json_path {
+                Ok(ExternalSettingsFile::RustJson(path.to_path_buf()))
+            } else {
+                Ok(ExternalSettingsFile::LegacyProperties(path.to_path_buf()))
+            }
+        }
+        Err(error) => Err(tr("rust.error.import.settings-read")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())),
+    }
 }
 
 fn import_legacy_settings(
@@ -9721,6 +9823,344 @@ fn import_legacy_settings(
     Ok(summary)
 }
 
+fn write_external_settings_file(
+    file: &ExternalSettingsFile,
+    settings: &SavedSettings,
+) -> Result<(), String> {
+    match file {
+        ExternalSettingsFile::RustJson(path) => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Could not create settings directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+            let bytes = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
+            fs::write(path, bytes).map_err(|error| {
+                format!("Could not write settings file {}: {error}", path.display())
+            })
+        }
+        ExternalSettingsFile::LegacyProperties(path) => write_legacy_properties(path, settings),
+    }
+}
+
+fn legacy_properties_from_settings(settings: &SavedSettings) -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    let mut put = |key: &str, value: String| {
+        properties.insert(key.to_owned(), value);
+    };
+    put("client", settings.client_id.clone());
+    let mut experiments = settings
+        .legacy_experiments
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    experiments.sort();
+    put("experiments.enabled", experiments.join(";"));
+    put("jarscanner", settings.malware_scan_version.to_string());
+    put("minecraft.gamedir", settings.game_directory.clone());
+    put("login.version", settings.selected_version.clone());
+    put(
+        "minecraft.gamedir.separate",
+        match settings.separate_game_directories {
+            SeparateDirs::None => "none",
+            SeparateDirs::Family => "family",
+            SeparateDirs::Version => "version",
+        }
+        .to_owned(),
+    );
+    put("minecraft.onlaunch", settings.launch_action.clone());
+    put(
+        "minecraft.crash",
+        settings.crash_detection_enabled.to_string(),
+    );
+    put(
+        "gui.logger.fullcommand",
+        settings.show_full_game_command.to_string(),
+    );
+    put("gui.logger", settings.logger_mode.clone());
+    put("login.auto", settings.auto_login.to_string());
+    put(
+        "login.auto.timeout",
+        settings.auto_login_timeout_secs.to_string(),
+    );
+    put(
+        "gui.settings.blocked",
+        settings.settings_blocked.to_string(),
+    );
+    put("feedback", settings.feedback_acknowledged.to_string());
+    put(
+        "gui.size",
+        format!(
+            "{}x{}",
+            settings.launcher_window_width, settings.launcher_window_height
+        ),
+    );
+    put(
+        "gui.window",
+        if settings.launcher_maximized {
+            "6"
+        } else {
+            "0"
+        }
+        .to_owned(),
+    );
+    put("gui.logger.width", settings.log_window_width.to_string());
+    put("gui.logger.height", settings.log_window_height.to_string());
+    put("gui.logger.x", settings.log_window_x.to_string());
+    put("gui.logger.y", settings.log_window_y.to_string());
+    put("gui.font", settings.launcher_font_size.to_string());
+    if let Some(size) = settings.legacy_font_size_revert {
+        put("gui.font.old", size.to_string());
+    }
+    if !settings.background_path.trim().is_empty() {
+        put("gui.background", settings.background_path.clone());
+    }
+    if !settings.legacy_theme_path.trim().is_empty() {
+        put("gui.theme", settings.legacy_theme_path.clone());
+    }
+    put("gui.laf.v1.state", settings.look_and_feel.clone());
+    put(
+        "gui.direction.loginform",
+        settings.login_form_direction.clone(),
+    );
+    put(
+        "minecraft.size",
+        format!("{}x{}", settings.screen_width, settings.screen_height),
+    );
+    put("minecraft.fullscreen", settings.fullscreen.to_string());
+    put("minecraft.gpu", settings.gpu_preference.clone());
+    put(
+        "windows.gpuperf",
+        settings.windows_gpu_performance.to_string(),
+    );
+    put("minecraft.jre.dir", settings.java_runtime_directory.clone());
+    put(
+        "minecraft.improvedargs.type",
+        settings.optimized_java_args.clone(),
+    );
+    put(
+        "minecraft.jre.change-trust-store",
+        settings.use_current_trust_store.to_string(),
+    );
+    put(
+        "minecraft.wrapper-command",
+        settings.wrapper_command.clone(),
+    );
+    put("minecraft.jre.type", settings.java_mode.clone());
+    if settings.java_mode == "custom" && !settings.java_path.trim().is_empty() {
+        put("minecraft.jre.custom.path", settings.java_path.clone());
+    }
+    put("minecraft.javaargs", settings.jvm_args.clone());
+    put("minecraft.args", settings.game_args.clone());
+    if settings.automatic_memory {
+        put("minecraft.xmx", "auto".to_owned());
+    } else if let Some(memory_mb) = parse_memory_size(&settings.max_memory) {
+        put("minecraft.xmx", (memory_mb / 1024_u64.pow(2)).to_string());
+    }
+    for (kind, enabled) in &settings.version_catalog_types {
+        let key = match kind.as_str() {
+            "old-beta" => "minecraft.versions.old_beta",
+            "old-alpha" => "minecraft.versions.old_alpha",
+            other => match other {
+                "snapshot" => "minecraft.versions.snapshot",
+                "modified" => "minecraft.versions.modified",
+                "launcher" => "minecraft.versions.launcher",
+                "pending" => "minecraft.versions.pending",
+                _ => continue,
+            },
+        };
+        put(key, enabled.to_string());
+    }
+    put(
+        "minecraft.versions.sub.old_release",
+        settings.version_show_old_releases.to_string(),
+    );
+    put(
+        "minecraft.versions.only-installed",
+        settings.version_only_installed.to_string(),
+    );
+    put(
+        "minecraft.versions.sub.remote",
+        settings.version_include_remote.to_string(),
+    );
+    for (kind, enabled) in &settings.version_alert_types {
+        if matches!(
+            kind.as_str(),
+            "release" | "snapshot" | "modified" | "old-beta" | "old-alpha" | "launcher" | "pending"
+        ) {
+            put(&format!("gui.alerton.{kind}"), enabled.to_string());
+        }
+    }
+    put("notice.enabled", settings.notices_enabled.to_string());
+    put("bootstrap.switchToBeta", settings.beta_updates.to_string());
+    put(
+        "notice.promoted",
+        settings.promoted_notices_enabled.to_string(),
+    );
+    put(
+        "minecraft.servers.promoted.ingame",
+        settings.promoted_servers_in_game.to_string(),
+    );
+    put(
+        "minecraft.mods.removeUndesirable",
+        settings.remove_undesirable_mods.to_string(),
+    );
+    put("minecraft.deletePatchy", settings.delete_patchy.to_string());
+    for (id, expiry) in &settings.hidden_notices_until {
+        put(&format!("notice.id.{id}"), expiry.to_string());
+    }
+    properties
+}
+
+fn escape_java_property_component(value: &str, escape_all_spaces: bool) -> String {
+    let mut escaped = String::new();
+    let mut first = true;
+    for unit in value.encode_utf16() {
+        match unit {
+            0x20 if escape_all_spaces || first => escaped.push_str("\\ "),
+            0x5c => escaped.push_str("\\\\"),
+            0x3a | 0x3d if escape_all_spaces => {
+                escaped.push('\\');
+                escaped.push(char::from_u32(unit as u32).unwrap_or('?'));
+            }
+            0x23 | 0x21 if escape_all_spaces && first => {
+                escaped.push('\\');
+                escaped.push(char::from_u32(unit as u32).unwrap_or('?'));
+            }
+            0x09 => escaped.push_str("\\t"),
+            0x0a => escaped.push_str("\\n"),
+            0x0d => escaped.push_str("\\r"),
+            0x0c => escaped.push_str("\\f"),
+            0x21..=0x7e if !matches!(unit, 0x3a | 0x3d) || !escape_all_spaces => {
+                escaped.push(char::from_u32(unit as u32).unwrap_or('?'));
+            }
+            _ => escaped.push_str(&format!("\\u{unit:04X}")),
+        }
+        first = false;
+    }
+    escaped
+}
+
+fn finish_legacy_property_group(
+    preserved_lines: &mut Vec<String>,
+    group_lines: &mut Vec<String>,
+    logical_line: &mut String,
+    managed_keys: &HashSet<String>,
+) {
+    if !group_lines.is_empty() {
+        let key = parse_java_properties(logical_line).into_keys().next();
+        if key
+            .as_ref()
+            .is_none_or(|key| !managed_keys.contains(key) && !key.starts_with("notice.id."))
+        {
+            preserved_lines.append(group_lines);
+        } else {
+            group_lines.clear();
+        }
+    }
+    logical_line.clear();
+}
+
+fn write_legacy_properties(path: &Path, settings: &SavedSettings) -> Result<(), String> {
+    let original = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "Could not read settings file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let properties = legacy_properties_from_settings(settings);
+    let mut managed_keys = properties.keys().cloned().collect::<HashSet<_>>();
+    managed_keys.extend(
+        [
+            "gui.background",
+            "gui.theme",
+            "gui.font.old",
+            "gui.systemlookandfeel",
+            "minecraft.improvedargs",
+            "minecraft.deleteTlSkinCape",
+            "minecraft.memory",
+            "minecraft.xmx",
+            "minecraft.cmd",
+            "minecraft.jre.custom.path",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+
+    let mut preserved_lines = Vec::new();
+    let mut group_lines = Vec::new();
+    let mut logical_line = String::new();
+    for raw_line in original.lines() {
+        if logical_line.is_empty() {
+            let trimmed = raw_line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
+                preserved_lines.push(raw_line.to_owned());
+                continue;
+            }
+            group_lines.push(raw_line.to_owned());
+            logical_line.push_str(trimmed);
+        } else {
+            group_lines.push(raw_line.to_owned());
+            logical_line.push_str(raw_line.trim_start());
+        }
+        let trailing_slashes = logical_line
+            .chars()
+            .rev()
+            .take_while(|character| *character == '\\')
+            .count();
+        if trailing_slashes % 2 == 1 {
+            logical_line.pop();
+            continue;
+        }
+        finish_legacy_property_group(
+            &mut preserved_lines,
+            &mut group_lines,
+            &mut logical_line,
+            &managed_keys,
+        );
+    }
+    finish_legacy_property_group(
+        &mut preserved_lines,
+        &mut group_lines,
+        &mut logical_line,
+        &managed_keys,
+    );
+
+    let mut contents = preserved_lines.join("\n");
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    for (key, value) in properties {
+        contents.push_str(&escape_java_property_component(&key, true));
+        contents.push('=');
+        contents.push_str(&escape_java_property_component(&value, false));
+        contents.push('\n');
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Could not create settings directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(path, contents)
+        .map_err(|error| format!("Could not write settings file {}: {error}", path.display()))
+}
+
 #[derive(Default)]
 struct ModCleanupSummary {
     removed: Vec<String>,
@@ -9825,6 +10265,7 @@ fn parse_command_line_overrides(arguments: &[String]) -> CommandLineOverrides {
             "fullscreen" => overrides.fullscreen = parse_legacy_bool(&value),
             "theme" => overrides.theme_path = Some(value),
             "jre-dir" => overrides.java_runtime_directory = Some(value),
+            "settings" => overrides.settings_path = Some(value),
             "username" => overrides.username = Some(value),
             "usertype" => overrides.user_type = Some(value),
             _ => {}
@@ -9935,6 +10376,7 @@ Usage: legacylauncher-rust [options]\n\
   --fullscreen <true|false>       Toggle fullscreen\n\
   --theme <path>                  Legacy theme properties file\n\
   --jre-dir <path>                Mojang Java runtime directory\n\
+  --settings <path>               Launcher settings file\n\
   --launch                        Launch automatically after startup\n\
   --debug                         Open the launcher log window\n\
   --requireMinecraftAccount       Require a licensed Minecraft account\n\
