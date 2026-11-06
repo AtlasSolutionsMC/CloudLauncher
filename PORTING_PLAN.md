@@ -111,6 +111,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Keep each loader/build's cache and save directory separate from vanilla and other loader builds.
 - [x] Port source Forge mod-list files, 1.13+ mod-list arguments, version-inferred compatibility, and `forge_transformers` argument substitution.
 - [x] Port the source's unwanted-mod cleanup patterns, default setting, settings UI, legacy setting migration, and launch-time deletion scoped to the selected game's `mods` folder.
+- [x] Port source Fractureiser scanning before game downloads: recurse through nested mods folders, scan JAR classes with all three bytecode signatures, import and persist the `jarscanner` version, allow cancellation, prompt on long scans, and block launch when a signature is detected.
 
 ### 6. Diagnostics, notices, and support
 

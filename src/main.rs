@@ -7,6 +7,7 @@ mod diagnostics;
 mod ely;
 mod ely_legacy;
 mod github_update;
+mod malware;
 mod notices;
 mod support;
 mod vault;
@@ -69,6 +70,7 @@ struct SavedSettings {
     show_full_game_command: bool,
     crash_detection_enabled: bool,
     remove_undesirable_mods: bool,
+    malware_scan_version: u32,
     delete_patchy: bool,
     launcher_font_size: f32,
     legacy_font_size_revert: Option<f32>,
@@ -349,6 +351,8 @@ struct LaunchUiMessage {
 
 enum LaunchUiEvent {
     Message(LaunchUiMessage),
+    LongMalwareScanConfirmation(tokio::sync::oneshot::Sender<bool>),
+    MalwareDetected(malware::MalwareDetection),
     GameStarted,
     Finished,
 }
@@ -395,6 +399,7 @@ impl Default for SavedSettings {
             show_full_game_command: false,
             crash_detection_enabled: true,
             remove_undesirable_mods: true,
+            malware_scan_version: 0,
             delete_patchy: true,
             launcher_font_size: 12.0,
             legacy_font_size_revert: None,
@@ -560,6 +565,8 @@ struct LauncherApp {
     game_log: Arc<Mutex<VecDeque<String>>>,
     pending_crash_report: Arc<Mutex<Option<CrashReport>>>,
     crash_report: Option<CrashReport>,
+    malware_scan_confirmation: Option<tokio::sync::oneshot::Sender<bool>>,
+    malware_detection: Option<malware::MalwareDetection>,
     cancel_requested: Arc<AtomicBool>,
     hidden_for_game: bool,
 }
@@ -2122,6 +2129,12 @@ impl LauncherApp {
             .map(|_| selected_version_supports_quick_play(&version, &game_dir));
         let quick_play_server = server;
         let mods_directory = game_dir.join("mods");
+        let should_scan_malware = self.settings.malware_scan_version < 2 && mods_directory.is_dir();
+        if should_scan_malware {
+            // Record the scan version first, matching Java's fail-open behavior.
+            self.settings.malware_scan_version = 2;
+            self.persist();
+        }
         let crash_game_dir = self.game_data_directory_for_version(&version);
         let preferences = self.settings.clone();
         let show_full_game_command = preferences.show_full_game_command;
@@ -2404,6 +2417,41 @@ impl LauncherApp {
                         LogTarget::Minecraft,
                         tr("rust.status.game.connecting").replace("%0", &server.name),
                     );
+                }
+
+                if should_scan_malware {
+                    match scan_mods_before_launch(
+                        &mods_directory,
+                        cancel_requested.clone(),
+                        &update_tx,
+                    )
+                    .await
+                    {
+                        MalwareScanOutcome::Cancelled => {
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Warn,
+                                LogTarget::Mods,
+                                tr("rust.status.game.launch-cancelled"),
+                            );
+                            return;
+                        }
+                        MalwareScanOutcome::Infected(detection) => {
+                            send_launch_message(
+                                &update_tx,
+                                LogLevel::Error,
+                                LogTarget::Mods,
+                                format!(
+                                    "Fractureiser signature detected in {}: {}",
+                                    detection.jar.display(),
+                                    detection.entry
+                                ),
+                            );
+                            let _ = update_tx.send(LaunchUiEvent::MalwareDetected(detection));
+                            return;
+                        }
+                        MalwareScanOutcome::Clean | MalwareScanOutcome::Skipped => {}
+                    }
                 }
 
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
@@ -2959,6 +3007,15 @@ impl eframe::App for LauncherApp {
                         self.launch_progress = Some(progress);
                     }
                     self.status = message.message;
+                }
+                LaunchUiEvent::LongMalwareScanConfirmation(reply) => {
+                    self.malware_scan_confirmation = Some(reply);
+                }
+                LaunchUiEvent::MalwareDetected(detection) => {
+                    self.settings.malware_scan_version = 0;
+                    self.persist();
+                    self.status = tr("jarscanner.detected").to_owned();
+                    self.malware_detection = Some(detection);
                 }
                 LaunchUiEvent::GameStarted => {
                     let message = tr("rust.status.game.starting").to_owned();
@@ -6332,6 +6389,59 @@ impl eframe::App for LauncherApp {
             }
         }
 
+        if let Some(detection) = self.malware_detection.clone() {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new(tr("rust.malware.detected.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.colored_label(Color32::LIGHT_RED, tr("jarscanner.detected"));
+                    ui.separator();
+                    ui.label(
+                        tr("rust.malware.detected.jar")
+                            .replace("%0", &detection.jar.display().to_string()),
+                    );
+                    ui.label(tr("rust.malware.detected.entry").replace("%0", &detection.entry));
+                    ui.add_space(8.0);
+                    if ui.button(tr("rust.malware.button.ok")).clicked() {
+                        close = true;
+                    }
+                });
+            if !open || close {
+                self.malware_detection = None;
+            }
+        }
+
+        if self.malware_scan_confirmation.is_some() {
+            let mut open = true;
+            let mut answer = None;
+            egui::Window::new(tr("rust.malware.wait.title"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(tr("jarscanner.takes-time"));
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("rust.malware.button.continue")).clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button(tr("rust.malware.button.skip")).clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+            if !open {
+                answer = Some(false);
+            }
+            if let Some(answer) = answer {
+                if let Some(reply) = self.malware_scan_confirmation.take() {
+                    let _ = reply.send(answer);
+                }
+            }
+        }
+
         if let Some(mut report) = self.crash_report.clone() {
             let mut open = true;
             let mut selected_action = None;
@@ -7542,6 +7652,146 @@ fn launch_event_message_or_record(
     }
 }
 
+enum MalwareScanOutcome {
+    Clean,
+    Skipped,
+    Cancelled,
+    Infected(malware::MalwareDetection),
+}
+
+async fn scan_mods_before_launch(
+    mods_directory: &Path,
+    cancel_requested: Arc<AtomicBool>,
+    sender: &mpsc::Sender<LaunchUiEvent>,
+) -> MalwareScanOutcome {
+    send_launch_message(
+        sender,
+        LogLevel::Info,
+        LogTarget::Mods,
+        tr("launcher.step.jarscanner"),
+    );
+
+    let scanner_cancel = Arc::new(AtomicBool::new(false));
+    let scan_directory = mods_directory.to_path_buf();
+    let worker_cancel = Arc::clone(&scanner_cancel);
+    let mut scan_task =
+        tokio::task::spawn_blocking(move || malware::scan_mods(&scan_directory, &worker_cancel));
+    let prompt_delay = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(prompt_delay);
+
+    loop {
+        tokio::select! {
+            result = &mut scan_task => {
+                return finish_malware_scan(result, sender);
+            }
+            _ = wait_for_cancel(Arc::clone(&cancel_requested)) => {
+                scanner_cancel.store(true, Ordering::Release);
+                let _ = scan_task.await;
+                return MalwareScanOutcome::Cancelled;
+            }
+            _ = &mut prompt_delay => {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                if sender.send(LaunchUiEvent::LongMalwareScanConfirmation(reply)).is_err() {
+                    scanner_cancel.store(true, Ordering::Release);
+                    let _ = scan_task.await;
+                    return MalwareScanOutcome::Cancelled;
+                }
+                let continue_scanning = tokio::select! {
+                    answer = answer => answer.unwrap_or(false),
+                    _ = wait_for_cancel(Arc::clone(&cancel_requested)) => {
+                        scanner_cancel.store(true, Ordering::Release);
+                        let _ = scan_task.await;
+                        return MalwareScanOutcome::Cancelled;
+                    }
+                };
+                if !continue_scanning {
+                    scanner_cancel.store(true, Ordering::Release);
+                    let _ = scan_task.await;
+                    send_launch_message(
+                        sender,
+                        LogLevel::Info,
+                        LogTarget::Mods,
+                        tr("rust.status.malware.skipped"),
+                    );
+                    return MalwareScanOutcome::Skipped;
+                }
+                prompt_delay.as_mut().reset(
+                    tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                );
+            }
+        }
+    }
+}
+
+fn finish_malware_scan(
+    result: Result<std::io::Result<malware::ScanResult>, tokio::task::JoinError>,
+    sender: &mpsc::Sender<LaunchUiEvent>,
+) -> MalwareScanOutcome {
+    let report = match result {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            send_launch_message(
+                sender,
+                LogLevel::Warn,
+                LogTarget::Mods,
+                tr("rust.status.malware.scan-error").replace("%0", &error.to_string()),
+            );
+            return MalwareScanOutcome::Skipped;
+        }
+        Err(error) => {
+            send_launch_message(
+                sender,
+                LogLevel::Warn,
+                LogTarget::Mods,
+                tr("rust.status.malware.scan-error").replace("%0", &error.to_string()),
+            );
+            return MalwareScanOutcome::Skipped;
+        }
+    };
+
+    if report.cancelled {
+        return MalwareScanOutcome::Cancelled;
+    }
+    if report.unreadable_archives > 0 {
+        send_launch_message(
+            sender,
+            LogLevel::Warn,
+            LogTarget::Mods,
+            tr("rust.status.malware.archive-errors")
+                .replace("%0", &report.unreadable_archives.to_string()),
+        );
+    }
+    if report.malformed_classes > 0 {
+        send_launch_message(
+            sender,
+            LogLevel::Warn,
+            LogTarget::Mods,
+            tr("rust.status.malware.class-errors")
+                .replace("%0", &report.malformed_classes.to_string()),
+        );
+    }
+    if report.oversized_classes > 0 {
+        send_launch_message(
+            sender,
+            LogLevel::Warn,
+            LogTarget::Mods,
+            tr("rust.status.malware.large-classes")
+                .replace("%0", &report.oversized_classes.to_string()),
+        );
+    }
+    if let Some(detection) = report.detection {
+        return MalwareScanOutcome::Infected(detection);
+    }
+
+    send_launch_message(
+        sender,
+        LogLevel::Info,
+        LogTarget::Mods,
+        tr("rust.status.malware.clean"),
+    );
+    MalwareScanOutcome::Clean
+}
+
 fn send_launch_message(
     sender: &mpsc::Sender<LaunchUiEvent>,
     level: LogLevel,
@@ -8277,6 +8527,7 @@ fn load_settings() -> SavedSettings {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
+    settings.malware_scan_version = settings.malware_scan_version.min(2);
     if settings.legacy_config_path.trim().is_empty() {
         settings.legacy_config_path = default_legacy_config_path().to_string_lossy().into_owned();
     }
@@ -8427,6 +8678,17 @@ fn import_legacy_settings(
         }
         settings.legacy_experiments = experiments;
         apply("experiments.enabled", Some(()));
+    }
+    if let Some(value) = properties.get("jarscanner") {
+        let scan_version = value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|version| version.clamp(0, 2) as u32);
+        if let Some(scan_version) = scan_version {
+            settings.malware_scan_version = scan_version;
+        }
+        apply("jarscanner", scan_version.map(|_| ()));
     }
 
     if let Some(value) = properties.get("minecraft.gamedir") {
