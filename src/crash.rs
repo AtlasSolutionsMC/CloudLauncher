@@ -63,15 +63,19 @@ pub fn diagnose(
     }
     let variables = runtime_variables(&root);
     let buttons = root.get("buttons").and_then(Value::as_array);
-    let mut result = Vec::new();
     let version_context = format!("{version_id}-{loader}");
-
-    for signature in root
+    let mut signatures = root
         .get("signatures")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
+        .collect::<Vec<_>>();
+    // The Java launcher defers rules needing Windows system information until
+    // after ordinary log/version signatures, preserving source JSON order in
+    // both groups.
+    signatures.sort_by_key(|signature| requires_windows_system_info(signature));
+
+    for signature in signatures {
         if signature
             .get("fake")
             .and_then(Value::as_bool)
@@ -133,17 +137,19 @@ pub fn diagnose(
             continue;
         }
 
-        let Some(pattern) = signature.get("pattern").and_then(Value::as_str) else {
-            continue;
-        };
-        let pattern = expand_vars(pattern, Some(&variables));
-        let Ok(pattern) = Regex::new(&format!("^(?:{pattern})$")) else {
-            // Java's signature database occasionally uses syntax unsupported by Rust's
-            // regex engine. Ignore just that rule and retain the rest of the catalog.
-            continue;
-        };
-        if !log.lines().any(|line| pattern.is_match(line)) {
-            continue;
+        if let Some(pattern) = signature.get("pattern") {
+            let Some(pattern) = pattern.as_str() else {
+                continue;
+            };
+            let pattern = expand_vars(pattern, Some(&variables));
+            let Ok(pattern) = Regex::new(&format!("^(?:{pattern})$")) else {
+                // Java's signature database occasionally uses syntax unsupported by Rust's
+                // regex engine. Ignore just that rule and retain the rest of the catalog.
+                continue;
+            };
+            if !log.lines().any(|line| pattern.is_match(line)) {
+                continue;
+            }
         }
 
         if let Some(version_pattern) = signature.get("version").and_then(Value::as_str) {
@@ -157,14 +163,23 @@ pub fn diagnose(
             }
         }
 
-        let title = localized(signature.get("title"), Some(&variables)).unwrap_or_else(|| {
-            signature
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(crate::tr("rust.crash.issue.known"))
-                .replace('-', " ")
-        });
-        let body = localized(signature.get("body"), Some(&variables)).unwrap_or_default();
+        let name = signature
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("known");
+        let title = localized(signature.get("title"), Some(&variables))
+            .or_else(|| localized_catalog_field(name, "title", &variables))
+            .unwrap_or_else(|| {
+                signature
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(crate::tr("rust.crash.issue.known"))
+                    .replace('-', " ")
+            });
+        let body = localized(signature.get("body"), Some(&variables))
+            .or_else(|| localized_catalog_field(name, "body", &variables))
+            .unwrap_or_default()
+            .replace("\\n", "\n");
         let actions = signature
             .get("buttons")
             .and_then(Value::as_array)
@@ -172,7 +187,7 @@ pub fn diagnose(
             .flatten()
             .filter_map(|button| resolve_button(button, buttons, Some(&variables)))
             .collect();
-        result.push(CrashSuggestion {
+        let suggestion = CrashSuggestion {
             title,
             body: clean_html(&body),
             permit_help: signature
@@ -180,14 +195,48 @@ pub fn diagnose(
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             actions,
-        });
+        };
 
-        // The Java launcher presents one most relevant crash explanation at a time.
-        if result.len() >= 3 {
-            break;
-        }
+        // Java chooses the first capable signature after its system-info sort.
+        return vec![suggestion];
     }
-    result
+    Vec::new()
+}
+
+fn localized_catalog_field(
+    name: &str,
+    field: &str,
+    variables: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    let key = format!("crash.{name}.{field}");
+    let value = crate::tr_dynamic(&key);
+    (value != key).then(|| expand_vars(&value, Some(variables)))
+}
+
+fn requires_windows_system_info(signature: &Value) -> bool {
+    if current_os_name() != "windows" {
+        return false;
+    }
+    let windows_compatible =
+        signature
+            .get("os")
+            .and_then(Value::as_array)
+            .is_none_or(|operating_systems| {
+                operating_systems.iter().any(|entry| {
+                    entry
+                        .as_str()
+                        .is_some_and(|entry| entry.eq_ignore_ascii_case("windows"))
+                })
+            });
+    windows_compatible
+        && (signature
+            .get("graphicsCard")
+            .and_then(Value::as_str)
+            .is_some()
+            || signature
+                .get("archIssue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
 }
 
 /// Probe the Java executable selected by the completed Minecraft installation.
