@@ -470,6 +470,7 @@ struct CommandLineOverrides {
     java_runtime_directory: Option<String>,
     username: Option<String>,
     user_type: Option<String>,
+    debug_mode: bool,
     launch_automatically: bool,
 }
 
@@ -798,7 +799,13 @@ impl LauncherApp {
         let persisted_settings = settings.clone();
         command_line_overrides.apply(&mut settings);
         let background_custom_loaded = !settings.background_path.trim().is_empty();
-        let show_global_logger = settings.logger_mode == "global";
+        let show_global_logger =
+            settings.logger_mode == "global" || command_line_overrides.debug_mode;
+        if command_line_overrides.debug_mode {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                "Legacy Launcher — Rust [DEBUG]".to_owned(),
+            ));
+        }
         let background_load_error = if settings.background_path.trim().is_empty() {
             None
         } else {
@@ -9794,6 +9801,10 @@ fn parse_command_line_overrides(arguments: &[String]) -> CommandLineOverrides {
             overrides.launch_automatically = true;
             continue;
         }
+        if name == "debug" {
+            overrides.debug_mode = true;
+            continue;
+        }
         let value = inline_value.or_else(|| {
             arguments
                 .get(index)
@@ -9905,6 +9916,30 @@ fn select_command_line_account(
             }
         }
     }
+}
+
+fn print_command_line_help() {
+    println!(
+        "Legacy Launcher — Rust\n\
+Usage: legacylauncher-rust [options]\n\
+  --directory <path>             Minecraft game directory\n\
+  --java-executable <path>        Java executable\n\
+  --java-directory <path>         Deprecated Java directory option\n\
+  --version <id>                  Minecraft version to launch\n\
+  --username <name>               Account display name to select\n\
+  --usertype <type>               Account type for ambiguous names\n\
+  --javaargs <args>               JVM arguments\n\
+  --margs <args>                  Minecraft arguments\n\
+  --window <width;height>         Game window size\n\
+  --background <path>             Launcher background image\n\
+  --fullscreen <true|false>       Toggle fullscreen\n\
+  --theme <path>                  Legacy theme properties file\n\
+  --jre-dir <path>                Mojang Java runtime directory\n\
+  --launch                        Launch automatically after startup\n\
+  --debug                         Open the launcher log window\n\
+  --requireMinecraftAccount       Require a licensed Minecraft account\n\
+  --help                          Print this help and exit"
+    );
 }
 
 fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
@@ -11365,6 +11400,10 @@ pub(crate) fn open_url(url: &str) {
 fn main() -> eframe::Result {
     install_process_panic_logger();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.iter().any(|argument| argument == "--help") {
+        print_command_line_help();
+        return Ok(());
+    }
     let require_minecraft_account = arguments.iter().any(|argument| {
         argument == "--requireMinecraftAccount" || argument == "--require-minecraft-account"
     });
