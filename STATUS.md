@@ -25,6 +25,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Legacy log-window dimensions and position migration, with current viewer geometry saved across launches.
 - Source `gui.logger` Global/None mode with a 1 MiB live launcher buffer, a rolling 12 MiB launcher log with ten backups, live sanitized logs, log-file browsing, a stop-game action, and close-to-disable behavior. In-memory records now retain timestamp, severity, and subsystem; launch/download, auth, Java, mods, servers, catalog, update, bootstrap, notice, diagnostics, settings import, and crash events have explicit categories. Status updates now log directly with a level and subsystem. Unhandled Rust panics also write redacted details and a forced backtrace to the rolling log; full Java Log4j coverage comparison remains open.
 - Migration and persistence for the selected Minecraft version and maximized launcher window state.
+- Legacy auto-login imports its configurable 2–10 second delay and shows a live cancel-start countdown before launching; first-run notices and folder selection finish before the countdown begins.
 - Source version update alerts for enabled release types, backed by the compatible `versions/versions.json` cache and imported `gui.alerton.*` settings.
 - Settings and common dialog labels now resolve from the US locale resource.
 - The source SettingsPanel About us tab includes the US copy, Rust clone version, creator and Ely.by links, and source license text.

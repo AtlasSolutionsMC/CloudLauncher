@@ -59,6 +59,7 @@ struct SavedSettings {
     selected_account: Option<String>,
     selected_version: String,
     auto_login: bool,
+    auto_login_timeout_secs: u8,
     feedback_acknowledged: bool,
     force_update: bool,
     beta_updates: bool,
@@ -389,6 +390,7 @@ impl Default for SavedSettings {
             selected_account: None,
             selected_version: "26.3".to_owned(),
             auto_login: false,
+            auto_login_timeout_secs: 3,
             feedback_acknowledged: false,
             force_update: false,
             beta_updates: false,
@@ -486,6 +488,7 @@ struct LauncherApp {
     version_kind_filter: String,
     confirm_remove_version: Option<String>,
     auto_launch_pending: bool,
+    auto_launch_deadline: Option<Instant>,
     launcher_window_state_seen: bool,
     show_account_dialog: bool,
     show_account_help: bool,
@@ -2978,9 +2981,25 @@ impl eframe::App for LauncherApp {
             self.persist();
             self.show_feedback_dialog = true;
         }
-        if self.auto_launch_pending && !self.show_first_run_notice {
+        if self.auto_launch_pending
+            && !self.show_first_run_notice
+            && !self.show_first_run_folder_notice
+            && !self.show_arm_compat_notice
+        {
             self.auto_launch_pending = false;
-            self.start_selected_game();
+            let timeout = self.settings.auto_login_timeout_secs.clamp(2, 10);
+            self.auto_launch_deadline =
+                Some(Instant::now() + Duration::from_secs(u64::from(timeout)));
+        }
+        if let Some(deadline) = self.auto_launch_deadline {
+            if !self.settings.auto_login || self.settings.selected_account.is_none() {
+                self.auto_launch_deadline = None;
+            } else if Instant::now() >= deadline {
+                self.auto_launch_deadline = None;
+                self.start_selected_game();
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
         }
         if self.legacy_theme_palette_path != self.settings.legacy_theme_path {
             self.legacy_theme_palette = load_legacy_theme_palette(&self.settings.legacy_theme_path);
@@ -3547,6 +3566,9 @@ impl eframe::App for LauncherApp {
                             )
                             .changed()
                         {
+                            if !self.settings.auto_login {
+                                self.auto_launch_deadline = None;
+                            }
                             self.persist();
                         }
                         if ui
@@ -3560,8 +3582,17 @@ impl eframe::App for LauncherApp {
                         }
                         ui.add_space(3.0);
 
+                        let auto_login_remaining = self
+                            .auto_launch_deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                            .map(|remaining| remaining.as_secs_f64().ceil().clamp(1.0, 10.0) as u8);
+                        let play_label = auto_login_remaining
+                            .map(|seconds| {
+                                tr("loginform.cancel").replace("%0", &seconds.to_string())
+                            })
+                            .unwrap_or_else(|| install_label.to_owned());
                         let play_button =
-                            egui::Button::new(RichText::new(install_label).size(18.0).strong())
+                            egui::Button::new(RichText::new(play_label).size(18.0).strong())
                                 .fill(Color32::from_rgb(73, 78, 80))
                                 .stroke(Stroke::new(1.0, Color32::from_white_alpha(36)))
                                 .corner_radius(2.0);
@@ -3572,7 +3603,12 @@ impl eframe::App for LauncherApp {
                             )
                             .clicked()
                         {
-                            self.start_selected_game();
+                            if self.auto_launch_deadline.take().is_some() {
+                                self.settings.auto_login = false;
+                                self.persist();
+                            } else {
+                                self.start_selected_game();
+                            }
                         }
 
                         ui.add_space(2.0);
@@ -8669,6 +8705,7 @@ fn load_settings() -> SavedSettings {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     settings.malware_scan_version = settings.malware_scan_version.min(2);
+    settings.auto_login_timeout_secs = settings.auto_login_timeout_secs.clamp(2, 10);
     if settings.legacy_config_path.trim().is_empty() {
         settings.legacy_config_path = default_legacy_config_path().to_string_lossy().into_owned();
     }
@@ -8896,6 +8933,17 @@ fn import_legacy_settings(
             settings.auto_login = enabled;
         }
         apply("login.auto", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("login.auto.timeout") {
+        let timeout = value
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|timeout| (2..=10).contains(timeout));
+        if let Some(timeout) = timeout {
+            settings.auto_login_timeout_secs = timeout;
+        }
+        apply("login.auto.timeout", timeout.map(|_| ()));
     }
     if let Some(value) = properties.get("feedback") {
         let acknowledged = parse_legacy_bool(value);
