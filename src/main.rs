@@ -672,6 +672,8 @@ struct LauncherApp {
     force_update_confirmed_version: Option<String>,
     outdated_version_confirmation: Option<PendingVersionUpdateConfirmation>,
     version_update_prompt_bypassed: Option<String>,
+    force_update_toggle_count: u8,
+    force_update_easter_egg: bool,
     show_autologin_tip: bool,
     auto_launch_pending: bool,
     auto_launch_deadline: Option<Instant>,
@@ -4395,13 +4397,21 @@ impl eframe::App for LauncherApp {
                         }
                         self.persist();
                     }
+                    let force_update_label = if self.force_update_easter_egg {
+                        "This ain't easter egg."
+                    } else {
+                        tr("loginform.checkbox.forceupdate")
+                    };
                     if ui
-                        .checkbox(
-                            &mut self.settings.force_update,
-                            tr("loginform.checkbox.forceupdate"),
-                        )
+                        .checkbox(&mut self.settings.force_update, force_update_label)
                         .changed()
                     {
+                        self.force_update_toggle_count =
+                            self.force_update_toggle_count.saturating_add(1);
+                        if self.force_update_toggle_count == 10 {
+                            self.force_update_toggle_count = 0;
+                            self.force_update_easter_egg = true;
+                        }
                         self.persist();
                     }
                     ui.add_space(3.0);
