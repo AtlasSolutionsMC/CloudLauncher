@@ -212,7 +212,7 @@ struct PendingPromotedServerLaunch {
 }
 
 #[derive(Clone)]
-struct PendingForceUpdateConfirmation {
+struct PendingVersionUpdateConfirmation {
     version: String,
     server: Option<SavedServer>,
 }
@@ -668,8 +668,10 @@ struct LauncherApp {
     version_search: String,
     version_kind_filter: String,
     confirm_remove_version: Option<String>,
-    force_update_confirmation: Option<PendingForceUpdateConfirmation>,
+    force_update_confirmation: Option<PendingVersionUpdateConfirmation>,
     force_update_confirmed_version: Option<String>,
+    outdated_version_confirmation: Option<PendingVersionUpdateConfirmation>,
+    version_update_prompt_bypassed: Option<String>,
     auto_launch_pending: bool,
     auto_launch_deadline: Option<Instant>,
     launcher_window_state_seen: bool,
@@ -1452,6 +1454,44 @@ impl LauncherApp {
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         })
+    }
+
+    fn installed_version_is_outdated(&self, version: &str) -> bool {
+        let remote_time = self
+            .version_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.versions.iter().find(|entry| entry.id == version))
+            .and_then(|entry| OffsetDateTime::parse(&entry.time, &Rfc3339).ok());
+        let local_time = self
+            .installed_version_metadata(version)
+            .and_then(|metadata| metadata.get("time")?.as_str().map(str::to_owned))
+            .and_then(|time| OffsetDateTime::parse(&time, &Rfc3339).ok());
+        matches!((remote_time, local_time), (Some(remote), Some(local)) if remote > local)
+    }
+
+    fn update_installed_version_timestamp(&self, version: &str) -> Result<(), String> {
+        let root = self
+            .installed_version_root(version)
+            .ok_or_else(|| "installed version metadata is missing".to_owned())?;
+        let path = root
+            .join("versions")
+            .join(version)
+            .join(format!("{version}.json"));
+        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("installed version metadata exceeds the size limit".to_owned());
+        }
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let object = metadata
+            .as_object_mut()
+            .ok_or_else(|| "installed version metadata is not a JSON object".to_owned())?;
+        let timestamp = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|error| error.to_string())?;
+        object.insert("time".to_owned(), serde_json::Value::String(timestamp));
+        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| error.to_string())?;
+        fs::write(path, bytes).map_err(|error| error.to_string())
     }
 
     fn installed_versions(&self) -> Vec<String> {
@@ -2651,6 +2691,17 @@ impl LauncherApp {
             return;
         }
         let force_update = self.settings.force_update;
+        let skip_outdated_prompt =
+            self.version_update_prompt_bypassed.take().as_deref() == Some(version.as_str());
+        if !force_update
+            && !skip_outdated_prompt
+            && self.version_is_installed()
+            && self.installed_version_is_outdated(&version)
+        {
+            self.outdated_version_confirmation =
+                Some(PendingVersionUpdateConfirmation { version, server });
+            return;
+        }
         if force_update {
             let has_remote_version = self
                 .version_manifest
@@ -2672,7 +2723,7 @@ impl LauncherApp {
                 self.force_update_confirmed_version.take().as_deref() == Some(version.as_str());
             if self.version_is_installed() && !confirmation_accepted {
                 self.force_update_confirmation =
-                    Some(PendingForceUpdateConfirmation { version, server });
+                    Some(PendingVersionUpdateConfirmation { version, server });
                 return;
             }
         }
@@ -7404,6 +7455,58 @@ impl eframe::App for LauncherApp {
                 if confirmed && self.settings.selected_version == confirmation.version {
                     self.force_update_confirmed_version = Some(confirmation.version);
                     self.start_selected_game_on_server(confirmation.server);
+                }
+            }
+        }
+
+        if let Some(confirmation) = self.outdated_version_confirmation.clone() {
+            let mut decision = None;
+            egui::Modal::new(Id::unique("outdated_version_confirmation")).show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.heading(tr("versions.found-update.title"));
+                ui.add_space(6.0);
+                ui.label(tr("versions.found-update"));
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("ui.no")).clicked() {
+                        decision = Some(false);
+                    }
+                    if ui.button(tr("ui.yes")).clicked() {
+                        decision = Some(true);
+                    }
+                });
+            });
+            if let Some(accept_update) = decision {
+                self.outdated_version_confirmation = None;
+                if self.settings.selected_version == confirmation.version {
+                    if accept_update {
+                        self.settings.force_update = true;
+                        self.persist();
+                        self.start_selected_game_on_server(confirmation.server);
+                    } else {
+                        match self.update_installed_version_timestamp(&confirmation.version) {
+                            Ok(()) => {
+                                self.start_selected_game_on_server(confirmation.server);
+                            }
+                            Err(error) => {
+                                let title = tr("versions.found-update.error.title").to_owned();
+                                let message = tr("versions.found-update.error").to_owned();
+                                self.version_update_prompt_bypassed =
+                                    Some(confirmation.version.clone());
+                                self.set_logged_status(
+                                    LogLevel::Error,
+                                    LogTarget::VersionManager,
+                                    format!("{message} {error}"),
+                                );
+                                self.launch_error_dialog = Some(LaunchErrorDialog {
+                                    title,
+                                    message,
+                                    details: Some(error),
+                                });
+                                self.start_selected_game_on_server(confirmation.server);
+                            }
+                        }
+                    }
                 }
             }
         }
