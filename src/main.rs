@@ -428,7 +428,7 @@ impl Default for SavedSettings {
             log_window_height: 500,
             log_window_x: 30,
             log_window_y: 30,
-            login_form_direction: "top_left".to_owned(),
+            login_form_direction: "center".to_owned(),
             hidden_notices_until: HashMap::new(),
             servers: Vec::new(),
             servers_cache_root: String::new(),
@@ -720,6 +720,7 @@ struct LauncherApp {
     show_notices_window: bool,
     show_notice_scene: bool,
     notice_scene_index: usize,
+    show_settings_reset_confirmation: bool,
     connectivity_events: Option<Receiver<connectivity::Report>>,
     connectivity_report: Option<connectivity::Report>,
     show_connectivity_window: bool,
@@ -1000,6 +1001,86 @@ impl LauncherApp {
                 &error,
             );
         }
+    }
+
+    fn reset_preferences_to_defaults(&mut self, ctx: &egui::Context) {
+        let current = self.settings.clone();
+        let mut defaults = SavedSettings::default();
+
+        // Keep launcher data and choices that are outside the source settings panel.
+        defaults.accounts = current.accounts;
+        defaults.migrated_mojang_accounts = current.migrated_mojang_accounts;
+        defaults.offline_account_uuids = current.offline_account_uuids;
+        defaults.offline_ely_skins = current.offline_ely_skins;
+        defaults.microsoft_accounts = current.microsoft_accounts;
+        defaults.ely_accounts = current.ely_accounts;
+        defaults.ely_legacy_accounts = current.ely_legacy_accounts;
+        defaults.selected_account = current.selected_account;
+        defaults.selected_version = current.selected_version;
+        defaults.auto_login = current.auto_login;
+        defaults.auto_login_timeout_secs = current.auto_login_timeout_secs;
+        defaults.settings_blocked = current.settings_blocked;
+        defaults.feedback_acknowledged = current.feedback_acknowledged;
+        defaults.force_update = current.force_update;
+        defaults.client_id = current.client_id;
+        defaults.malware_scan_version = current.malware_scan_version;
+        defaults.legacy_font_size_revert = current.legacy_font_size_revert;
+        defaults.log_window_width = current.log_window_width;
+        defaults.log_window_height = current.log_window_height;
+        defaults.log_window_x = current.log_window_x;
+        defaults.log_window_y = current.log_window_y;
+        defaults.hidden_notices_until = current.hidden_notices_until;
+        defaults.servers = current.servers;
+        defaults.servers_cache_root = current.servers_cache_root;
+        defaults.legacy_profiles_path = current.legacy_profiles_path;
+        defaults.legacy_config_path = current.legacy_config_path;
+        defaults.login_form_direction = "center".to_owned();
+
+        let beta_channel_changed = self.settings.beta_updates != defaults.beta_updates;
+        let notices_were_disabled = !self.settings.notices_enabled;
+        self.settings = defaults;
+        self.command_line_overrides.apply(&mut self.settings);
+        http::set_certificate_validation(self.settings.verify_tls_certificates);
+
+        ctx.set_zoom_factor(self.settings.launcher_font_size / 12.0);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+            self.settings.launcher_window_width as f32,
+            self.settings.launcher_window_height as f32,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+            self.settings.launcher_maximized,
+        ));
+
+        self.background_custom_loaded = false;
+        if let Some(assets) = &mut self.assets {
+            assets.background = if self.background_theme_dark.unwrap_or(false) {
+                assets.background_dark.clone()
+            } else {
+                assets.background_light.clone()
+            };
+        }
+        self.server_list_root = None;
+        self.show_log_window =
+            self.settings.logger_mode == "global" || self.command_line_overrides.debug_mode;
+        self.show_live_launcher_log = self.show_log_window;
+        self.show_live_game_log = false;
+
+        if notices_were_disabled {
+            self.refresh_notices();
+        }
+        if beta_channel_changed && !self.update_checking {
+            self.available_release = None;
+            self.update_prompt_pending = false;
+            self.show_update_dialog = false;
+            self.start_update_check();
+        }
+
+        self.persist();
+        self.set_logged_status(
+            LogLevel::Info,
+            LogTarget::Settings,
+            tr("rust.status.settings.reset"),
+        );
     }
 
     fn set_logged_status(
@@ -5742,6 +5823,9 @@ impl eframe::App for LauncherApp {
                             {
                                 self.start_update_check();
                             }
+                            if ui.button(tr("settings.default")).clicked() {
+                                self.show_settings_reset_confirmation = true;
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label(tr("settings.switch-to-beta.label"));
@@ -6986,6 +7070,32 @@ impl eframe::App for LauncherApp {
             }
             if !open {
                 self.settings_page = None;
+            }
+        }
+
+        if self.show_settings_reset_confirmation {
+            let mut confirm_reset = false;
+            let mut close_reset = false;
+            egui::Modal::new(Id::unique("settings_reset_confirmation")).show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.heading(tr("settings.default.warning.title"));
+                ui.add_space(6.0);
+                ui.label(tr("rust.settings.reset.body"));
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("ui.no")).clicked() {
+                        close_reset = true;
+                    }
+                    if ui.button(tr("ui.yes")).clicked() {
+                        confirm_reset = true;
+                    }
+                });
+            });
+            if close_reset || confirm_reset {
+                self.show_settings_reset_confirmation = false;
+            }
+            if confirm_reset {
+                self.reset_preferences_to_defaults(ctx);
             }
         }
 
