@@ -8077,6 +8077,82 @@ fn append_launcher_log_file(line: &[u8]) {
     }
 }
 
+fn append_launcher_diagnostic(level: LogLevel, target: LogTarget, message: &str) {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs() % 86_400;
+    let timestamp = format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60,
+        now.subsec_millis()
+    );
+    let redacted = redact_sensitive_log_values(message);
+    for line in redacted.lines().take(256) {
+        let mut record = LogRecord {
+            timestamp: timestamp.clone(),
+            level,
+            target,
+            message: line.to_owned(),
+        };
+        if record.rendered_len() > 32 * 1024 {
+            let fixed_length = record.rendered_len() - record.message.len();
+            record.message = truncate_utf8_to_bytes(&record.message, 32 * 1024 - fixed_length);
+        }
+        append_launcher_log_file(format!("{}\n", record.render()).as_bytes());
+    }
+}
+
+fn install_process_panic_logger() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        previous_hook(panic_info);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_owned();
+            let payload = panic_info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| {
+                    panic_info
+                        .payload()
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                })
+                .unwrap_or("non-string panic payload");
+            let location = panic_info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown location".to_owned());
+            append_launcher_diagnostic(
+                LogLevel::Error,
+                LogTarget::Launcher,
+                &format!("Unhandled panic in thread {thread_name} at {location}: {payload}"),
+            );
+            append_launcher_diagnostic(
+                LogLevel::Error,
+                LogTarget::Launcher,
+                &format!(
+                    "Panic backtrace:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                ),
+            );
+        }));
+    }));
+}
+
 fn collect_crash_report(
     game_dir: &std::path::Path,
     game_log: &Arc<Mutex<VecDeque<String>>>,
@@ -10419,6 +10495,7 @@ pub(crate) fn open_url(url: &str) {
 }
 
 fn main() -> eframe::Result {
+    install_process_panic_logger();
     let require_minecraft_account = std::env::args_os().skip(1).any(|argument| {
         let argument = argument.to_string_lossy();
         argument == "--requireMinecraftAccount" || argument == "--require-minecraft-account"
