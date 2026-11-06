@@ -78,7 +78,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 
 - [x] Fetch the official manifest and filter/search release, snapshot, old beta/alpha, and installed versions.
 - [x] Port version-category defaults, enable/disable filters, the only-installed and pre-1.7.10 filters, and import these values from `legacy.properties`.
-- [x] Install, verify/repair, refresh, and remove versions from the manager screen.
+- [x] Install, verify/repair, refresh, and remove versions from the manager screen. Catalog refresh now switches to a cancellable action while loading in both the login toolbar and version manager, matching the source refresh/cancel lifecycle; its cancellation token is isolated from auth and game-launch jobs.
 - [x] Port source Force update guards: reject local-only builds with the localized error, require confirmation before reinstalling an installed remote version, and preserve the selected server when confirming quick play.
 - [x] Compare installed version metadata time with remote catalog time, prompt before an available update, and persist the source-compatible timestamp when the user declines so the same update is not prompted again.
 - [x] Load installed custom version JSON, resolve `inheritsFrom` parents locally or from Mojang, merge libraries/arguments/downloads, and reject cycles or unsafe IDs.

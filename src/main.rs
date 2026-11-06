@@ -662,6 +662,7 @@ struct LauncherApp {
     extra_version_repositories: Vec<String>,
     version_manifest: Option<MojangVersionManifest>,
     version_catalog_events: Option<Receiver<Result<MojangVersionManifest, String>>>,
+    version_catalog_cancel: Option<Arc<AtomicBool>>,
     version_catalog_loading: bool,
     version_update_alert: Option<String>,
     version_alert_has_refreshed: bool,
@@ -901,6 +902,7 @@ impl LauncherApp {
             .notices_enabled
             .then(|| spawn_notice_fetch(settings.client_id.clone()));
         let notices_loading = settings.notices_enabled;
+        let version_catalog_cancel = Arc::new(AtomicBool::new(false));
         let mut app = Self {
             settings,
             assets: Some(assets),
@@ -916,7 +918,11 @@ impl LauncherApp {
             first_run_folder_current_directory,
             first_run_folder_path,
             show_arm_compat_notice,
-            version_catalog_events: Some(spawn_catalog_fetch(Vec::new())),
+            version_catalog_events: Some(spawn_catalog_fetch(
+                Vec::new(),
+                Arc::clone(&version_catalog_cancel),
+            )),
+            version_catalog_cancel: Some(version_catalog_cancel),
             version_catalog_loading: true,
             show_log_window: show_global_logger,
             show_live_launcher_log: show_global_logger,
@@ -1547,13 +1553,36 @@ impl LauncherApp {
     }
 
     fn start_version_catalog_fetch(&mut self) {
-        self.version_catalog_events =
-            Some(spawn_catalog_fetch(self.extra_version_repositories.clone()));
+        if let Some(cancel_requested) = self.version_catalog_cancel.take() {
+            cancel_requested.store(true, Ordering::Release);
+        }
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        self.version_catalog_events = Some(spawn_catalog_fetch(
+            self.extra_version_repositories.clone(),
+            Arc::clone(&cancel_requested),
+        ));
+        self.version_catalog_cancel = Some(cancel_requested);
         self.version_catalog_loading = true;
         self.set_logged_status(
             LogLevel::Info,
             LogTarget::VersionCatalog,
             tr("rust.status.catalog.refreshing"),
+        );
+    }
+
+    fn cancel_version_catalog_fetch(&mut self) {
+        if !self.version_catalog_loading {
+            return;
+        }
+        if let Some(cancel_requested) = self.version_catalog_cancel.take() {
+            cancel_requested.store(true, Ordering::Release);
+        }
+        self.version_catalog_events = None;
+        self.version_catalog_loading = false;
+        self.set_logged_status(
+            LogLevel::Warn,
+            LogTarget::VersionCatalog,
+            tr("rust.status.catalog.cancelled"),
         );
     }
 
@@ -3472,13 +3501,11 @@ impl LauncherApp {
     fn show_version_manager(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(tr("rust.ui.versions.heading"));
-            if ui
-                .add_enabled(
-                    !self.version_catalog_loading,
-                    egui::Button::new(tr("rust.ui.versions.refresh-catalog")),
-                )
-                .clicked()
-            {
+            if self.version_catalog_loading {
+                if ui.button(tr("rust.ui.versions.cancel-refresh")).clicked() {
+                    self.cancel_version_catalog_fetch();
+                }
+            } else if ui.button(tr("rust.ui.versions.refresh-catalog")).clicked() {
                 self.refresh_version_catalog();
             }
             if self.version_catalog_loading {
@@ -3858,6 +3885,7 @@ impl eframe::App for LauncherApp {
         }
         if let Some(result) = catalog_update {
             self.version_catalog_events = None;
+            self.version_catalog_cancel = None;
             self.version_catalog_loading = false;
             match result {
                 Ok(manifest) => {
@@ -4195,6 +4223,7 @@ impl eframe::App for LauncherApp {
         let support_icon_tint = icon_color("comments-o");
         let folder_icon_tint = icon_color("folder-open");
         let refresh_icon_tint = icon_color("refresh");
+        let cancel_icon_tint = icon_color("remove");
         let settings_icon_tint = icon_color("bars");
         let account_menu_label = self.selected_account_label();
         let selected_version = self.settings.selected_version.clone();
@@ -4481,18 +4510,27 @@ impl eframe::App for LauncherApp {
                             folder.on_hover_text(tr("loginform.button.folder"));
                         }
 
-                        let refresh = icon_button(ui, "refresh", &refresh_icon, refresh_icon_tint);
-                        if refresh.clicked() {
-                            let count = self.installed_versions().len();
-                            self.refresh_version_catalog();
-                            self.set_logged_status(
-                                LogLevel::Info,
-                                LogTarget::VersionCatalog,
-                                tr("rust.status.catalog.refreshed-local")
-                                    .replace("%0", &count.to_string()),
-                            );
+                        if self.version_catalog_loading {
+                            let cancel = cancel_icon_button(ui, cancel_icon_tint);
+                            if cancel.clicked() {
+                                self.cancel_version_catalog_fetch();
+                            }
+                            cancel.on_hover_text(tr("loginform.button.refresh-cancel"));
+                        } else {
+                            let refresh =
+                                icon_button(ui, "refresh", &refresh_icon, refresh_icon_tint);
+                            if refresh.clicked() {
+                                let count = self.installed_versions().len();
+                                self.refresh_version_catalog();
+                                self.set_logged_status(
+                                    LogLevel::Info,
+                                    LogTarget::VersionCatalog,
+                                    tr("rust.status.catalog.refreshed-local")
+                                        .replace("%0", &count.to_string()),
+                                );
+                            }
+                            refresh.on_hover_text(tr("loginform.button.refresh"));
                         }
-                        refresh.on_hover_text(tr("loginform.button.refresh"));
 
                         if !self.settings.settings_blocked {
                             let settings =
@@ -8087,19 +8125,27 @@ impl eframe::App for LauncherApp {
 
 fn spawn_catalog_fetch(
     repositories: Vec<String>,
+    cancel_requested: Arc<AtomicBool>,
 ) -> Receiver<Result<MojangVersionManifest, String>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let result = tokio::runtime::Builder::new_multi_thread()
+        let result = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|error| tr("rust.error.runtime.catalog").replace("%0", &error.to_string()))
-            .and_then(|runtime| {
-                runtime
-                    .block_on(catalog::fetch_manifest(&repositories))
-                    .map_err(|error| error)
-            });
-        let _ = sender.send(result);
+        {
+            Ok(runtime) => runtime.block_on(async {
+                tokio::select! {
+                    result = catalog::fetch_manifest(&repositories) => Some(result),
+                    _ = wait_for_cancel(cancel_requested) => None,
+                }
+            }),
+            Err(error) => Some(Err(
+                tr("rust.error.runtime.catalog").replace("%0", &error.to_string())
+            )),
+        };
+        if let Some(result) = result {
+            let _ = sender.send(result);
+        }
     });
     receiver
 }
@@ -9696,6 +9742,33 @@ fn icon_button(
         tint.unwrap_or(Color32::WHITE),
     );
     response.on_hover_text(name)
+}
+
+fn cancel_icon_button(ui: &mut egui::Ui, tint: Option<Color32>) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 31.0), Sense::click());
+    let fill = if response.hovered() {
+        Color32::from_rgb(102, 108, 110)
+    } else {
+        Color32::from_rgb(73, 78, 80)
+    };
+    ui.painter().rect_filled(rect, 2.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, Color32::from_white_alpha(24)),
+        egui::StrokeKind::Inside,
+    );
+    let center = rect.center();
+    let color = tint.unwrap_or(Color32::WHITE);
+    ui.painter().line_segment(
+        [center + Vec2::new(-6.0, -6.0), center + Vec2::new(6.0, 6.0)],
+        Stroke::new(2.5, color),
+    );
+    ui.painter().line_segment(
+        [center + Vec2::new(6.0, -6.0), center + Vec2::new(-6.0, 6.0)],
+        Stroke::new(2.5, color),
+    );
+    response
 }
 
 fn load_texture(ctx: &Context, name: &str, bytes: &[u8], recolor: bool) -> TextureHandle {
