@@ -3505,8 +3505,37 @@ impl LauncherApp {
                 if ui.button(tr("rust.ui.versions.cancel-refresh")).clicked() {
                     self.cancel_version_catalog_fetch();
                 }
-            } else if ui.button(tr("rust.ui.versions.refresh-catalog")).clicked() {
-                self.refresh_version_catalog();
+            } else {
+                let mut refresh_action = None;
+                ui.menu_button(tr("rust.ui.versions.refresh-catalog"), |ui| {
+                    if ui
+                        .button(tr("version.manager.refresher.menu.local"))
+                        .clicked()
+                    {
+                        refresh_action = Some(false);
+                        ui.close();
+                    }
+                    if ui
+                        .button(tr("version.manager.refresher.menu.remote"))
+                        .clicked()
+                    {
+                        refresh_action = Some(true);
+                        ui.close();
+                    }
+                });
+                match refresh_action {
+                    Some(true) => self.refresh_version_catalog(),
+                    Some(false) => {
+                        let count = self.installed_versions().len();
+                        self.set_logged_status(
+                            LogLevel::Info,
+                            LogTarget::VersionCatalog,
+                            tr("rust.status.versions.refreshed-local")
+                                .replace("%0", &count.to_string()),
+                        );
+                    }
+                    None => {}
+                }
             }
             if self.version_catalog_loading {
                 ui.spinner();
