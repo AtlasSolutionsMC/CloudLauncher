@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    OnceLock, RwLock,
 };
 use std::time::Duration;
 
@@ -11,6 +12,139 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::Deserialize;
 
 static VERIFY_CERTIFICATES: AtomicBool = AtomicBool::new(true);
+
+/// Signed repository lists supplied by the LegacyLauncher bootstrap service.
+/// Empty lists use the same public fallback repositories as the Java launcher.
+#[derive(Debug, Clone, Default)]
+pub struct RepositoryOverrides {
+    pub assets: Vec<String>,
+    pub libraries: Vec<String>,
+    pub proxified: Vec<String>,
+    pub official_versions: Vec<String>,
+}
+
+static REPOSITORY_OVERRIDES: OnceLock<RwLock<RepositoryOverrides>> = OnceLock::new();
+
+/// Replace the repository lists used for subsequent metadata and file requests.
+pub fn set_repository_overrides(overrides: RepositoryOverrides) {
+    let repositories = REPOSITORY_OVERRIDES.get_or_init(|| RwLock::new(RepositoryOverrides::default()));
+    if let Ok(mut current) = repositories.write() {
+        *current = overrides;
+    }
+}
+
+/// Return ordered URLs for a Mojang resource, followed by LegacyLauncher mirrors.
+/// Unknown hosts are returned unchanged so third-party mod repositories keep
+/// their own URL semantics.
+pub fn repository_candidates(url: &str) -> Vec<String> {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return vec![url.to_owned()];
+    };
+    let Some(host) = parsed.host_str() else {
+        return vec![url.to_owned()];
+    };
+    let path = parsed.path().trim_start_matches('/');
+    let overrides = REPOSITORY_OVERRIDES
+        .get_or_init(|| RwLock::new(RepositoryOverrides::default()))
+        .read()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+
+    let mut candidates = vec![url.to_owned()];
+    let mut add_root = |root: &str| {
+        let candidate = format!("{}{}", root.trim_end_matches('/'), format!("/{path}"));
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    match host {
+        "resources.download.minecraft.net" => {
+            let configured = !overrides.assets.is_empty();
+            let roots = if configured {
+                overrides.assets
+            } else {
+                vec![
+                    "https://resources.download.minecraft.net/".to_owned(),
+                    "https://proxy.llaun.ch/resources.download.minecraft.net/".to_owned(),
+                    "https://proxy.legacylauncher.ru/resources.download.minecraft.net/".to_owned(),
+                ]
+            };
+            for root in roots {
+                add_root(&root);
+            }
+        }
+        "libraries.minecraft.net" => {
+            let roots = if !overrides.libraries.is_empty() {
+                overrides.libraries
+            } else {
+                vec![
+                    "https://libraries.minecraft.net/".to_owned(),
+                    "https://repo.llaun.ch/repo/libraries/".to_owned(),
+                    "https://repo.legacylauncher.ru/repo/libraries/".to_owned(),
+                    "https://repo.legacylauncherservices.com/repo/libraries/".to_owned(),
+                ]
+            };
+            for root in roots {
+                add_root(&root);
+            }
+        }
+        "launchermeta.mojang.com"
+        | "piston-meta.mojang.com"
+        | "launcher.mojang.com"
+        | "piston-data.mojang.com"
+        | "files.minecraftforge.net"
+        | "maven.minecraftforge.net"
+        | "maven.fabricmc.net"
+        | "maven.quiltmc.org"
+        | "maven.neoforged.net"
+        | "modloaders.forgecdn.net" => {
+            let configured = !overrides.proxified.is_empty();
+            if configured {
+                for root in overrides.proxified {
+                    // Java's AppenderRepoList concatenates dynamic repository
+                    // prefixes with the complete source URL.
+                    let candidate = format!("{}{}", root.trim_end_matches('/'), format!("/{url}"));
+                    if !candidates.iter().any(|existing| existing == &candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            } else {
+                for root in [
+                    "https://proxy.llaun.ch/".to_owned(),
+                    "https://proxy.legacylauncher.ru/".to_owned(),
+                ] {
+                    let candidate = format!(
+                        "{}{}{}{}",
+                        root.trim_end_matches('/'),
+                        "/",
+                        host,
+                        if path.is_empty() { String::new() } else { format!("/{path}") }
+                    );
+                    if !candidates.iter().any(|existing| existing == &candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        "s3.amazonaws.com" if parsed.path().starts_with("/Minecraft.Download/") => {
+            let roots = if !overrides.official_versions.is_empty() {
+                overrides.official_versions
+            } else {
+                vec!["https://s3.amazonaws.com/Minecraft.Download/".to_owned()]
+            };
+            let relative = parsed.path().trim_start_matches("/Minecraft.Download/");
+            for root in roots {
+                let candidate = format!("{}{}{}", root.trim_end_matches('/'), "/", relative);
+                if !candidates.iter().any(|existing| existing == &candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        _ => {}
+    }
+    candidates
+}
 
 /// Set TLS certificate and hostname validation for subsequently built clients.
 pub fn set_certificate_validation(verify: bool) {

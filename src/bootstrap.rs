@@ -1,6 +1,7 @@
 use crate::notices::{self, Notice, NoticeAction};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
+use minecraft_java_rs_core::net::client::RepositoryOverrides;
 use rsa::{
     RsaPublicKey,
     pkcs1v15::{Signature, VerifyingKey},
@@ -26,6 +27,7 @@ pub struct Configuration {
     allow_notice_disable_modulo: u32,
     pub allow_ely_everywhere: bool,
     pub extra_version_repositories: Vec<String>,
+    pub repositories: RepositoryOverrides,
 }
 
 impl Configuration {
@@ -204,18 +206,12 @@ async fn parse_configuration(
         .get("ely")
         .and_then(Value::as_bool)
         .unwrap_or_default();
-    let mut seen_repositories = HashSet::new();
-    configuration.extra_version_repositories = options
-        .get("repositories")
-        .and_then(Value::as_object)
-        .and_then(|repositories| repositories.get("extra_version_repo"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter_map(safe_repository_base)
-        .filter(|repository| seen_repositories.insert(repository.clone()))
-        .collect();
+    configuration.repositories.assets = repository_list(&options, "assets_repo");
+    configuration.repositories.libraries = repository_list(&options, "library_repo");
+    configuration.repositories.proxified = repository_list(&options, "proxified_repo");
+    configuration.repositories.official_versions =
+        repository_list(&options, "official_version_repo");
+    configuration.extra_version_repositories = repository_list(&options, "extra_version_repo");
     if let Some(notices) = options
         .get("notices")
         .and_then(Value::as_object)
@@ -314,4 +310,19 @@ fn safe_repository_base(value: &str) -> Option<String> {
         url.set_path(&format!("{}/", url.path()));
     }
     Some(url.to_string())
+}
+
+fn repository_list(options: &Value, key: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    options
+        .get("repositories")
+        .and_then(Value::as_object)
+        .and_then(|repositories| repositories.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(safe_repository_base)
+        .filter(|repository| seen.insert(repository.clone()))
+        .collect()
 }

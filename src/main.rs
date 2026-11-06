@@ -3526,6 +3526,9 @@ impl eframe::App for LauncherApp {
             match result {
                 Ok(configuration) => {
                     let notices_were_enabled = self.settings.notices_enabled;
+                    minecraft_java_rs_core::net::client::set_repository_overrides(
+                        configuration.repositories.clone(),
+                    );
                     self.notices_disable_allowed =
                         configuration.allows_notice_disable(&self.settings.client_id);
                     self.allow_ely_everywhere = configuration.allow_ely_everywhere;

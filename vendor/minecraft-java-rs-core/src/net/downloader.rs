@@ -240,6 +240,66 @@ async fn fetch_one(
     item: &DownloadItem,
     dl_counter: &Arc<AtomicU64>,
 ) -> Result<(), DownloadError> {
+    let tmp_path = temporary_path(&item.path);
+    match tokio::fs::remove_file(&tmp_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DownloadError::Io(error)),
+    }
+
+    let candidates = crate::net::client::repository_candidates(&item.url);
+    let mut last_error = None;
+    for url in candidates {
+        let mut candidate = item.clone();
+        candidate.url = url;
+        match fetch_one_url(client.clone(), &candidate, dl_counter).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    // The temporary file contains only bytes received during this task: old
+    // partials were removed above, and failed mirrors share this verified path.
+    if let Ok(metadata) = tokio::fs::metadata(&tmp_path).await {
+        let size = metadata.len();
+        match tokio::fs::remove_file(&tmp_path).await {
+            Ok(()) => {
+                subtract_downloaded(dl_counter, size);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DownloadError::Io(error)),
+        }
+    }
+
+    Err(last_error.unwrap_or(DownloadError::Timeout))
+}
+
+fn subtract_downloaded(counter: &AtomicU64, size: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_sub(size),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn temporary_path(path: &std::path::Path) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".tmp");
+    PathBuf::from(value)
+}
+
+async fn fetch_one_url(
+    client: reqwest::Client,
+    item: &DownloadItem,
+    dl_counter: &Arc<AtomicU64>,
+) -> Result<(), DownloadError> {
     let dir = if item.folder.as_os_str().is_empty() {
         item.path
             .parent()
@@ -250,21 +310,9 @@ async fn fetch_one(
     };
     tokio::fs::create_dir_all(&dir).await?;
 
-    // Temporary path: `foo.jar` → `foo.jar.tmp`
-    let tmp_path = {
-        let mut s = item.path.as_os_str().to_owned();
-        s.push(".tmp");
-        PathBuf::from(s)
-    };
-
-    // Match the Java downloader: partial bytes survive retries within this
-    // download task. A later launcher run starts clean because no URL metadata
-    // is persisted alongside this temporary file.
-    match tokio::fs::remove_file(&tmp_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(DownloadError::Io(error)),
-    }
+    // Match the Java downloader: partial bytes survive retries and mirror
+    // failover within this download task. A later launcher run starts clean.
+    let tmp_path = temporary_path(&item.path);
 
     let mut last_err: Option<DownloadError> = None;
     let mut backoff = DOWNLOAD_INITIAL_BACKOFF_MS;
@@ -461,7 +509,6 @@ async fn fetch_one(
         return Ok(());
     }
 
-    let _ = tokio::fs::remove_file(&tmp_path).await;
     Err(last_err.unwrap_or(DownloadError::Timeout))
 }
 

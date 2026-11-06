@@ -22,6 +22,20 @@ pub async fn fetch_json<T: DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<T, String> {
+    let mut last_error = None;
+    for candidate in crate::net::client::repository_candidates(url) {
+        match fetch_json_from_url(client, &candidate).await {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("GET {url}: no repository URL available")))
+}
+
+async fn fetch_json_from_url<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, String> {
     let mut last_err = String::new();
     let mut backoff = INITIAL_BACKOFF_MS;
 
@@ -72,6 +86,17 @@ pub async fn fetch_json<T: DeserializeOwned>(
 /// Retries up to `MAX_RETRIES` times on network errors or 5xx/429 responses,
 /// with exponential backoff starting at `INITIAL_BACKOFF_MS`.
 pub async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let mut last_error = None;
+    for candidate in crate::net::client::repository_candidates(url) {
+        match fetch_text_from_url(client, &candidate).await {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("GET {url}: no repository URL available")))
+}
+
+async fn fetch_text_from_url(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let mut last_err = String::new();
     let mut backoff = INITIAL_BACKOFF_MS;
 
