@@ -721,6 +721,7 @@ struct LauncherApp {
     bootstrap_events: Option<Receiver<Result<bootstrap::Configuration, String>>>,
     bootstrap_loading: bool,
     notices_disable_allowed: bool,
+    allow_ely_everywhere: bool,
     bootstrap_error: Option<String>,
     bootstrap_notice_list: Vec<notices::Notice>,
     personal_notice_list: Vec<notices::Notice>,
@@ -898,6 +899,7 @@ impl LauncherApp {
             bootstrap_events: Some(spawn_bootstrap_fetch()),
             bootstrap_loading: true,
             notices_disable_allowed: false,
+            allow_ely_everywhere: false,
             notice_events,
             notices_loading,
             connectivity_events: Some(spawn_connectivity_check()),
@@ -2354,7 +2356,7 @@ impl LauncherApp {
             Some("ely".to_owned())
         } else {
             offline_username.as_deref().map(|username| {
-                if offline_ely_skins_for(&self.settings, username) {
+                if self.allow_ely_everywhere && offline_ely_skins_for(&self.settings, username) {
                     "ely".to_owned()
                 } else {
                     "plain".to_owned()
@@ -3516,6 +3518,7 @@ impl eframe::App for LauncherApp {
                     let notices_were_enabled = self.settings.notices_enabled;
                     self.notices_disable_allowed =
                         configuration.allows_notice_disable(&self.settings.client_id);
+                    self.allow_ely_everywhere = configuration.allow_ely_everywhere;
                     if !self.notices_disable_allowed {
                         self.settings.notices_enabled = true;
                         if !notices_were_enabled {
@@ -3548,6 +3551,7 @@ impl eframe::App for LauncherApp {
                 Err(error) => {
                     let notices_were_enabled = self.settings.notices_enabled;
                     self.notices_disable_allowed = false;
+                    self.allow_ely_everywhere = false;
                     self.settings.notices_enabled = true;
                     if !notices_were_enabled {
                         self.persist();

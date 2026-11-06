@@ -24,6 +24,7 @@ pub struct Configuration {
     pub notification: Option<Notification>,
     pub feedback_url: Option<String>,
     allow_notice_disable_modulo: u32,
+    pub allow_ely_everywhere: bool,
 }
 
 impl Configuration {
@@ -197,6 +198,10 @@ async fn parse_configuration(
         .get("allowNoticeDisable")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_default();
+    configuration.allow_ely_everywhere = options
+        .get("ely")
+        .and_then(Value::as_bool)
         .unwrap_or_default();
     if let Some(notices) = options
         .get("notices")

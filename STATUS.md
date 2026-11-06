@@ -47,7 +47,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Windows ARM first-run OpenGL compatibility notice with the source's five-second install countdown and support action.
 - First-run game-folder conflict detection and destination selection with browse, path validation, and no-copy warning; settings also has a native folder picker.
 - Ely.by OAuth client secret is supplied through `LEGACYLAUNCHER_ELY_CLIENT_SECRET`; no client secret is checked into this public repository.
-- Legacy settings import preserves the source client UUID and all six configured Java experiments; JVM experiments and experimental LWJGL/JNA library replacements are applied during launch.
+- Legacy settings import preserves the source client UUID and all six configured Java experiments; signed bootstrap `ely` permission now gates Ely replacement libraries for offline accounts exactly as in Java, while JVM experiments and experimental LWJGL/JNA replacements are applied during launch.
 
 ## Still open
 
