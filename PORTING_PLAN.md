@@ -41,7 +41,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Add/remove/select Microsoft accounts and persist their Minecraft profiles.
 - [x] Link the login account selector directly to Manage accounts and distinguish Ely.by Legacy from OAuth accounts.
 - [x] Port the account-type help dialog and the US Buy Minecraft action from the source account-add flow.
-- [x] Add/manage/import Ely.by OAuth accounts, protect credentials with DPAPI, and refresh tokens before launch.
+- [x] Add/manage/import Ely.by OAuth accounts, protect credentials with DPAPI, and refresh tokens before launch. Successful Ely OAuth/Legacy sign-ins replace same-username or same-UUID profiles across both Ely account types, matching the Java panes' duplicate-removal behavior.
 - [x] Add/edit/manage/import Ely.by Legacy accounts, protect credentials with DPAPI, and refresh tokens before launch. Editing reauthenticates and replaces stored credentials only after the new sign-in succeeds.
 - [x] Port browser OAuth callback, Xbox Live/XSTS, Minecraft Services login, ownership checks, and refresh-token flow.
 - [x] Protect Microsoft refresh tokens with the current Windows user's DPAPI.

@@ -27,6 +27,19 @@ pub fn store_refresh_token(account_id: &str, refresh_token: &str) -> io::Result<
     save_all(&tokens)
 }
 
+pub fn store_refresh_token_replacing_accounts(
+    account_id: &str,
+    refresh_token: &str,
+    replaced_account_ids: &[String],
+) -> io::Result<()> {
+    let mut tokens = load_all()?;
+    for replaced_account_id in replaced_account_ids {
+        tokens.remove(replaced_account_id);
+    }
+    tokens.insert(account_id.to_owned(), refresh_token.to_owned());
+    save_all(&tokens)
+}
+
 pub fn remove_account(account_id: &str) -> io::Result<()> {
     let mut tokens = load_all()?;
     if tokens.remove(account_id).is_some() {

@@ -2220,7 +2220,31 @@ impl LauncherApp {
                                 .find(|saved| &saved.id == account_id)
                                 .cloned()
                         });
-                if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
+                let mut replaced_ely_accounts = Vec::new();
+                for saved in &self.settings.ely_accounts {
+                    if saved.id != account.id
+                        && (saved.uuid == account.uuid
+                            || saved.username.eq_ignore_ascii_case(&account.username))
+                    {
+                        replaced_ely_accounts.push(saved.id.clone());
+                    }
+                }
+                for saved in &self.settings.ely_legacy_accounts {
+                    if saved.id != account.id
+                        && (saved.uuid == account.uuid
+                            || saved.username.eq_ignore_ascii_case(&account.username)
+                            || editing_account
+                                .as_ref()
+                                .is_some_and(|previous| saved.id == previous.id))
+                    {
+                        replaced_ely_accounts.push(saved.id.clone());
+                    }
+                }
+                if let Err(error) = vault::store_refresh_token_replacing_accounts(
+                    &account.storage_key(),
+                    &secret,
+                    &replaced_ely_accounts,
+                ) {
                     self.set_logged_status(
                         LogLevel::Error,
                         LogTarget::Authentication,
@@ -2229,29 +2253,11 @@ impl LauncherApp {
                     );
                     return;
                 }
-                if let Some(previous) = editing_account.as_ref()
-                    && previous.id != account.id
-                    && let Err(error) = vault::remove_account(&previous.storage_key())
-                {
-                    let cleanup_error = vault::remove_account(&account.storage_key()).err();
-                    let details = cleanup_error.map_or_else(
-                        || error.to_string(),
-                        |cleanup| {
-                            format!("{error}; could not roll back new credentials: {cleanup}")
-                        },
-                    );
-                    self.set_logged_status(
-                        LogLevel::Error,
-                        LogTarget::Authentication,
-                        tr("rust.status.account.ely.remove-error").replace("%0", &details),
-                    );
-                    return;
-                }
+                self.settings.ely_accounts.retain(|saved| {
+                    saved.id != account.id && !replaced_ely_accounts.contains(&saved.id)
+                });
                 self.settings.ely_legacy_accounts.retain(|saved| {
-                    saved.uuid != account.uuid
-                        && editing_account
-                            .as_ref()
-                            .is_none_or(|previous| saved.id != previous.id)
+                    saved.id != account.id && !replaced_ely_accounts.contains(&saved.id)
                 });
                 self.settings.ely_legacy_accounts.push(account.clone());
                 self.settings.selected_account = Some(account.id);
@@ -2321,7 +2327,32 @@ impl LauncherApp {
                         return;
                     }
                 };
-                if let Err(error) = vault::store_refresh_token(&account.storage_key(), &secret) {
+                let replaced_ely_accounts = self
+                    .settings
+                    .ely_accounts
+                    .iter()
+                    .filter(|saved| {
+                        saved.id != account.id
+                            && (saved.uuid == account.uuid
+                                || saved.username.eq_ignore_ascii_case(&account.username))
+                    })
+                    .map(|saved| saved.id.clone())
+                    .chain(
+                        self.settings
+                            .ely_legacy_accounts
+                            .iter()
+                            .filter(|saved| {
+                                saved.uuid == account.uuid
+                                    || saved.username.eq_ignore_ascii_case(&account.username)
+                            })
+                            .map(|saved| saved.id.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                if let Err(error) = vault::store_refresh_token_replacing_accounts(
+                    &account.storage_key(),
+                    &secret,
+                    &replaced_ely_accounts,
+                ) {
                     self.set_logged_status(
                         LogLevel::Error,
                         LogTarget::Authentication,
@@ -2330,9 +2361,12 @@ impl LauncherApp {
                     );
                     return;
                 }
-                self.settings
-                    .ely_accounts
-                    .retain(|saved| saved.uuid != account.uuid);
+                self.settings.ely_accounts.retain(|saved| {
+                    saved.id != account.id && !replaced_ely_accounts.contains(&saved.id)
+                });
+                self.settings.ely_legacy_accounts.retain(|saved| {
+                    saved.id != account.id && !replaced_ely_accounts.contains(&saved.id)
+                });
                 self.settings.ely_accounts.push(account.clone());
                 self.settings.selected_account = Some(account.id);
                 self.show_ely_dialog = false;
