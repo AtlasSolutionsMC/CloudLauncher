@@ -475,6 +475,40 @@ struct LegacyThemePalette {
     border_additional: Option<Color32>,
     border_settings: Option<Color32>,
     border_size: Option<f32>,
+    shadow: Option<Color32>,
+    shadow_uses_border: bool,
+    shadow_main: Option<Color32>,
+    shadow_additional: Option<Color32>,
+    shadow_settings: Option<Color32>,
+    arc: Option<u8>,
+    arc_main: Option<u8>,
+    arc_additional: Option<u8>,
+    arc_settings: Option<u8>,
+    icon_default_color: Option<Color32>,
+    icon_colors: HashMap<String, Color32>,
+}
+
+impl LegacyThemePalette {
+    fn shadow_for(
+        &self,
+        specific: Option<Color32>,
+        border_color: Option<Color32>,
+    ) -> Option<Color32> {
+        specific.or_else(|| {
+            if self.shadow_uses_border {
+                border_color
+            } else {
+                self.shadow
+            }
+        })
+    }
+
+    fn icon_color(&self, icon_name: &str) -> Option<Color32> {
+        self.icon_colors
+            .get(icon_name)
+            .copied()
+            .or(self.icon_default_color)
+    }
 }
 
 #[derive(Default)]
@@ -3383,6 +3417,37 @@ impl eframe::App for LauncherApp {
         let folder_icon = assets.folder.clone();
         let refresh_icon = assets.refresh.clone();
         let settings_icon = assets.settings.clone();
+        let login_panel_fill = self
+            .legacy_theme_palette
+            .as_ref()
+            .and_then(|palette| palette.panel_background)
+            .unwrap_or(Color32::from_rgba_unmultiplied(23, 29, 34, 198));
+        let login_panel_border = self
+            .legacy_theme_palette
+            .as_ref()
+            .and_then(|palette| palette.border_main.or(palette.border));
+        let login_panel_border_size = self
+            .legacy_theme_palette
+            .as_ref()
+            .and_then(|palette| palette.border_size)
+            .unwrap_or(1.0);
+        let login_panel_arc = self
+            .legacy_theme_palette
+            .as_ref()
+            .and_then(|palette| palette.arc_main.or(palette.arc));
+        let login_panel_shadow = self.legacy_theme_palette.as_ref().and_then(|palette| {
+            palette.shadow_for(palette.shadow_main, palette.border_main.or(palette.border))
+        });
+        let default_panel_shadow = ctx.style_of(ctx.theme()).visuals.window_shadow;
+        let icon_color = |name: &str| {
+            self.legacy_theme_palette
+                .as_ref()
+                .and_then(|palette| palette.icon_color(name))
+        };
+        let support_icon_tint = icon_color("comments-o");
+        let folder_icon_tint = icon_color("folder-open");
+        let refresh_icon_tint = icon_color("refresh");
+        let settings_icon_tint = icon_color("bars");
         let account_menu_label = self.selected_account_label();
         let selected_version = self.settings.selected_version.clone();
         let install_label = if self.launching {
@@ -3406,257 +3471,266 @@ impl eframe::App for LauncherApp {
             .order(egui::Order::Foreground)
             .anchor(panel_anchor, panel_offset)
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(23, 29, 34, 198))
-                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(16)))
-                    .inner_margin(Margin::symmetric(24, 28))
-                    .show(ui, |ui| {
-                        ui.set_width(236.0);
-                        let line_rect = ui
-                            .allocate_exact_size(Vec2::new(236.0, 1.0), Sense::hover())
-                            .0;
-                        ui.painter().line_segment(
-                            [line_rect.left_top(), line_rect.right_top()],
-                            Stroke::new(1.0, Color32::from_white_alpha(110)),
-                        );
-                        ui.add_space(5.0);
+                let mut panel_frame = egui::Frame::new()
+                    .fill(login_panel_fill)
+                    .stroke(Stroke::new(
+                        login_panel_border_size,
+                        login_panel_border.unwrap_or(Color32::from_white_alpha(16)),
+                    ))
+                    .inner_margin(Margin::symmetric(24, 28));
+                if let Some(radius) = login_panel_arc {
+                    panel_frame = panel_frame.corner_radius(radius);
+                }
+                if let Some(color) = login_panel_shadow {
+                    panel_frame = panel_frame.shadow(egui::Shadow {
+                        color,
+                        ..default_panel_shadow
+                    });
+                }
+                panel_frame.show(ui, |ui| {
+                    ui.set_width(236.0);
+                    let line_rect = ui
+                        .allocate_exact_size(Vec2::new(236.0, 1.0), Sense::hover())
+                        .0;
+                    ui.painter().line_segment(
+                        [line_rect.left_top(), line_rect.right_top()],
+                        Stroke::new(1.0, Color32::from_white_alpha(110)),
+                    );
+                    ui.add_space(5.0);
 
-                        ComboBox::from_id_salt("account_selector")
-                            .width(236.0)
-                            .selected_text(RichText::new(account_menu_label).size(12.0))
-                            .show_ui(ui, |ui| {
-                                if self.settings.accounts.is_empty()
-                                    && self.settings.microsoft_accounts.is_empty()
-                                    && self.settings.ely_accounts.is_empty()
-                                    && self.settings.ely_legacy_accounts.is_empty()
-                                {
-                                    ui.label(tr("account.empty"));
-                                }
-                                for account in &self.settings.accounts {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.settings.selected_account,
-                                            Some(account.clone()),
-                                            account,
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist();
-                                    }
-                                }
-                                for account in &self.settings.microsoft_accounts {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.settings.selected_account,
-                                            Some(account.id.clone()),
-                                            &account.username,
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist();
-                                    }
-                                }
-                                for account in &self.settings.ely_accounts {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.settings.selected_account,
-                                            Some(account.id.clone()),
-                                            tr("rust.ui.account.ely-label")
-                                                .replace("%0", &account.display_name),
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist();
-                                    }
-                                }
-                                for account in &self.settings.ely_legacy_accounts {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.settings.selected_account,
-                                            Some(account.id.clone()),
-                                            tr("rust.ui.account.ely-legacy-label")
-                                                .replace("%0", &account.display_name),
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist();
-                                    }
-                                }
-                                ui.separator();
-                                if ui.button(tr("rust.ui.account.add-offline")).clicked() {
-                                    self.open_account_dialog();
-                                }
+                    ComboBox::from_id_salt("account_selector")
+                        .width(236.0)
+                        .selected_text(RichText::new(account_menu_label).size(12.0))
+                        .show_ui(ui, |ui| {
+                            if self.settings.accounts.is_empty()
+                                && self.settings.microsoft_accounts.is_empty()
+                                && self.settings.ely_accounts.is_empty()
+                                && self.settings.ely_legacy_accounts.is_empty()
+                            {
+                                ui.label(tr("account.empty"));
+                            }
+                            for account in &self.settings.accounts {
                                 if ui
-                                    .add_enabled(
-                                        !self.microsoft_signin_pending
-                                            && !self.ely_signin_pending
-                                            && !self.ely_legacy_signin_pending
-                                            && !self.launching,
-                                        egui::Button::new(tr("rust.ui.account.add-microsoft")),
+                                    .selectable_value(
+                                        &mut self.settings.selected_account,
+                                        Some(account.clone()),
+                                        account,
                                     )
-                                    .clicked()
+                                    .changed()
                                 {
-                                    self.start_microsoft_sign_in();
+                                    self.persist();
                                 }
+                            }
+                            for account in &self.settings.microsoft_accounts {
                                 if ui
-                                    .add_enabled(
-                                        !self.microsoft_signin_pending
-                                            && !self.ely_signin_pending
-                                            && !self.ely_legacy_signin_pending
-                                            && !self.launching,
-                                        egui::Button::new(tr("rust.ui.account.add-ely")),
+                                    .selectable_value(
+                                        &mut self.settings.selected_account,
+                                        Some(account.id.clone()),
+                                        &account.username,
                                     )
-                                    .clicked()
+                                    .changed()
                                 {
-                                    self.open_ely_dialog();
+                                    self.persist();
                                 }
+                            }
+                            for account in &self.settings.ely_accounts {
                                 if ui
-                                    .add_enabled(
-                                        !self.microsoft_signin_pending
-                                            && !self.ely_signin_pending
-                                            && !self.ely_legacy_signin_pending
-                                            && !self.launching,
-                                        egui::Button::new(tr("rust.ui.account.add-ely-legacy")),
+                                    .selectable_value(
+                                        &mut self.settings.selected_account,
+                                        Some(account.id.clone()),
+                                        tr("rust.ui.account.ely-label")
+                                            .replace("%0", &account.display_name),
                                     )
-                                    .clicked()
+                                    .changed()
                                 {
-                                    self.open_ely_legacy_dialog();
+                                    self.persist();
                                 }
-                                ui.separator();
+                            }
+                            for account in &self.settings.ely_legacy_accounts {
                                 if ui
-                                    .button(tr("account.manager.multipane.add-account.hint"))
-                                    .clicked()
+                                    .selectable_value(
+                                        &mut self.settings.selected_account,
+                                        Some(account.id.clone()),
+                                        tr("rust.ui.account.ely-legacy-label")
+                                            .replace("%0", &account.display_name),
+                                    )
+                                    .changed()
                                 {
-                                    self.show_account_help = true;
+                                    self.persist();
                                 }
-                                if ui
-                                    .button(tr(
-                                        "account.manager.multipane.add-account.buy-minecraft",
-                                    ))
-                                    .clicked()
-                                {
-                                    open_url("https://minecraft.net/store/minecraft");
-                                }
-                                if ui.button(tr("loginform.button.settings.account")).clicked() {
-                                    self.settings_page = Some("Manage accounts");
-                                }
-                            });
-
-                        ComboBox::from_id_salt("version_selector")
-                            .width(236.0)
-                            .selected_text(RichText::new(selected_version).size(12.0))
-                            .show_ui(ui, |ui| {
-                                for version in self.available_versions() {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.settings.selected_version,
-                                            version.clone(),
-                                            &version,
-                                        )
-                                        .changed()
-                                    {
-                                        self.persist();
-                                    }
-                                }
-                            });
-
-                        ui.add_space(5.0);
-                        if ui
-                            .checkbox(
-                                &mut self.settings.auto_login,
-                                tr("loginform.checkbox.autologin"),
-                            )
-                            .changed()
-                        {
-                            if !self.settings.auto_login {
-                                self.auto_launch_deadline = None;
                             }
-                            self.persist();
-                        }
-                        if ui
-                            .checkbox(
-                                &mut self.settings.force_update,
-                                tr("loginform.checkbox.forceupdate"),
-                            )
-                            .changed()
-                        {
-                            self.persist();
-                        }
-                        ui.add_space(3.0);
-
-                        let auto_login_remaining = self
-                            .auto_launch_deadline
-                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                            .map(|remaining| remaining.as_secs_f64().ceil().clamp(1.0, 10.0) as u8);
-                        let play_label = auto_login_remaining
-                            .map(|seconds| {
-                                tr("loginform.cancel").replace("%0", &seconds.to_string())
-                            })
-                            .unwrap_or_else(|| install_label.to_owned());
-                        let play_button =
-                            egui::Button::new(RichText::new(play_label).size(18.0).strong())
-                                .fill(Color32::from_rgb(73, 78, 80))
-                                .stroke(Stroke::new(1.0, Color32::from_white_alpha(36)))
-                                .corner_radius(2.0);
-                        if ui
-                            .add_enabled(
-                                !self.launching,
-                                play_button.min_size(Vec2::new(236.0, 46.0)),
-                            )
-                            .clicked()
-                        {
-                            if self.auto_launch_deadline.take().is_some() {
-                                self.settings.auto_login = false;
-                                self.persist();
-                            } else {
-                                self.start_selected_game();
+                            ui.separator();
+                            if ui.button(tr("rust.ui.account.add-offline")).clicked() {
+                                self.open_account_dialog();
                             }
-                        }
-
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            let support = icon_button(ui, "support", &support_icon);
-                            if support.clicked() {
-                                self.show_support_menu = !self.show_support_menu;
-                                self.support_menu_pos =
-                                    support.rect.left_bottom() + Vec2::new(-54.0, 1.0);
+                            if ui
+                                .add_enabled(
+                                    !self.microsoft_signin_pending
+                                        && !self.ely_signin_pending
+                                        && !self.ely_legacy_signin_pending
+                                        && !self.launching,
+                                    egui::Button::new(tr("rust.ui.account.add-microsoft")),
+                                )
+                                .clicked()
+                            {
+                                self.start_microsoft_sign_in();
                             }
-                            support.on_hover_text(tr("loginform.button.support"));
-
-                            if !self.settings.settings_blocked {
-                                let folder = icon_button(ui, "folder", &folder_icon);
-                                if folder.clicked() {
-                                    self.show_folder_menu = !self.show_folder_menu;
-                                    self.folder_menu_pos =
-                                        folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
-                                }
-                                folder.on_hover_text(tr("loginform.button.folder"));
+                            if ui
+                                .add_enabled(
+                                    !self.microsoft_signin_pending
+                                        && !self.ely_signin_pending
+                                        && !self.ely_legacy_signin_pending
+                                        && !self.launching,
+                                    egui::Button::new(tr("rust.ui.account.add-ely")),
+                                )
+                                .clicked()
+                            {
+                                self.open_ely_dialog();
                             }
-
-                            let refresh = icon_button(ui, "refresh", &refresh_icon);
-                            if refresh.clicked() {
-                                let count = self.installed_versions().len();
-                                self.refresh_version_catalog();
-                                self.set_logged_status(
-                                    LogLevel::Info,
-                                    LogTarget::VersionCatalog,
-                                    tr("rust.status.catalog.refreshed-local")
-                                        .replace("%0", &count.to_string()),
-                                );
+                            if ui
+                                .add_enabled(
+                                    !self.microsoft_signin_pending
+                                        && !self.ely_signin_pending
+                                        && !self.ely_legacy_signin_pending
+                                        && !self.launching,
+                                    egui::Button::new(tr("rust.ui.account.add-ely-legacy")),
+                                )
+                                .clicked()
+                            {
+                                self.open_ely_legacy_dialog();
                             }
-                            refresh.on_hover_text(tr("loginform.button.refresh"));
-
-                            if !self.settings.settings_blocked {
-                                let settings = icon_button(ui, "settings", &settings_icon);
-                                if settings.clicked() {
-                                    self.show_settings_menu = !self.show_settings_menu;
-                                    self.settings_menu_pos =
-                                        settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
-                                }
-                                settings.on_hover_text(tr("loginform.button.settings"));
+                            ui.separator();
+                            if ui
+                                .button(tr("account.manager.multipane.add-account.hint"))
+                                .clicked()
+                            {
+                                self.show_account_help = true;
+                            }
+                            if ui
+                                .button(tr("account.manager.multipane.add-account.buy-minecraft"))
+                                .clicked()
+                            {
+                                open_url("https://minecraft.net/store/minecraft");
+                            }
+                            if ui.button(tr("loginform.button.settings.account")).clicked() {
+                                self.settings_page = Some("Manage accounts");
                             }
                         });
+
+                    ComboBox::from_id_salt("version_selector")
+                        .width(236.0)
+                        .selected_text(RichText::new(selected_version).size(12.0))
+                        .show_ui(ui, |ui| {
+                            for version in self.available_versions() {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.settings.selected_version,
+                                        version.clone(),
+                                        &version,
+                                    )
+                                    .changed()
+                                {
+                                    self.persist();
+                                }
+                            }
+                        });
+
+                    ui.add_space(5.0);
+                    if ui
+                        .checkbox(
+                            &mut self.settings.auto_login,
+                            tr("loginform.checkbox.autologin"),
+                        )
+                        .changed()
+                    {
+                        if !self.settings.auto_login {
+                            self.auto_launch_deadline = None;
+                        }
+                        self.persist();
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.settings.force_update,
+                            tr("loginform.checkbox.forceupdate"),
+                        )
+                        .changed()
+                    {
+                        self.persist();
+                    }
+                    ui.add_space(3.0);
+
+                    let auto_login_remaining = self
+                        .auto_launch_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .map(|remaining| remaining.as_secs_f64().ceil().clamp(1.0, 10.0) as u8);
+                    let play_label = auto_login_remaining
+                        .map(|seconds| tr("loginform.cancel").replace("%0", &seconds.to_string()))
+                        .unwrap_or_else(|| install_label.to_owned());
+                    let play_button =
+                        egui::Button::new(RichText::new(play_label).size(18.0).strong())
+                            .fill(Color32::from_rgb(73, 78, 80))
+                            .stroke(Stroke::new(1.0, Color32::from_white_alpha(36)))
+                            .corner_radius(2.0);
+                    if ui
+                        .add_enabled(
+                            !self.launching,
+                            play_button.min_size(Vec2::new(236.0, 46.0)),
+                        )
+                        .clicked()
+                    {
+                        if self.auto_launch_deadline.take().is_some() {
+                            self.settings.auto_login = false;
+                            self.persist();
+                        } else {
+                            self.start_selected_game();
+                        }
+                    }
+
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        let support = icon_button(ui, "support", &support_icon, support_icon_tint);
+                        if support.clicked() {
+                            self.show_support_menu = !self.show_support_menu;
+                            self.support_menu_pos =
+                                support.rect.left_bottom() + Vec2::new(-54.0, 1.0);
+                        }
+                        support.on_hover_text(tr("loginform.button.support"));
+
+                        if !self.settings.settings_blocked {
+                            let folder = icon_button(ui, "folder", &folder_icon, folder_icon_tint);
+                            if folder.clicked() {
+                                self.show_folder_menu = !self.show_folder_menu;
+                                self.folder_menu_pos =
+                                    folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
+                            }
+                            folder.on_hover_text(tr("loginform.button.folder"));
+                        }
+
+                        let refresh = icon_button(ui, "refresh", &refresh_icon, refresh_icon_tint);
+                        if refresh.clicked() {
+                            let count = self.installed_versions().len();
+                            self.refresh_version_catalog();
+                            self.set_logged_status(
+                                LogLevel::Info,
+                                LogTarget::VersionCatalog,
+                                tr("rust.status.catalog.refreshed-local")
+                                    .replace("%0", &count.to_string()),
+                            );
+                        }
+                        refresh.on_hover_text(tr("loginform.button.refresh"));
+
+                        if !self.settings.settings_blocked {
+                            let settings =
+                                icon_button(ui, "settings", &settings_icon, settings_icon_tint);
+                            if settings.clicked() {
+                                self.show_settings_menu = !self.show_settings_menu;
+                                self.settings_menu_pos =
+                                    settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
+                            }
+                            settings.on_hover_text(tr("loginform.button.settings"));
+                        }
                     });
+                });
             });
 
         if let Some(notification) = self.bootstrap_notification.clone() {
@@ -8466,7 +8540,12 @@ fn diagnose_crash_fallback(log: &str) -> Vec<String> {
     suggestions
 }
 
-fn icon_button(ui: &mut egui::Ui, name: &'static str, texture: &TextureHandle) -> egui::Response {
+fn icon_button(
+    ui: &mut egui::Ui,
+    name: &'static str,
+    texture: &TextureHandle,
+    tint: Option<Color32>,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(58.0, 31.0), Sense::click());
     let fill = if response.hovered() {
         Color32::from_rgb(102, 108, 110)
@@ -8486,7 +8565,7 @@ fn icon_button(ui: &mut egui::Ui, name: &'static str, texture: &TextureHandle) -
         texture.id(),
         icon_rect,
         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-        Color32::WHITE,
+        tint.unwrap_or(Color32::WHITE),
     );
     response.on_hover_text(name)
 }
@@ -9466,6 +9545,22 @@ fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
             .get(key)
             .and_then(|value| parse_legacy_theme_color(value))
     };
+    let arc = |key: &str| {
+        properties
+            .get(key)
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|value| *value <= 64)
+    };
+    let shadow_uses_border = properties
+        .get("shadow")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("border"));
+    let icon_colors = properties
+        .iter()
+        .filter_map(|(key, value)| {
+            let icon_name = key.strip_prefix("icon.color.")?;
+            Some((icon_name.to_owned(), parse_legacy_theme_color(value)?))
+        })
+        .collect();
     Some(LegacyThemePalette {
         foreground: color("foreground"),
         semi_foreground: color("semiforeground"),
@@ -9482,6 +9577,17 @@ fn load_legacy_theme_palette(path: &str) -> Option<LegacyThemePalette> {
             .and_then(|value| value.trim().parse::<u8>().ok())
             .filter(|value| *value <= 24)
             .map(f32::from),
+        shadow: (!shadow_uses_border).then(|| color("shadow")).flatten(),
+        shadow_uses_border,
+        shadow_main: color("shadow.main_panel"),
+        shadow_additional: color("shadow.additional_panel"),
+        shadow_settings: color("shadow.settings_panel"),
+        arc: arc("arc"),
+        arc_main: arc("arc.main_panel"),
+        arc_additional: arc("arc.additional_panel"),
+        arc_settings: arc("arc.settings_panel"),
+        icon_default_color: color("icon.defaultColor"),
+        icon_colors,
     })
 }
 
@@ -9534,7 +9640,7 @@ fn apply_legacy_theme_palette(style: &mut egui::Style, palette: &LegacyThemePale
     if let Some(failure) = palette.failure {
         visuals.error_fg_color = failure;
     }
-    if let Some(border) = palette.border.or(palette.border_settings) {
+    if let Some(border) = palette.border_settings.or(palette.border) {
         visuals.window_stroke.color = border;
         visuals.widgets.noninteractive.bg_stroke.color = border;
     }
@@ -9547,6 +9653,24 @@ fn apply_legacy_theme_palette(style: &mut egui::Style, palette: &LegacyThemePale
     if let Some(border) = palette.border_size {
         visuals.window_stroke.width = border;
         visuals.widgets.noninteractive.bg_stroke.width = border;
+    }
+    if let Some(radius) = palette.arc_settings.or(palette.arc) {
+        visuals.window_corner_radius = egui::CornerRadius::same(radius);
+    }
+    if let Some(radius) = palette.arc_additional.or(palette.arc) {
+        visuals.menu_corner_radius = egui::CornerRadius::same(radius);
+    }
+    if let Some(shadow) = palette.shadow_for(
+        palette.shadow_settings,
+        palette.border_settings.or(palette.border),
+    ) {
+        visuals.window_shadow.color = shadow;
+    }
+    if let Some(shadow) = palette.shadow_for(
+        palette.shadow_additional,
+        palette.border_additional.or(palette.border),
+    ) {
+        visuals.popup_shadow.color = shadow;
     }
 }
 
