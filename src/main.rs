@@ -96,6 +96,7 @@ struct SavedSettings {
     optimized_java_args: String,
     use_current_trust_store: bool,
     wrapper_command: String,
+    legacy_experiments: HashSet<String>,
     screen_width: u32,
     screen_height: u32,
     fullscreen: bool,
@@ -421,6 +422,7 @@ impl Default for SavedSettings {
             optimized_java_args: "default".to_owned(),
             use_current_trust_store: true,
             wrapper_command: String::new(),
+            legacy_experiments: HashSet::new(),
             screen_width: 925,
             screen_height: 530,
             fullscreen: false,
@@ -2071,6 +2073,12 @@ impl LauncherApp {
         if let Some(replacement_type) = library_replace_type {
             library_replace_types.push(replacement_type);
         }
+        if self.settings.legacy_experiments.contains("updated_lwjgl") {
+            library_replace_types.push("experiment-lwjgl-update".to_owned());
+        }
+        if self.settings.legacy_experiments.contains("updated_jna") {
+            library_replace_types.push("experiment-jna-update".to_owned());
+        }
 
         let version = self.settings.selected_version.clone();
         if !valid_version_id(&version) {
@@ -2337,10 +2345,27 @@ impl LauncherApp {
                     }
                 }
 
+                let experimental_java_major = if preferences
+                    .legacy_experiments
+                    .contains("zgc_generational")
+                    && preferences.optimized_java_args == "zgc"
+                {
+                    selected_java_major_for_experiments(
+                        &game_dir,
+                        &version,
+                        &preferences,
+                        version_manifest.as_ref(),
+                    )
+                    .await
+                } else {
+                    None
+                };
+
                 let gpu_preference = preferences.gpu_preference.clone();
                 let gpu_preference_enabled = preferences.windows_gpu_performance;
                 let remove_undesirable_mods = preferences.remove_undesirable_mods;
                 let replacement_instance_version = version.clone();
+                let legacy_experiments = preferences.legacy_experiments.clone();
                 let mut options = make_launch_options_with_authenticator(
                     version,
                     authenticator,
@@ -2348,6 +2373,18 @@ impl LauncherApp {
                     force_update,
                     preferences,
                 );
+                if let Some(warning) = append_legacy_experiment_arguments(
+                    &mut options,
+                    &legacy_experiments,
+                    experimental_java_major,
+                ) {
+                    send_launch_message(
+                        &update_tx,
+                        LogLevel::Warn,
+                        LogTarget::JavaRuntime,
+                        warning,
+                    );
+                }
                 if !library_replace_types.is_empty() {
                     options.library_replace_types = library_replace_types.clone();
                     options.skip_bundle_check = false;
@@ -6876,6 +6913,53 @@ fn make_launch_options_with_authenticator(
     }
 }
 
+fn append_legacy_experiment_arguments(
+    options: &mut LaunchOptions,
+    experiments: &HashSet<String>,
+    java_major: Option<u32>,
+) -> Option<String> {
+    if options.java.optimized_args_type != "none" {
+        if experiments.contains("max_xms") {
+            options.jvm_args.push(format!("-Xms{}", options.memory.max));
+        }
+        if experiments.contains("more_gc_threads") {
+            let threads = std::thread::available_parallelism()
+                .map(|count| count.get() / 2)
+                .unwrap_or(1)
+                .max(1);
+            options
+                .jvm_args
+                .push(format!("-XX:ConcGCThreads={threads}"));
+        }
+        if experiments.contains("tenuring") {
+            options
+                .jvm_args
+                .push("-XX:MaxTenuringThreshold=1".to_owned());
+            options.jvm_args.push("-XX:SurvivorRatio=32".to_owned());
+        }
+    }
+    if experiments.contains("zgc_generational") && options.java.optimized_args_type == "zgc" {
+        match java_major {
+            Some(21..=22) => {
+                options.jvm_args.push("-XX:+ZGenerational".to_owned());
+            }
+            Some(major) => {
+                return Some(
+                    tr("rust.status.experiment.zgc-generational-unavailable")
+                        .replace("%0", &major.to_string()),
+                );
+            }
+            None => {
+                return Some(
+                    tr("rust.status.experiment.zgc-generational-unavailable")
+                        .replace("%0", "unknown"),
+                );
+            }
+        }
+    }
+    None
+}
+
 fn append_promoted_server(
     servers: &mut Vec<SavedServer>,
     version: &str,
@@ -8278,6 +8362,17 @@ fn load_settings() -> SavedSettings {
     for (kind, enabled) in default_version_alert_types() {
         settings.version_alert_types.entry(kind).or_insert(enabled);
     }
+    settings.legacy_experiments.retain(|experiment| {
+        matches!(
+            experiment.as_str(),
+            "zgc_generational"
+                | "tenuring"
+                | "max_xms"
+                | "updated_lwjgl"
+                | "updated_jna"
+                | "more_gc_threads"
+        )
+    });
     settings
 }
 
@@ -8304,6 +8399,35 @@ fn import_legacy_settings(
             }
         }
     };
+
+    if let Some(value) = properties.get("client") {
+        let client_id = uuid::Uuid::parse_str(value.trim()).ok();
+        if let Some(client_id) = client_id.as_ref() {
+            settings.client_id = client_id.to_string();
+        }
+        apply("client", client_id.map(|_| ()))
+    }
+    if let Some(value) = properties.get("experiments.enabled") {
+        let mut experiments = HashSet::new();
+        for experiment in value
+            .split(';')
+            .map(|value| value.trim().to_ascii_lowercase())
+        {
+            if matches!(
+                experiment.as_str(),
+                "zgc_generational"
+                    | "tenuring"
+                    | "max_xms"
+                    | "updated_lwjgl"
+                    | "updated_jna"
+                    | "more_gc_threads"
+            ) {
+                experiments.insert(experiment);
+            }
+        }
+        settings.legacy_experiments = experiments;
+        apply("experiments.enabled", Some(()));
+    }
 
     if let Some(value) = properties.get("minecraft.gamedir") {
         let path = PathBuf::from(value.trim());
@@ -9793,6 +9917,32 @@ async fn verify_java_compatibility(
             .replace("%0", &major.to_string())
             .replace("%1", &version_text))
     }
+}
+
+async fn selected_java_major_for_experiments(
+    game_dir: &std::path::Path,
+    version_id: &str,
+    preferences: &SavedSettings,
+    version_manifest: Option<&MojangVersionManifest>,
+) -> Option<u32> {
+    if preferences.java_mode == "recommended" {
+        if let Some(major) = local_required_java_major(game_dir, version_id) {
+            return Some(major);
+        }
+        return match version_manifest {
+            Some(manifest) => catalog::fetch_required_java_major(version_id, manifest)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+    }
+
+    let path = PathBuf::from(preferences.java_path.trim());
+    tokio::task::spawn_blocking(move || inspect_java(&path).ok().map(|(major, _)| major))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn local_required_java_major(game_dir: &std::path::Path, version_id: &str) -> Option<u32> {

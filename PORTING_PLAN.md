@@ -65,6 +65,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Record source-style startup version/platform, working-directory, and settings-file context in the launcher log.
 - [x] Import `bootstrap.switchToBeta` and expose it as an opt-in prerelease update channel for the Rust self-updater.
 - [ ] Migrate the remaining Java launcher settings and unsupported legacy account types.
+- [x] Preserve the source `client` UUID and import/run all six `experiments.enabled` options, including runtime-gated ZGC generational support and LWJGL/JNA replacement profiles.
 - [x] Port plain/offline account validation, including the source's opt-in for non-standard names.
 - [x] Preserve each offline account's `elySkins` preference (defaulting to the Java source's `true` value), import it from `tlauncher_profiles.json`, and apply the matching Ely/plain/Minecraft replacement libraries from `libraries/replace.json` with repo failover and isolated launch caches.
 

@@ -1,6 +1,6 @@
 # Port status
 
-Updated: 2026-11-05 (Asia/Bangkok)
+Updated: 2026-11-06 (Asia/Bangkok)
 
 Implementation is ongoing; feature parity remains incomplete.
 
@@ -35,6 +35,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Windows ARM first-run OpenGL compatibility notice with the source's five-second install countdown and support action.
 - First-run game-folder conflict detection and destination selection with browse, path validation, and no-copy warning; settings also has a native folder picker.
 - Ely.by OAuth client secret is supplied through `LEGACYLAUNCHER_ELY_CLIENT_SECRET`; no client secret is checked into this public repository.
+- Legacy settings import preserves the source client UUID and all six configured Java experiments; JVM experiments and experimental LWJGL/JNA library replacements are applied during launch.
 
 ## Still open
 
@@ -44,11 +45,11 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 98 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 99 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 
-Latest Windows x64 release build and portable ZIP packaging passed on 2026-11-05.
+Latest Windows x64 release build and portable ZIP packaging passed on 2026-11-06.
 
 From the project directory:
 
