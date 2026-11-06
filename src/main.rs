@@ -67,6 +67,7 @@ struct SavedSettings {
     beta_updates: bool,
     client_id: String,
     notices_enabled: bool,
+    notice_side_panel_enabled: bool,
     promoted_notices_enabled: bool,
     promoted_servers_in_game: bool,
     logger_mode: String,
@@ -401,6 +402,7 @@ impl Default for SavedSettings {
             beta_updates: false,
             client_id: uuid::Uuid::new_v4().to_string(),
             notices_enabled: true,
+            notice_side_panel_enabled: true,
             promoted_notices_enabled: true,
             promoted_servers_in_game: true,
             logger_mode: "none".to_owned(),
@@ -718,6 +720,7 @@ struct LauncherApp {
     new_server_address: String,
     bootstrap_events: Option<Receiver<Result<bootstrap::Configuration, String>>>,
     bootstrap_loading: bool,
+    notices_disable_allowed: bool,
     bootstrap_error: Option<String>,
     bootstrap_notice_list: Vec<notices::Notice>,
     personal_notice_list: Vec<notices::Notice>,
@@ -894,6 +897,7 @@ impl LauncherApp {
             show_live_game_log: false,
             bootstrap_events: Some(spawn_bootstrap_fetch()),
             bootstrap_loading: true,
+            notices_disable_allowed: false,
             notice_events,
             notices_loading,
             connectivity_events: Some(spawn_connectivity_check()),
@@ -3509,6 +3513,15 @@ impl eframe::App for LauncherApp {
             self.bootstrap_loading = false;
             match result {
                 Ok(configuration) => {
+                    let notices_were_enabled = self.settings.notices_enabled;
+                    self.notices_disable_allowed =
+                        configuration.allows_notice_disable(&self.settings.client_id);
+                    if !self.notices_disable_allowed {
+                        self.settings.notices_enabled = true;
+                        if !notices_were_enabled {
+                            self.persist();
+                        }
+                    }
                     self.bootstrap_notice_list = configuration.notices;
                     self.bootstrap_promoted_servers = configuration.promoted_servers;
                     self.bootstrap_feedback_url = configuration.feedback_url;
@@ -3522,6 +3535,9 @@ impl eframe::App for LauncherApp {
                     self.bootstrap_notification = configuration.notification;
                     self.bootstrap_error = None;
                     self.rebuild_notice_list(ctx);
+                    if !notices_were_enabled && self.settings.notices_enabled {
+                        self.refresh_notices();
+                    }
                     record_launcher_log_event(
                         &self.launcher_log,
                         LogLevel::Info,
@@ -3530,6 +3546,13 @@ impl eframe::App for LauncherApp {
                     );
                 }
                 Err(error) => {
+                    let notices_were_enabled = self.settings.notices_enabled;
+                    self.notices_disable_allowed = false;
+                    self.settings.notices_enabled = true;
+                    if !notices_were_enabled {
+                        self.persist();
+                        self.refresh_notices();
+                    }
                     record_launcher_log_event(
                         &self.launcher_log,
                         LogLevel::Warn,
@@ -3559,6 +3582,9 @@ impl eframe::App for LauncherApp {
                         &tr("rust.log.notices.loaded").replace("%0", &notices.len().to_string()),
                     );
                     self.personal_notice_list = notices;
+                    if !self.settings.notices_enabled {
+                        self.personal_notice_list.clear();
+                    }
                     self.notice_error = None;
                 }
                 Err(error) => {
@@ -4348,7 +4374,10 @@ impl eframe::App for LauncherApp {
             }
         }
 
-        if self.settings.notices_enabled && !self.show_notices_window {
+        if self.settings.notices_enabled
+            && self.settings.notice_side_panel_enabled
+            && !self.show_notices_window
+        {
             let visible = self.visible_notice_indices();
             if let Some(index) = visible
                 .get(self.notice_index % visible.len().max(1))
@@ -4427,19 +4456,28 @@ impl eframe::App for LauncherApp {
                 .show(ctx, |ui| {
                     let was_enabled = self.settings.notices_enabled;
                     let notices_changed = ui
-                        .checkbox(
-                            &mut self.settings.notices_enabled,
-                            tr("rust.ui.notices.show"),
+                        .add_enabled(
+                            self.notices_disable_allowed,
+                            egui::Checkbox::new(
+                                &mut self.settings.notices_enabled,
+                                tr("rust.ui.notices.show"),
+                            ),
                         )
                         .changed();
                     let mut changed = notices_changed;
-                    if notices_changed && !was_enabled && self.settings.notices_enabled {
+                    if notices_changed && was_enabled != self.settings.notices_enabled {
                         self.refresh_notices();
                     }
                     changed |= ui
                         .checkbox(
                             &mut self.settings.promoted_notices_enabled,
                             tr("rust.ui.notices.show-promoted"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.notice_side_panel_enabled,
+                            tr("rust.ui.notices.show-launcher-panel"),
                         )
                         .changed();
                     if changed {
@@ -4483,7 +4521,9 @@ impl eframe::App for LauncherApp {
                     }
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for index in visible {
-                            let notice = self.notice_list[index].clone();
+                            let Some(notice) = self.notice_list.get(index).cloned() else {
+                                continue;
+                            };
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.strong(if notice.promoted {
@@ -9807,14 +9847,19 @@ fn import_legacy_settings(
         }
     }
 
-    for key in ["notice.enabled", "gui.notices.enabled"] {
-        if let Some(value) = properties.get(key) {
-            let enabled = parse_legacy_bool(value);
-            if let Some(enabled) = enabled {
-                settings.notices_enabled = enabled;
-            }
-            apply(key, enabled.map(|_| ()));
+    if let Some(value) = properties.get("notice.enabled") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.notices_enabled = enabled;
         }
+        apply("notice.enabled", enabled.map(|_| ()));
+    }
+    if let Some(value) = properties.get("gui.notices.enabled") {
+        let enabled = parse_legacy_bool(value);
+        if let Some(enabled) = enabled {
+            settings.notice_side_panel_enabled = enabled;
+        }
+        apply("gui.notices.enabled", enabled.map(|_| ()));
     }
     if let Some(value) = properties.get("bootstrap.switchToBeta") {
         let enabled = parse_legacy_bool(value);
@@ -10052,6 +10097,10 @@ fn legacy_properties_from_settings(settings: &SavedSettings) -> BTreeMap<String,
         }
     }
     put("notice.enabled", settings.notices_enabled.to_string());
+    put(
+        "gui.notices.enabled",
+        settings.notice_side_panel_enabled.to_string(),
+    );
     put("bootstrap.switchToBeta", settings.beta_updates.to_string());
     put(
         "notice.promoted",

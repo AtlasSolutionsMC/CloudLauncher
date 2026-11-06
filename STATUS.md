@@ -40,6 +40,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Startup connectivity checks cover Mojang version metadata, Legacy Launcher repository mirrors, both bootstrap hosts, and Ely.by; failures show a warning badge with affected hosts and source help copy.
 - Version filters, notice/account controls, launch/download status labels, and error text for Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server handling, imports, background images, and crash fallbacks now resolve from US locale entries. Dynamic errors and source-provided notice/crash copy still need a full-flow review.
 - US personal notices and signed bootstrap configuration with US notices, promoted servers, and notification links; Java's separate full-screen notice scene now has previous/next navigation, timed hide/restore, notice actions, and a home action.
+- Separate the Java `notice.enabled` permission from `gui.notices.enabled` panel visibility; signed `allowNoticeDisable` is evaluated against the preserved client UUID using Java's hash rule, and both settings round-trip through legacy properties.
 - Startup and manual GitHub release checks with release notes, bounded executable download, SHA-256 verification, and a Windows replacement/restart handoff; the startup prompt waits until first-run setup is complete. A tag-triggered workflow publishes the assets.
 - The migrated `bootstrap.switchToBeta` preference enables opt-in GitHub prerelease updates; the default channel continues to use stable releases.
 - Source-style US first-run notice with a required acknowledgment before launcher controls can be used.
@@ -56,7 +57,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 103 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 104 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
 
 ## Windows build
 

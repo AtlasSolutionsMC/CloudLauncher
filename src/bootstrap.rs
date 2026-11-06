@@ -23,6 +23,24 @@ pub struct Configuration {
     pub promoted_servers: Vec<NoticeAction>,
     pub notification: Option<Notification>,
     pub feedback_url: Option<String>,
+    allow_notice_disable_modulo: u32,
+}
+
+impl Configuration {
+    pub fn allows_notice_disable(&self, client_id: &str) -> bool {
+        if self.allow_notice_disable_modulo == 0 {
+            return false;
+        }
+        let Ok(client_id) = uuid::Uuid::parse_str(client_id) else {
+            return false;
+        };
+        let raw = client_id.as_u128();
+        let most_significant = (raw >> 64) as u64;
+        let least_significant = raw as u64;
+        let combined = most_significant ^ least_significant;
+        let java_hash = ((combined >> 32) as u32) ^ (combined as u32);
+        java_hash % self.allow_notice_disable_modulo == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +193,11 @@ async fn parse_configuration(
     options: Value,
 ) -> Result<Configuration, String> {
     let mut configuration = Configuration::default();
+    configuration.allow_notice_disable_modulo = options
+        .get("allowNoticeDisable")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_default();
     if let Some(notices) = options
         .get("notices")
         .and_then(Value::as_object)
