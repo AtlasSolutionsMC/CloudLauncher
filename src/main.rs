@@ -4449,7 +4449,7 @@ impl eframe::App for LauncherApp {
                         if support.clicked() {
                             self.show_support_menu = !self.show_support_menu;
                             self.support_menu_pos =
-                                support.rect.left_bottom() + Vec2::new(-54.0, 1.0);
+                                support.rect.left_bottom() + Vec2::new(0.0, 1.0);
                         }
                         support.on_hover_text(tr("loginform.button.support"));
 
@@ -4458,7 +4458,7 @@ impl eframe::App for LauncherApp {
                             if folder.clicked() {
                                 self.show_folder_menu = !self.show_folder_menu;
                                 self.folder_menu_pos =
-                                    folder.rect.left_bottom() + Vec2::new(-70.0, 1.0);
+                                    folder.rect.left_bottom() + Vec2::new(0.0, 1.0);
                             }
                             folder.on_hover_text(tr("loginform.button.folder"));
                         }
@@ -4482,7 +4482,7 @@ impl eframe::App for LauncherApp {
                             if settings.clicked() {
                                 self.show_settings_menu = !self.show_settings_menu;
                                 self.settings_menu_pos =
-                                    settings.rect.left_bottom() + Vec2::new(-58.0, 1.0);
+                                    settings.rect.left_bottom() + Vec2::new(0.0, 1.0);
                             }
                             settings.on_hover_text(tr("loginform.button.settings"));
                         }
