@@ -3870,6 +3870,14 @@ impl eframe::App for LauncherApp {
                         }
                     ),
                 );
+                for detail in &service.failure_details {
+                    record_launcher_log_event(
+                        &self.launcher_log,
+                        LogLevel::Warn,
+                        LogTarget::Connectivity,
+                        &format!("Connectivity failure for {}: {detail}", service.id),
+                    );
+                }
             }
             self.connectivity_report = Some(report);
         }
@@ -8408,7 +8416,9 @@ fn spawn_connectivity_check() -> Receiver<connectivity::Report> {
             .build()
         {
             Ok(runtime) => runtime.block_on(connectivity::check()),
-            Err(_) => connectivity::unavailable_report(),
+            Err(error) => connectivity::unavailable_report(&format!(
+                "Could not start connectivity-check runtime: {error}"
+            )),
         };
         let _ = sender.send(report);
     });

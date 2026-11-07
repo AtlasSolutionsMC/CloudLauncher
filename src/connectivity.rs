@@ -24,6 +24,7 @@ pub struct ServiceCheck {
     pub hosts: Vec<&'static str>,
     pub reachable: bool,
     pub critical: bool,
+    pub failure_details: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +64,9 @@ pub async fn check() -> Report {
         .build()
     {
         Ok(client) => client,
-        Err(_) => return unavailable_report(),
+        Err(error) => {
+            return unavailable_report(&format!("Could not create HTTP client: {error}"));
+        }
     };
 
     let brand = option_env!("LEGACYLAUNCHER_SHORT_BRAND").unwrap_or("develop");
@@ -72,7 +75,15 @@ pub async fn check() -> Report {
     let proxified_manifest_urls = PROXY_HOSTS.map(|host| {
         format!("https://{host}/launchermeta.mojang.com/mc/game/version_manifest.json")
     });
-    let (mojang, repo_llaunch, repo_ru, repo_services, bootstrap_a, bootstrap_b, ely) = tokio::join!(
+    let (
+        mojang_result,
+        repo_llaunch_result,
+        repo_ru_result,
+        repo_services_result,
+        bootstrap_a_result,
+        bootstrap_b_result,
+        ely_result,
+    ) = tokio::join!(
         check_json(&client, MOJANG_VERSION_MANIFEST),
         check_json(&client, EXTRA_REPOSITORIES[0]),
         check_json(&client, EXTRA_REPOSITORIES[1]),
@@ -81,17 +92,36 @@ pub async fn check() -> Report {
         check_http(&client, &bootstrap_urls[1]),
         check_json(&client, ELY_PROFILE),
     );
+    let mojang_failure = failure_detail("launchermeta.mojang.com", mojang_result);
+    let repo_llaunch_failure = failure_detail("repo.llaun.ch", repo_llaunch_result);
+    let repo_ru_failure = failure_detail("repo.legacylauncher.ru", repo_ru_result);
+    let repo_services_failure =
+        failure_detail("repo.legacylauncherservices.com", repo_services_result);
+    let bootstrap_a_failure = failure_detail(BOOTSTRAP_HOSTS[0], bootstrap_a_result);
+    let bootstrap_b_failure = failure_detail(BOOTSTRAP_HOSTS[1], bootstrap_b_result);
+    let ely_failure = failure_detail("account.ely.by", ely_result);
+    let mojang = mojang_failure.is_none();
+    let repo_llaunch = repo_llaunch_failure.is_none();
+    let repo_ru = repo_ru_failure.is_none();
+    let repo_services = repo_services_failure.is_none();
+    let bootstrap_a = bootstrap_a_failure.is_none();
+    let bootstrap_b = bootstrap_b_failure.is_none();
+    let ely = ely_failure.is_none();
     let proxy_needed =
         !mojang || !(repo_llaunch || repo_ru || repo_services) || !(bootstrap_a || bootstrap_b);
-    let (proxified_a, proxified_b) = if proxy_needed {
+    let (proxified_a_result, proxified_b_result) = if proxy_needed {
         tokio::join!(
             check_json(&client, &proxified_manifest_urls[0]),
             check_json(&client, &proxified_manifest_urls[1]),
         )
     } else {
         // Source queues proxy checks only after a normal-priority service fails.
-        (true, true)
+        (Ok(()), Ok(()))
     };
+    let proxified_a_failure = failure_detail(PROXY_HOSTS[0], proxified_a_result);
+    let proxified_b_failure = failure_detail(PROXY_HOSTS[1], proxified_b_result);
+    let proxified_a = proxified_a_failure.is_none();
+    let proxified_b = proxified_b_failure.is_none();
 
     let mut report = Report {
         services: vec![
@@ -100,12 +130,14 @@ pub async fn check() -> Report {
                 hosts: vec!["launchermeta.mojang.com"],
                 reachable: mojang,
                 critical: true,
+                failure_details: failures([mojang_failure]),
             },
             ServiceCheck {
                 id: "official_repo_proxy",
                 hosts: PROXY_HOSTS.to_vec(),
                 reachable: proxified_a || proxified_b,
                 critical: false,
+                failure_details: failures([proxified_a_failure, proxified_b_failure]),
             },
             ServiceCheck {
                 id: "repo",
@@ -116,18 +148,25 @@ pub async fn check() -> Report {
                 ],
                 reachable: repo_llaunch || repo_ru || repo_services,
                 critical: true,
+                failure_details: failures([
+                    repo_llaunch_failure,
+                    repo_ru_failure,
+                    repo_services_failure,
+                ]),
             },
             ServiceCheck {
                 id: "boot",
                 hosts: BOOTSTRAP_HOSTS.to_vec(),
                 reachable: bootstrap_a || bootstrap_b,
                 critical: true,
+                failure_details: failures([bootstrap_a_failure, bootstrap_b_failure]),
             },
             ServiceCheck {
                 id: "account.ely.by",
                 hosts: vec!["account.ely.by"],
                 reachable: ely,
                 critical: false,
+                failure_details: failures([ely_failure]),
             },
         ],
         doomsday_message: None,
@@ -156,38 +195,56 @@ async fn fetch_doomsday_message(client: &Client) -> Option<String> {
     primary.or(mirror)
 }
 
-async fn check_json(client: &Client, url: &str) -> bool {
-    let Ok(response) = client.get(url).send().await else {
-        return false;
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-    response.json::<Value>().await.is_ok()
+fn failure_detail(host: &str, result: Result<(), String>) -> Option<String> {
+    result.err().map(|error| format!("{host}: {error}"))
 }
 
-async fn check_http(client: &Client, url: &str) -> bool {
+fn failures<const N: usize>(details: [Option<String>; N]) -> Vec<String> {
+    details.into_iter().flatten().collect()
+}
+
+async fn check_json(client: &Client, url: &str) -> Result<(), String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    response
+        .json::<Value>()
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Invalid JSON: {error}"))
+}
+
+async fn check_http(client: &Client, url: &str) -> Result<(), String> {
     client
         .get(url)
         .send()
         .await
-        .is_ok_and(|response| response.status().is_success())
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-pub fn unavailable_report() -> Report {
-    Report {
+pub fn unavailable_report(reason: &str) -> Report {
+    let mut report = Report {
         services: vec![
             ServiceCheck {
                 id: "official_repo",
                 hosts: vec!["launchermeta.mojang.com"],
                 reachable: false,
                 critical: true,
+                failure_details: Vec::new(),
             },
             ServiceCheck {
                 id: "official_repo_proxy",
                 hosts: PROXY_HOSTS.to_vec(),
                 reachable: false,
                 critical: false,
+                failure_details: Vec::new(),
             },
             ServiceCheck {
                 id: "repo",
@@ -198,20 +255,27 @@ pub fn unavailable_report() -> Report {
                 ],
                 reachable: false,
                 critical: true,
+                failure_details: Vec::new(),
             },
             ServiceCheck {
                 id: "boot",
                 hosts: BOOTSTRAP_HOSTS.to_vec(),
                 reachable: false,
                 critical: true,
+                failure_details: Vec::new(),
             },
             ServiceCheck {
                 id: "account.ely.by",
                 hosts: vec!["account.ely.by"],
                 reachable: false,
                 critical: false,
+                failure_details: Vec::new(),
             },
         ],
         doomsday_message: None,
+    };
+    if let Some(service) = report.services.first_mut() {
+        service.failure_details.push(reason.to_owned());
     }
+    report
 }
