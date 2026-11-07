@@ -7344,6 +7344,10 @@ impl eframe::App for LauncherApp {
                         self.show_version_manager(ui);
                     }
                     "Manage accounts" => {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.label(tr("rust.ui.account.manage.hint"));
+                        });
+                        ui.add_space(8.0);
                         ui.heading(tr("rust.settings.import.accounts.heading"));
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.settings.legacy_profiles_path);

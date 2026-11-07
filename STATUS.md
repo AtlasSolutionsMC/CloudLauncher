@@ -11,6 +11,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Offline, Microsoft, Ely.by OAuth, and Ely.by Legacy account flows.
 - Account type guidance with Microsoft/offline/Ely.by descriptions, plus source-style Buy Minecraft and Ely.by registration links.
 - Login account dropdown opens Manage accounts directly and labels Ely.by Legacy accounts distinctly from Ely.by OAuth.
+- The Manage accounts page includes the source welcome tip with Rust-specific US instructions for adding, selecting, and editing accounts.
 - Optional `--requireMinecraftAccount` account-add gate with the source US warning and Mojang-import exception.
 - Minecraft version catalog and lifecycle, custom inherited versions, Java runtime management, Forge/NeoForge/Fabric/LegacyFabric/Quilt launch paths, and source Forge mod-pack argument compatibility.
 - Source Auto memory allocation by Minecraft release family and available RAM, including Forge scaling, the Auto/manual setting, and migration of the retired `minecraft.memory` preference.
