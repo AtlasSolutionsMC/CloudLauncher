@@ -38,6 +38,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Source version update alerts for enabled release types, backed by the compatible `versions/versions.json` cache and imported `gui.alerton.*` settings.
 - Settings and common dialog labels now resolve from the US locale resource.
 - The source SettingsPanel About us tab includes the US copy, Rust clone version, creator and Ely.by links, and source license text.
+- Source HTML formatting is preserved in About, account-creation success, connectivity-warning, and Doomsday messages, including paragraphs, emphasis, lists, and safe clickable HTTP(S) links. Link failures are reported under the matching launcher or connectivity subsystem.
 - Startup connectivity checks cover Mojang version metadata, Legacy Launcher repository mirrors, both bootstrap hosts, and Ely.by; failures show a warning badge with affected hosts and source help copy.
 - Version filters, notice/account controls, launch/download status labels, and error text for Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server handling, imports, background images, crash fallbacks, external-link/OAuth browser-launch failures, connectivity-check runtime/request/HTTP/JSON failures, and optional notice-image download failures now resolve from US locale entries. Connectivity lifecycle logs use US locale labels while retaining host-specific transport details. Optional notice/bootstrap image failures are logged under their subsystem without exposing query strings or suppressing the notice. Failed external-link launches are logged by subsystem; notification and first-run notices remain available to retry. The ExtraVersionList catalog now also prefers signed-bootstrap `extra_version_repo` mirrors before built-in fallbacks. Dynamic errors and source-provided notice/crash copy still need a full-flow review.
 - US personal notices and signed bootstrap configuration with US notices, promoted servers, and notification links; notice content preserves safe inline emphasis, paragraph breaks, and clickable HTTP(S) links across the side panel, notice manager, and Java-style full-screen notice scene with previous/next navigation, timed hide/restore, notice actions, and a home action.
@@ -58,7 +59,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. It has 113 completed entries and 8 open entries (93.4% of tracked checklist items); this is a checklist count, not a measured feature-parity percentage. A reliable parity estimate still needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. It has 113 completed entries and 8 open entries (93.4% of tracked checklist items); this is a checklist count, not a measured feature-parity percentage. Recent rich-text work also covers localized About, account-success, and connectivity messages. A reliable parity estimate still needs the remaining source and runtime review.
 
 ## Windows build
 

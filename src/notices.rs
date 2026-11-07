@@ -6,7 +6,7 @@ use url::Url;
 pub struct Notice {
     pub id: String,
     pub order: i64,
-    pub text_lines: Vec<Vec<NoticeTextSpan>>,
+    pub text_lines: Vec<Vec<RichTextSpan>>,
     pub promoted: bool,
     pub action: Option<NoticeAction>,
     pub image: Option<Vec<u8>>,
@@ -14,7 +14,7 @@ pub struct Notice {
 }
 
 #[derive(Debug, Clone)]
-pub struct NoticeTextSpan {
+pub struct RichTextSpan {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
@@ -104,7 +104,7 @@ pub fn parse_notice(value: &Value) -> Option<(Notice, Option<String>)> {
         })
     })?;
     let raw_text = value.get("text")?.as_str()?;
-    let (plain_text, text_lines) = parse_notice_html(raw_text);
+    let (plain_text, text_lines) = parse_safe_html(raw_text);
     if plain_text.is_empty() {
         return None;
     }
@@ -335,9 +335,9 @@ struct NoticeHtmlStyle {
     link: Option<String>,
 }
 
-fn parse_notice_html(input: &str) -> (String, Vec<Vec<NoticeTextSpan>>) {
+pub fn parse_safe_html(input: &str) -> (String, Vec<Vec<RichTextSpan>>) {
     let mut plain = String::with_capacity(input.len());
-    let mut lines = vec![Vec::new()];
+    let mut lines: Vec<Vec<RichTextSpan>> = vec![Vec::new()];
     let mut buffer = String::new();
     let mut style = NoticeHtmlStyle::default();
     let mut stack: Vec<(String, NoticeHtmlStyle)> = Vec::new();
@@ -440,7 +440,7 @@ fn parse_notice_html(input: &str) -> (String, Vec<Vec<NoticeTextSpan>>) {
 fn flush_notice_text(
     buffer: &mut String,
     plain: &mut String,
-    line: &mut Vec<NoticeTextSpan>,
+    line: &mut Vec<RichTextSpan>,
     style: &NoticeHtmlStyle,
 ) {
     if buffer.is_empty() {
@@ -456,7 +456,7 @@ fn flush_notice_text(
     {
         previous.text.push_str(&text);
     } else {
-        line.push(NoticeTextSpan {
+        line.push(RichTextSpan {
             text,
             bold: style.bold,
             italic: style.italic,
@@ -467,11 +467,7 @@ fn flush_notice_text(
     buffer.clear();
 }
 
-fn push_notice_line_break(
-    plain: &mut String,
-    lines: &mut Vec<Vec<NoticeTextSpan>>,
-    paragraph: bool,
-) {
+fn push_notice_line_break(plain: &mut String, lines: &mut Vec<Vec<RichTextSpan>>, paragraph: bool) {
     if !paragraph || lines.last().is_some_and(|line| !line.is_empty()) {
         plain.push('\n');
         lines.push(Vec::new());

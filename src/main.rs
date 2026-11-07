@@ -5426,13 +5426,14 @@ impl eframe::App for LauncherApp {
 
             if self.show_connectivity_window {
                 let mut open = true;
+                let mut html_action = None;
                 egui::Window::new(tr("connectivity.warning.title"))
                     .open(&mut open)
                     .default_size([500.0, 460.0])
                     .resizable(true)
                     .show(ctx, |ui| {
                         if let Some(message) = report.doomsday_message.as_deref() {
-                            ui.label(localized_html_to_plain_text(message));
+                            render_notice_html(ui, message, true, &mut html_action);
                         } else {
                             let no_connection = report.all_services_unreachable();
                             let body_key = if no_connection {
@@ -5440,7 +5441,7 @@ impl eframe::App for LauncherApp {
                             } else {
                                 "connectivity.warning.body.text"
                             };
-                            ui.label(localized_html_to_plain_text(&tr(body_key)));
+                            render_notice_html(ui, &tr(body_key), true, &mut html_action);
                             if ui.link(tr("connectivity.warning.body.link")).clicked() {
                                 let url = if no_connection {
                                     "https://wiki.llaun.ch/en:connectivity:none"
@@ -5529,6 +5530,9 @@ impl eframe::App for LauncherApp {
                         }
                     });
                 self.show_connectivity_window = open;
+                if let Some(notices::NoticeAction::Url { url, .. }) = html_action {
+                    self.open_url_with_status(&url, LogTarget::Connectivity);
+                }
             }
         }
 
@@ -6426,20 +6430,27 @@ impl eframe::App for LauncherApp {
             let mut open = true;
             let title = tr_dynamic(&format!("account.manager.multipane.{kind}.title"));
             let mut close = false;
+            let mut html_action = None;
             egui::Window::new(title)
                 .open(&mut open)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(localized_html_to_plain_text(&tr(
-                        "account.manager.multipane.success.body",
-                    )));
+                    render_notice_html(
+                        ui,
+                        &tr("account.manager.multipane.success.body"),
+                        true,
+                        &mut html_action,
+                    );
                     ui.add_space(8.0);
                     if ui.button(tr("support.button.close")).clicked() {
                         close = true;
                     }
                 });
+            if let Some(action) = html_action {
+                self.perform_notice_action(action, ctx);
+            }
             if close || !open {
                 self.account_success_kind = None;
             }
@@ -6457,6 +6468,7 @@ impl eframe::App for LauncherApp {
             let mut browse_background_file = false;
             let mut browse_theme_file = false;
             let mut logger_mode_changed = false;
+            let mut about_action = None;
             egui::Window::new(settings_page_title(title))
                 .open(&mut open)
                 .collapsible(false)
@@ -6473,9 +6485,14 @@ impl eframe::App for LauncherApp {
                             if ui.link("turikhay").clicked() {
                                 self.open_url_with_status("https://turikhay.com", LogTarget::Launcher);
                             }
-                            ui.label(") —");
-                            ui.label(localized_html_to_plain_text(&tr("about.text")));
+                            ui.label(")");
                         });
+                        render_notice_html(
+                            ui,
+                            &tr("about.text"),
+                            true,
+                            &mut about_action,
+                        );
                         ui.add_space(10.0);
                         ui.separator();
                         ui.horizontal_wrapped(|ui| {
@@ -6483,10 +6500,20 @@ impl eframe::App for LauncherApp {
                                 self.open_url_with_status("https://ely.by", LogTarget::Launcher);
                             }
                             ui.label("—");
-                            ui.label(localized_html_to_plain_text(&tr("about.partners.ely")));
                         });
+                        render_notice_html(
+                            ui,
+                            &tr("about.partners.ely"),
+                            true,
+                            &mut about_action,
+                        );
                         ui.separator();
-                        ui.label(localized_html_to_plain_text(&tr("about.license")));
+                        render_notice_html(
+                            ui,
+                            &tr("about.license"),
+                            true,
+                            &mut about_action,
+                        );
                     }
                     "Launcher & game preferences" => {
                         ui.label(tr("rust.settings.locale.english-us"));
@@ -7696,6 +7723,9 @@ impl eframe::App for LauncherApp {
                     }
                     _ => {}
                 });
+            if let Some(notices::NoticeAction::Url { url, .. }) = about_action {
+                self.open_url_with_status(&url, LogTarget::Launcher);
+            }
             if logger_mode_changed {
                 self.persist();
                 if self.settings.logger_mode == "global" {
@@ -9593,42 +9623,34 @@ fn launch_action_label_key(action: &str) -> &'static str {
     }
 }
 
-fn localized_html_to_plain_text(value: &str) -> String {
-    let mut text = String::with_capacity(value.len());
-    let mut inside_tag = false;
-    let mut tag = String::new();
-    for character in value.chars() {
-        if inside_tag {
-            if character == '>' {
-                if tag.trim_start_matches('/').starts_with("br") {
-                    text.push('\n');
-                }
-                inside_tag = false;
-                tag.clear();
-            } else {
-                tag.push(character);
-            }
-        } else if character == '<' {
-            inside_tag = true;
-        } else {
-            text.push(character);
-        }
-    }
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-}
-
 fn render_notice_text(
     ui: &mut egui::Ui,
     notice: &notices::Notice,
     enabled: bool,
     action: &mut Option<notices::NoticeAction>,
 ) {
-    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-        for line in &notice.text_lines {
+    render_rich_text(ui, &notice.text_lines, enabled, action, egui::Align::Center);
+}
+
+fn render_notice_html(
+    ui: &mut egui::Ui,
+    html: &str,
+    enabled: bool,
+    action: &mut Option<notices::NoticeAction>,
+) {
+    let (_, lines) = notices::parse_safe_html(html);
+    render_rich_text(ui, &lines, enabled, action, egui::Align::Min);
+}
+
+fn render_rich_text(
+    ui: &mut egui::Ui,
+    lines: &[Vec<notices::RichTextSpan>],
+    enabled: bool,
+    action: &mut Option<notices::NoticeAction>,
+    alignment: egui::Align,
+) {
+    ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+        for line in lines {
             if line.is_empty() {
                 ui.add_space(8.0);
                 continue;
