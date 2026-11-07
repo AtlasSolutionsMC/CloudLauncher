@@ -12,6 +12,10 @@ const EXTRA_REPOSITORIES: [&str; 3] = [
 const BOOTSTRAP_HOSTS: [&str; 2] = ["bootstrap.llaun.ch", "bootstrap.legacylauncher.ru"];
 const ELY_PROFILE: &str =
     "https://account.ely.by/api/minecraft/session/profile/ffb3378cd561502fa78a08494be68811";
+const DOOMSDAY_URLS: [&str; 2] = [
+    "https://europe-west3-legacylauncher.cloudfunctions.net/doomsday",
+    "https://functions.yandexcloud.net/d4e6s85mtp5rjisfrgil",
+];
 
 #[derive(Debug, Clone)]
 pub struct ServiceCheck {
@@ -24,6 +28,7 @@ pub struct ServiceCheck {
 #[derive(Debug, Clone)]
 pub struct Report {
     pub services: Vec<ServiceCheck>,
+    pub doomsday_message: Option<String>,
 }
 
 impl Report {
@@ -73,7 +78,7 @@ pub async fn check() -> Report {
         check_json(&client, ELY_PROFILE),
     );
 
-    Report {
+    let mut report = Report {
         services: vec![
             ServiceCheck {
                 id: "official_repo",
@@ -104,7 +109,30 @@ pub async fn check() -> Report {
                 critical: false,
             },
         ],
+        doomsday_message: None,
+    };
+    if report.has_critical_failures() {
+        report.doomsday_message = fetch_doomsday_message(&client).await;
     }
+    report
+}
+
+async fn fetch_doomsday_message(client: &Client) -> Option<String> {
+    async fn fetch(client: &Client, url: &'static str) -> Option<String> {
+        let response = client.get(url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let payload = response.json::<Value>().await.ok()?;
+        let message = payload.get("messages")?.get("en_US")?.as_str()?.trim();
+        (!message.is_empty()).then(|| message.to_owned())
+    }
+
+    let (primary, mirror) = tokio::join!(
+        fetch(client, DOOMSDAY_URLS[0]),
+        fetch(client, DOOMSDAY_URLS[1])
+    );
+    primary.or(mirror)
 }
 
 async fn check_json(client: &Client, url: &str) -> bool {
@@ -157,5 +185,6 @@ pub fn unavailable_report() -> Report {
                 critical: false,
             },
         ],
+        doomsday_message: None,
     }
 }

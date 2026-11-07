@@ -5298,74 +5298,78 @@ impl eframe::App for LauncherApp {
                     .default_size([500.0, 460.0])
                     .resizable(true)
                     .show(ctx, |ui| {
-                        let no_connection = report.all_services_unreachable();
-                        let body_key = if no_connection {
-                            "connectivity.warning.body.empty"
+                        if let Some(message) = report.doomsday_message.as_deref() {
+                            ui.label(localized_html_to_plain_text(message));
                         } else {
-                            "connectivity.warning.body.text"
-                        };
-                        ui.label(localized_html_to_plain_text(&tr(body_key)));
-                        if ui.link(tr("connectivity.warning.body.link")).clicked() {
-                            open_url(if no_connection {
-                                "https://wiki.llaun.ch/en:connectivity:none"
+                            let no_connection = report.all_services_unreachable();
+                            let body_key = if no_connection {
+                                "connectivity.warning.body.empty"
                             } else {
-                                "https://wiki.llaun.ch/en:connectivity:some"
-                            });
-                        }
-                        ui.separator();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for service in report
-                                .services
-                                .iter()
-                                .filter(|service| !service.reachable)
-                            {
-                                let (name_key, hint_key) = match service.id {
-                                    "official_repo" => (
-                                        "connectivity.warning.list.name.official_repo",
-                                        "rust.connectivity.hint.official_repo",
-                                    ),
-                                    "repo" => (
-                                        "connectivity.warning.list.name.repo",
-                                        "connectivity.warning.list.hint.repo",
-                                    ),
-                                    "boot" => (
-                                        "connectivity.warning.list.name.boot",
-                                        "connectivity.warning.list.hint.boot",
-                                    ),
-                                    "account.ely.by" => (
-                                        "connectivity.warning.list.name.account.ely.by",
-                                        "connectivity.warning.list.hint.account.ely.by",
-                                    ),
-                                    _ => (
-                                        "connectivity.warning.list.name.web",
-                                        "rust.connectivity.hint.official_repo",
-                                    ),
-                                };
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.strong(tr(name_key));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.colored_label(
-                                                    Color32::LIGHT_RED,
-                                                    tr("connectivity.warning.list.status.unreachable"),
-                                                );
-                                            },
-                                        );
-                                    });
-                                    ui.label(tr(hint_key));
+                                "connectivity.warning.body.text"
+                            };
+                            ui.label(localized_html_to_plain_text(&tr(body_key)));
+                            if ui.link(tr("connectivity.warning.body.link")).clicked() {
+                                open_url(if no_connection {
+                                    "https://wiki.llaun.ch/en:connectivity:none"
+                                } else {
+                                    "https://wiki.llaun.ch/en:connectivity:some"
                                 });
                             }
-                        });
-                        let unavailable_hosts = report.unavailable_hosts();
-                        if !unavailable_hosts.is_empty() {
-                            egui::CollapsingHeader::new(tr("connectivity.warning.hosts.button"))
-                                .show(ui, |ui| {
-                                    for host in unavailable_hosts {
-                                        ui.monospace(host);
-                                    }
-                                });
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for service in report
+                                    .services
+                                    .iter()
+                                    .filter(|service| !service.reachable)
+                                {
+                                    let (name_key, hint_key) = match service.id {
+                                        "official_repo" => (
+                                            "connectivity.warning.list.name.official_repo",
+                                            "rust.connectivity.hint.official_repo",
+                                        ),
+                                        "repo" => (
+                                            "connectivity.warning.list.name.repo",
+                                            "connectivity.warning.list.hint.repo",
+                                        ),
+                                        "boot" => (
+                                            "connectivity.warning.list.name.boot",
+                                            "connectivity.warning.list.hint.boot",
+                                        ),
+                                        "account.ely.by" => (
+                                            "connectivity.warning.list.name.account.ely.by",
+                                            "connectivity.warning.list.hint.account.ely.by",
+                                        ),
+                                        _ => (
+                                            "connectivity.warning.list.name.web",
+                                            "rust.connectivity.hint.official_repo",
+                                        ),
+                                    };
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.strong(tr(name_key));
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.colored_label(
+                                                        Color32::LIGHT_RED,
+                                                        tr("connectivity.warning.list.status.unreachable"),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.label(tr(hint_key));
+                                    });
+                                }
+                            });
+                            let unavailable_hosts = report.unavailable_hosts();
+                            if !unavailable_hosts.is_empty() {
+                                egui::CollapsingHeader::new(tr("connectivity.warning.hosts.button"))
+                                    .show(ui, |ui| {
+                                        for host in unavailable_hosts {
+                                            ui.monospace(host);
+                                        }
+                                    });
+                            }
                         }
                     });
                 self.show_connectivity_window = open;
