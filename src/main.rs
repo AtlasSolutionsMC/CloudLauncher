@@ -685,6 +685,7 @@ struct LauncherApp {
     auto_launch_deadline: Option<Instant>,
     launcher_window_state_seen: bool,
     show_account_dialog: bool,
+    account_success_kind: Option<&'static str>,
     show_account_help: bool,
     require_minecraft_account: bool,
     show_require_minecraft_account_notice: bool,
@@ -2376,6 +2377,11 @@ impl LauncherApp {
         self.ely_legacy_signin_pending = false;
         match result {
             Ok((profile, credentials)) => {
+                let success_kind = if self.editing_ely_legacy_account.is_some() {
+                    "success-edit"
+                } else {
+                    "success-add"
+                };
                 let account = ElyLegacyAccountProfile {
                     id: format!("ely_legacy:{}", profile.uuid),
                     username: profile.username,
@@ -2448,6 +2454,7 @@ impl LauncherApp {
                 self.show_ely_legacy_dialog = false;
                 self.editing_ely_legacy_account = None;
                 self.ely_legacy_password.clear();
+                self.account_success_kind = Some(success_kind);
                 self.set_logged_status(
                     LogLevel::Info,
                     LogTarget::Authentication,
@@ -2554,6 +2561,7 @@ impl LauncherApp {
                 self.settings.ely_accounts.push(account.clone());
                 self.settings.selected_account = Some(account.id);
                 self.show_ely_dialog = false;
+                self.account_success_kind = Some("success-add");
                 self.set_logged_status(
                     LogLevel::Info,
                     LogTarget::Authentication,
@@ -2608,6 +2616,7 @@ impl LauncherApp {
             .retain(|saved| saved.id != profile.id);
         self.settings.microsoft_accounts.push(profile.clone());
         self.settings.selected_account = Some(profile.id);
+        self.account_success_kind = Some("success-add");
         self.set_logged_status(
             LogLevel::Info,
             LogTarget::Authentication,
@@ -5984,6 +5993,7 @@ impl eframe::App for LauncherApp {
                             if !name.is_empty()
                                 && (valid_plain_name(&name) || self.new_account_allow_invalid)
                             {
+                                let was_editing = self.editing_account.is_some();
                                 let old_name = self.editing_account.take();
                                 let collision = old_name.as_ref().is_some_and(|old_name| {
                                     old_name != &name
@@ -6051,6 +6061,11 @@ impl eframe::App for LauncherApp {
                                         .insert(name.clone(), self.new_account_ely_skins);
                                     self.settings.selected_account = Some(name);
                                     self.show_account_dialog = false;
+                                    self.account_success_kind = Some(if was_editing {
+                                        "success-edit"
+                                    } else {
+                                        "success-add"
+                                    });
                                     self.persist();
                                 }
                             } else {
@@ -6268,6 +6283,29 @@ impl eframe::App for LauncherApp {
             if !open && !self.profile_creation_pending {
                 self.show_minecraft_profile_dialog = false;
                 self.pending_minecraft_profile = None;
+            }
+        }
+
+        if let Some(kind) = self.account_success_kind {
+            let mut open = true;
+            let title = tr_dynamic(&format!("account.manager.multipane.{kind}.title"));
+            let mut close = false;
+            egui::Window::new(title)
+                .open(&mut open)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(localized_html_to_plain_text(&tr(
+                        "account.manager.multipane.success.body",
+                    )));
+                    ui.add_space(8.0);
+                    if ui.button(tr("support.button.close")).clicked() {
+                        close = true;
+                    }
+                });
+            if close || !open {
+                self.account_success_kind = None;
             }
         }
 
