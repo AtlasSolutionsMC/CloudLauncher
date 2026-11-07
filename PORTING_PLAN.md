@@ -135,7 +135,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Render optional personal-feed notice banners and merge available notice server actions into the in-game list.
 - [x] Port signed bootstrap notice, notification-icon, and global promoted-server delivery for the US locale.
 - [x] Download the release executable with a size limit, verify its SHA-256, retry temporary network/429/5xx/stream failures with bounded backoff, and hand off replacement/restart to a Windows helper process.
-- [ ] Validate the download and restart flow against a published Windows release artifact.
+- [ ] Validate the download and restart flow against a published Windows release artifact. The detached Windows helper now preserves startup arguments, retries file replacement for up to 60 seconds, and displays a localized error if installation or restart fails.
 - [x] No new-feature dialog to port in the current source flow: `NewFeaturesFrame` has no call sites in this checkout.
 - [x] Port the source feedback-on-exit prompt using the US/global survey URL from bootstrap configuration.
 - [x] Port the US Discord/email support links and opt-in diagnostics flow.

@@ -285,7 +285,7 @@ fn checksum_for_asset(checksums: &[u8], asset_name: &str) -> Result<String, Stri
 
 #[cfg(windows)]
 fn prepare_windows_handoff(executable: Vec<u8>) -> Result<(), String> {
-    use std::{io::Write, os::windows::process::CommandExt, process::Command};
+    use std::{os::windows::process::CommandExt, process::Command};
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let current_exe = std::env::current_exe().map_err(|error| {
@@ -300,38 +300,58 @@ fn prepare_windows_handoff(executable: Vec<u8>) -> Result<(), String> {
         .ok_or_else(|| crate::tr("rust.error.update.exe-name-invalid").to_owned())?;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let replacement = parent.join(format!("{file_name}.{suffix}.update"));
-    let helper = parent.join(format!("{file_name}.{suffix}.cmd"));
+    let helper = parent.join(format!("{file_name}.{suffix}.ps1"));
+    let handoff_data = parent.join(format!("{file_name}.{suffix}.json"));
 
-    fs::write(&replacement, executable)
-        .map_err(|error| crate::tr("rust.error.update.save").replace("%0", &error.to_string()))?;
-    let mut helper_file = match fs::File::create(&helper) {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = fs::remove_file(&replacement);
-            return Err(
-                crate::tr("rust.error.update.handoff-prepare").replace("%0", &error.to_string())
-            );
-        }
-    };
-    if let Err(error) = helper_file.write_all(include_bytes!("../assets/update_windows.cmd")) {
+    if let Err(error) = fs::write(&replacement, executable) {
         let _ = fs::remove_file(&replacement);
-        let _ = fs::remove_file(&helper);
-        return Err(crate::tr("rust.error.update.handoff-write").replace("%0", &error.to_string()));
+        return Err(crate::tr("rust.error.update.save").replace("%0", &error.to_string()));
     }
-    drop(helper_file);
+    let arguments = std::env::args_os()
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let handoff_json = serde_json::json!({
+        "arguments": arguments,
+        "failureTitle": crate::tr("rust.error.update.handoff-failed-title"),
+        "installFailure": crate::tr("rust.error.update.handoff-failed"),
+        "restartFailure": crate::tr("rust.error.update.restart-failed"),
+    });
+    if let Err(error) = fs::write(&handoff_data, handoff_json.to_string()) {
+        let _ = fs::remove_file(&replacement);
+        let _ = fs::remove_file(&handoff_data);
+        return Err(
+            crate::tr("rust.error.update.handoff-prepare").replace("%0", &error.to_string())
+        );
+    }
+    if let Err(error) = fs::write(&helper, include_bytes!("../assets/update_windows.ps1")) {
+        let _ = fs::remove_file(&replacement);
+        let _ = fs::remove_file(&handoff_data);
+        return Err(
+            crate::tr("rust.error.update.handoff-prepare").replace("%0", &error.to_string())
+        );
+    }
 
-    let spawn_result = Command::new("cmd.exe")
-        .arg("/D")
-        .arg("/C")
+    let spawn_result = Command::new("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-STA")
+        .arg("-File")
         .arg(&helper)
         .arg(std::process::id().to_string())
         .arg(&current_exe)
         .arg(&replacement)
+        .arg(&handoff_data)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
     if let Err(error) = spawn_result {
         let _ = fs::remove_file(&replacement);
         let _ = fs::remove_file(&helper);
+        let _ = fs::remove_file(&handoff_data);
         return Err(crate::tr("rust.error.update.handoff-start").replace("%0", &error.to_string()));
     }
     Ok(())
