@@ -9690,24 +9690,30 @@ fn collect_crash_report(
             .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
             .unwrap_or_default()
     });
-    if log.trim().is_empty() {
-        return None;
-    }
     let mut suggestions = match crash::diagnose(&log, version, loader, exit_code, runtime) {
         crash::CrashDiagnosis::Fake => return None,
         crash::CrashDiagnosis::Known(suggestion) => vec![suggestion],
         crash::CrashDiagnosis::Unknown => Vec::new(),
     };
     if suggestions.is_empty() {
-        suggestions = diagnose_crash_fallback(&log)
-            .into_iter()
-            .map(|body| crash::CrashSuggestion {
-                title: tr("rust.ui.crash.fallback-title").to_owned(),
-                body,
+        suggestions = if log.trim().is_empty() {
+            vec![crash::CrashSuggestion {
+                title: tr("crash.unknown.title").to_owned(),
+                body: tr("crash.unknown.body").to_owned(),
                 permit_help: true,
                 actions: Vec::new(),
-            })
-            .collect();
+            }]
+        } else {
+            diagnose_crash_fallback(&log)
+                .into_iter()
+                .map(|body| crash::CrashSuggestion {
+                    title: tr("rust.ui.crash.fallback-title").to_owned(),
+                    body,
+                    permit_help: true,
+                    actions: Vec::new(),
+                })
+                .collect()
+        };
     }
     let summary = if let Some(first) = suggestions.first() {
         tr("rust.crash.summary-with-suggestion").replace("%0", &first.title)
