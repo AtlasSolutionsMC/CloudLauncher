@@ -7940,6 +7940,9 @@ impl eframe::App for LauncherApp {
                 });
             if !open || dismiss_crash {
                 self.crash_report = None;
+                if self.settings.launch_action == "exit" {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             if request_crash_help {
                 self.show_diagnostic_consent = true;
