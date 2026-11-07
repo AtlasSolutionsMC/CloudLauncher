@@ -1018,15 +1018,39 @@ impl LauncherApp {
 
     fn persist(&self) {
         let path = settings_path();
+        let mut primary_error = None;
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(error) = fs::create_dir_all(parent) {
+                primary_error = Some(
+                    tr("rust.log.settings.create-directory-failed")
+                        .replace("%0", &parent.display().to_string())
+                        .replace("%1", &error.to_string()),
+                );
+            }
         }
         let mut saved_settings = self.settings.clone();
         self.command_line_overrides
             .restore_persisted_values(&mut saved_settings, &self.persisted_settings);
         http::set_certificate_validation(saved_settings.verify_tls_certificates);
-        if let Ok(bytes) = serde_json::to_vec_pretty(&saved_settings) {
-            let _ = fs::write(path, bytes);
+        if primary_error.is_none() {
+            primary_error = match serde_json::to_vec_pretty(&saved_settings) {
+                Ok(bytes) => fs::write(&path, bytes).err().map(|error| {
+                    tr("rust.log.settings.write-failed")
+                        .replace("%0", &path.display().to_string())
+                        .replace("%1", &error.to_string())
+                }),
+                Err(error) => {
+                    Some(tr("rust.log.settings.serialize-failed").replace("%0", &error.to_string()))
+                }
+            };
+        }
+        if let Some(error) = primary_error {
+            record_launcher_log_event(
+                &self.launcher_log,
+                LogLevel::Error,
+                LogTarget::Settings,
+                &error,
+            );
         }
         if let Some(external_settings_file) = &self.external_settings_file
             && let Err(error) =
