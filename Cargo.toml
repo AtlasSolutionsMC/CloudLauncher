@@ -8,6 +8,7 @@ description = "A Rust desktop port of Legacy Launcher for Windows"
 base64 = "0.22"
 bzip2 = "0.5"
 eframe = "0.37.0"
+fontique = "0.11.1"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 minecraft-java-rs-core = "0.4.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -23,6 +24,7 @@ tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "tim
 time = { version = "0.3", features = ["formatting", "parsing"] }
 url = "2.5"
 uuid = { version = "1.0", features = ["v4"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 fastnbt = "2.6.3"
 flate2 = "1"
 jcdc-classfile = "0.1.1"

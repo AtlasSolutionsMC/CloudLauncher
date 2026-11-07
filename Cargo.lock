@@ -2242,6 +2242,7 @@ dependencies = [
  "eframe",
  "fastnbt",
  "flate2",
+ "fontique",
  "image",
  "jcdc-classfile",
  "minecraft-java-rs-core",
@@ -2258,6 +2259,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

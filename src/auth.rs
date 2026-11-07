@@ -237,12 +237,23 @@ async fn authenticate_minecraft(
                 .replace("%0", &error.to_string())
         })?;
     if profile_response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(SignInOutcome::ProfileCreationRequired(
-            PendingMinecraftProfile {
-                access_token: minecraft_token.access_token,
-                refresh_token: microsoft_token.refresh_token,
-                xuid: identity.xid.clone().unwrap_or_default(),
-            },
+        let body = profile_response
+            .json::<Value>()
+            .await
+            .unwrap_or(Value::Null);
+        if body.get("error").and_then(Value::as_str) == Some("NOT_FOUND") {
+            return Ok(SignInOutcome::ProfileCreationRequired(
+                PendingMinecraftProfile {
+                    access_token: minecraft_token.access_token,
+                    refresh_token: microsoft_token.refresh_token,
+                    xuid: identity.xid.clone().unwrap_or_default(),
+                },
+            ));
+        }
+        return Err(response_error(
+            reqwest::StatusCode::NOT_FOUND,
+            &body,
+            crate::tr("rust.status.account.microsoft.operation.profile"),
         ));
     }
     let profile: MinecraftProfile = decode_response(
@@ -349,37 +360,41 @@ async fn decode_response<T: serde::de::DeserializeOwned>(
     let status = response.status();
     if !status.is_success() {
         let body = response.json::<Value>().await.unwrap_or(Value::Null);
-        let xerr = body.get("XErr").and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_str().and_then(|code| code.parse().ok()))
-        });
-        if let Some(code) = xerr {
-            let message = match code {
-                2_148_916_233 => crate::tr("rust.status.account.microsoft.xbox-no-profile"),
-                2_148_916_235 => crate::tr("rust.status.account.microsoft.xbox-region"),
-                2_148_916_238 => crate::tr("rust.status.account.microsoft.xbox-child"),
-                _ => crate::tr("rust.status.account.microsoft.xbox-rejected"),
-            };
-            return Err(message.to_owned());
-        }
-        if let Some(message) = ["errorMessage", "developerMessage", "message", "error"]
-            .iter()
-            .find_map(|field| body.get(field).and_then(Value::as_str))
-        {
-            let detail = message.chars().take(240).collect::<String>();
-            return Err(crate::tr("rust.status.account.microsoft.http-detail")
-                .replace("%0", operation_label)
-                .replace("%1", &status.to_string())
-                .replace("%2", &detail));
-        }
-        return Err(crate::tr("rust.status.account.microsoft.http-error")
-            .replace("%0", operation_label)
-            .replace("%1", &status.to_string()));
+        return Err(response_error(status, &body, operation_label));
     }
     response.json::<T>().await.map_err(|_| {
         crate::tr("rust.status.account.microsoft.response-error").replace("%0", operation_label)
     })
+}
+
+fn response_error(status: reqwest::StatusCode, body: &Value, operation: &str) -> String {
+    let xerr = body.get("XErr").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|code| code.parse().ok()))
+    });
+    if let Some(code) = xerr {
+        let message = match code {
+            2_148_916_233 => crate::tr("rust.status.account.microsoft.xbox-no-profile"),
+            2_148_916_235 => crate::tr("rust.status.account.microsoft.xbox-region"),
+            2_148_916_238 => crate::tr("rust.status.account.microsoft.xbox-child"),
+            _ => crate::tr("rust.status.account.microsoft.xbox-rejected"),
+        };
+        return message.to_owned();
+    }
+    if let Some(message) = ["errorMessage", "developerMessage", "message", "error"]
+        .iter()
+        .find_map(|field| body.get(field).and_then(Value::as_str))
+    {
+        let detail = message.chars().take(240).collect::<String>();
+        return crate::tr("rust.status.account.microsoft.http-detail")
+            .replace("%0", operation)
+            .replace("%1", &status.to_string())
+            .replace("%2", &detail);
+    }
+    crate::tr("rust.status.account.microsoft.http-error")
+        .replace("%0", operation)
+        .replace("%1", &status.to_string())
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
