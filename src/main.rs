@@ -4228,6 +4228,30 @@ impl eframe::App for LauncherApp {
             match result {
                 Ok(configuration) => {
                     let notices_were_enabled = self.settings.notices_enabled;
+                    for notice in &configuration.notices {
+                        if let Some(error) = &notice.image_load_error {
+                            record_launcher_log_event(
+                                &self.launcher_log,
+                                LogLevel::Warn,
+                                LogTarget::Bootstrap,
+                                &tr("rust.log.bootstrap.image-failed")
+                                    .replace("%0", &notice.id)
+                                    .replace("%1", error),
+                            );
+                        }
+                    }
+                    if let Some(notification) = &configuration.notification
+                        && let Some(error) = &notification.image_load_error
+                    {
+                        record_launcher_log_event(
+                            &self.launcher_log,
+                            LogLevel::Warn,
+                            LogTarget::Bootstrap,
+                            &tr("rust.log.bootstrap.image-failed")
+                                .replace("%0", &notification.id)
+                                .replace("%1", error),
+                        );
+                    }
                     minecraft_java_rs_core::net::client::set_repository_overrides(
                         configuration.repositories.clone(),
                     );
@@ -4312,6 +4336,18 @@ impl eframe::App for LauncherApp {
                         LogTarget::Notices,
                         &tr("rust.log.notices.loaded").replace("%0", &notices.len().to_string()),
                     );
+                    for notice in &notices {
+                        if let Some(error) = &notice.image_load_error {
+                            record_launcher_log_event(
+                                &self.launcher_log,
+                                LogLevel::Warn,
+                                LogTarget::Notices,
+                                &tr("rust.log.notices.image-failed")
+                                    .replace("%0", &notice.id)
+                                    .replace("%1", error),
+                            );
+                        }
+                    }
                     self.personal_notice_list = notices;
                     if !self.settings.notices_enabled {
                         self.personal_notice_list.clear();

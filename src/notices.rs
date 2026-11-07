@@ -10,6 +10,7 @@ pub struct Notice {
     pub promoted: bool,
     pub action: Option<NoticeAction>,
     pub image: Option<Vec<u8>>,
+    pub image_load_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +73,10 @@ pub async fn fetch(client_id: &str) -> Result<Vec<Notice>, String> {
             continue;
         };
         if let Some(image_url) = image_url {
-            notice.image = load_remote_image(&client, &image_url).await.ok().flatten();
+            match load_remote_image(&client, &image_url).await {
+                Ok(image) => notice.image = image,
+                Err(error) => notice.image_load_error = Some(error),
+            }
         }
         notices.push(notice);
     }
@@ -108,6 +112,7 @@ pub fn parse_notice(value: &Value) -> Option<(Notice, Option<String>)> {
                 .unwrap_or(false),
             action,
             image,
+            image_load_error: None,
         },
         image_url,
     ))
@@ -149,24 +154,45 @@ pub async fn load_remote_image(
     url: &str,
 ) -> Result<Option<Vec<u8>>, String> {
     const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "remote server".to_owned());
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            crate::tr("rust.error.notices.image-request")
+                .replace("%0", &host)
+                .replace("%1", &error.without_url().to_string())
+        })?
         .error_for_status()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            crate::tr("rust.error.notices.image-http")
+                .replace("%0", &host)
+                .replace(
+                    "%1",
+                    &error
+                        .status()
+                        .map_or_else(|| "unknown".to_owned(), |status| status.to_string()),
+                )
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_IMAGE_BYTES)
     {
-        return Ok(None);
+        return Err(crate::tr("rust.error.notices.image-too-large").replace("%0", &host));
     }
     let mut response = response;
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        crate::tr("rust.error.notices.image-read")
+            .replace("%0", &host)
+            .replace("%1", &error.without_url().to_string())
+    })? {
         if bytes.len().saturating_add(chunk.len()) as u64 > MAX_IMAGE_BYTES {
-            return Ok(None);
+            return Err(crate::tr("rust.error.notices.image-too-large").replace("%0", &host));
         }
         bytes.extend_from_slice(&chunk);
     }

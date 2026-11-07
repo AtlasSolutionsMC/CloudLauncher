@@ -52,6 +52,7 @@ pub struct Notification {
     pub id: String,
     pub url: String,
     pub image: Option<Vec<u8>>,
+    pub image_load_error: Option<String>,
 }
 
 pub async fn fetch() -> Result<Configuration, String> {
@@ -223,10 +224,10 @@ async fn parse_configuration(
                 continue;
             };
             if let Some(image_url) = image_url {
-                notice.image = notices::load_remote_image(client, &image_url)
-                    .await
-                    .ok()
-                    .flatten();
+                match notices::load_remote_image(client, &image_url).await {
+                    Ok(image) => notice.image = image,
+                    Err(error) => notice.image_load_error = Some(error),
+                }
             }
             configuration.notices.push(notice);
         }
@@ -270,18 +271,19 @@ async fn parse_configuration(
         if !id.is_empty()
             && let Some(url) = url
         {
-            let image = if let Some(image_url) = image_url {
-                notices::load_remote_image(client, &image_url)
-                    .await
-                    .ok()
-                    .flatten()
+            let (image, image_load_error) = if let Some(image_url) = image_url {
+                match notices::load_remote_image(client, &image_url).await {
+                    Ok(image) => (image, None),
+                    Err(error) => (None, Some(error)),
+                }
             } else {
-                None
+                (None, None)
             };
             configuration.notification = Some(Notification {
                 id: id.to_owned(),
                 url,
                 image,
+                image_load_error,
             });
         }
     }
