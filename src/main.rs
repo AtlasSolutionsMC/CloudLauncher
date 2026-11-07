@@ -1241,6 +1241,26 @@ impl LauncherApp {
         self.status = message;
     }
 
+    fn open_path_with_status(&mut self, path: &Path, target: LogTarget) {
+        if let Err(error) = open_path(path) {
+            self.set_logged_status(LogLevel::Error, target, error);
+        }
+    }
+
+    fn create_and_open_folder_with_status(&mut self, path: &Path, target: LogTarget) {
+        if let Err(error) = fs::create_dir_all(path) {
+            self.set_logged_status(
+                LogLevel::Error,
+                target,
+                tr("rust.status.folder.create-error")
+                    .replace("%0", &path.display().to_string())
+                    .replace("%1", &error.to_string()),
+            );
+            return;
+        }
+        self.open_path_with_status(path, target);
+    }
+
     fn game_dir_path(&self) -> PathBuf {
         let configured = PathBuf::from(self.settings.game_directory.trim());
         if configured.is_absolute() {
@@ -4699,7 +4719,8 @@ impl eframe::App for LauncherApp {
                                         folder.rect.left_bottom() + Vec2::new(0.0, 1.0);
                                 } else {
                                     self.show_folder_menu = false;
-                                    open_path(&self.game_dir_path());
+                                    let path = self.game_dir_path();
+                                    self.open_path_with_status(&path, LogTarget::Launcher);
                                 }
                             }
                             folder.on_hover_text(tr("loginform.button.folder"));
@@ -4797,9 +4818,9 @@ impl eframe::App for LauncherApp {
                             let label =
                                 tr("loginform.button.folder.family").replace("%0", &folder_name);
                             if ui.button(label).clicked() {
-                                open_path(
-                                    &self.game_root_for_version(&self.settings.selected_version),
-                                );
+                                let path =
+                                    self.game_root_for_version(&self.settings.selected_version);
+                                self.open_path_with_status(&path, LogTarget::Launcher);
                                 self.show_folder_menu = false;
                             }
                         }
@@ -4811,7 +4832,7 @@ impl eframe::App for LauncherApp {
                                 .game_data_directory_for_version(&self.settings.selected_version)
                                 .join("mods");
                             match fs::create_dir_all(&mods) {
-                                Ok(()) => open_path(&mods),
+                                Ok(()) => self.open_path_with_status(&mods, LogTarget::Mods),
                                 Err(error) => {
                                     self.set_logged_status(
                                         LogLevel::Error,
@@ -4824,7 +4845,8 @@ impl eframe::App for LauncherApp {
                             self.show_folder_menu = false;
                         }
                         if ui.button(tr("loginform.button.folder.root")).clicked() {
-                            open_path(&self.game_dir_path());
+                            let path = self.game_dir_path();
+                            self.open_path_with_status(&path, LogTarget::Launcher);
                             self.show_folder_menu = false;
                         }
                     });
@@ -5716,20 +5738,23 @@ impl eframe::App for LauncherApp {
                     ui.horizontal(|ui| {
                         if ui.button(tr("rust.ui.logs.open-folder")).clicked() {
                             let directory = game_directory.join("logs");
-                            let _ = fs::create_dir_all(&directory);
-                            open_path(&directory);
+                            self.create_and_open_folder_with_status(
+                                &directory,
+                                LogTarget::Launcher,
+                            );
                         }
                         if ui.button(tr("rust.ui.logs.open-launcher-folder")).clicked() {
                             let directory = launcher_log_path().parent().map(Path::to_path_buf);
                             if let Some(directory) = directory {
-                                let _ = fs::create_dir_all(&directory);
-                                open_path(&directory);
+                                self.create_and_open_folder_with_status(
+                                    &directory,
+                                    LogTarget::Launcher,
+                                );
                             }
                         }
                         if ui.button(tr("rust.ui.logs.open-crash-folder")).clicked() {
                             let directory = game_directory.join("crash-reports");
-                            let _ = fs::create_dir_all(&directory);
-                            open_path(&directory);
+                            self.create_and_open_folder_with_status(&directory, LogTarget::Crash);
                         }
                         if ui
                             .add_enabled(
@@ -5881,7 +5906,7 @@ impl eframe::App for LauncherApp {
                                         path.file_name().unwrap_or_default().to_string_lossy(),
                                     );
                                     if ui.small_button(tr("rust.ui.logs.open-file")).clicked() {
-                                        open_path(path);
+                                        self.open_path_with_status(path, LogTarget::Launcher);
                                     }
                                     if ui.small_button(tr("rust.ui.logs.copy")).clicked() {
                                         copy_text = read_log_tail(path);
@@ -6529,7 +6554,8 @@ impl eframe::App for LauncherApp {
                                 self.persist();
                             }
                             if ui.small_button(tr("rust.settings.gamedir.open")).clicked() {
-                                open_path(&self.game_dir_path());
+                                let path = self.game_dir_path();
+                                self.open_path_with_status(&path, LogTarget::Settings);
                             }
                         });
                         ui.horizontal(|ui| {
@@ -7056,7 +7082,7 @@ impl eframe::App for LauncherApp {
                                             .replace("%0", &error.to_string()),
                                     );
                                 } else {
-                                    open_path(&runtime_root);
+                                    self.open_path_with_status(&runtime_root, LogTarget::JavaRuntime);
                                 }
                             }
                         });
@@ -7993,7 +8019,7 @@ impl eframe::App for LauncherApp {
                                 tr("rust.ui.logs.path").replace("%0", &path.display().to_string()),
                             );
                             if ui.small_button(tr("rust.ui.logs.open-file")).clicked() {
-                                open_path(path);
+                                self.open_path_with_status(path, LogTarget::Crash);
                             }
                         });
                     }
@@ -8075,7 +8101,7 @@ impl eframe::App for LauncherApp {
             }
             if open_crash_logs {
                 if let Some(path) = report.path.as_ref().filter(|path| path.is_file()) {
-                    open_path(path);
+                    self.open_path_with_status(path, LogTarget::Crash);
                 } else {
                     self.show_log_window = true;
                 }
@@ -8084,7 +8110,9 @@ impl eframe::App for LauncherApp {
                 match action {
                     crash::CrashActionKind::OpenUrl(url) => open_url(&url),
                     crash::CrashActionKind::OpenFolder(folder) => {
-                        open_crash_folder(&report.game_directory, &folder, &mut self.status);
+                        if let Err(error) = open_crash_folder(&report.game_directory, &folder) {
+                            self.set_logged_status(LogLevel::Error, LogTarget::Crash, error);
+                        }
                     }
                     crash::CrashActionKind::OpenLogs => {
                         self.selected_log_path = report.path.clone();
@@ -13230,14 +13258,18 @@ fn inspect_java(path: &std::path::Path) -> Result<(u32, String), String> {
     Ok((major, version.to_owned()))
 }
 
-fn open_path(path: &std::path::Path) {
+fn open_path(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer").arg(path).spawn();
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(path).spawn();
-    let _ = result;
+    result.map(|_| ()).map_err(|error| {
+        tr("rust.status.folder.open-error")
+            .replace("%0", &path.display().to_string())
+            .replace("%1", &error.to_string())
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -13305,7 +13337,7 @@ fn apply_gpu_preference(_java_path: &str, preference: &str) -> Result<(), String
     }
 }
 
-fn open_crash_folder(game_directory: &std::path::Path, folder: &str, status: &mut String) {
+fn open_crash_folder(game_directory: &std::path::Path, folder: &str) -> Result<(), String> {
     let relative = folder.strip_prefix("./").unwrap_or(folder);
     let relative_path = std::path::Path::new(relative);
     if relative_path.is_absolute()
@@ -13316,31 +13348,25 @@ fn open_crash_folder(game_directory: &std::path::Path, folder: &str, status: &mu
             )
         })
     {
-        *status = tr("rust.status.crash.folder-outside-game").to_owned();
-        return;
+        return Err(tr("rust.status.crash.folder-outside-game").to_owned());
     }
     let base = match game_directory.canonicalize() {
         Ok(base) => base,
         Err(error) => {
-            *status = tr("rust.status.crash.game-folder-error").replace("%0", &error.to_string());
-            return;
+            return Err(tr("rust.status.crash.game-folder-error").replace("%0", &error.to_string()));
         }
     };
     let target = base.join(relative_path);
     if relative_path == std::path::Path::new("mods") && !target.exists() {
         if let Err(error) = fs::create_dir_all(&target) {
-            *status = tr("rust.status.crash.mods-create-error").replace("%0", &error.to_string());
-            return;
+            return Err(tr("rust.status.crash.mods-create-error").replace("%0", &error.to_string()));
         }
     }
     let target = match target.canonicalize() {
         Ok(target) if target.starts_with(&base) => target,
-        _ => {
-            *status = tr("rust.status.crash.folder-missing").to_owned();
-            return;
-        }
+        _ => return Err(tr("rust.status.crash.folder-missing").to_owned()),
     };
-    open_path(&target);
+    open_path(&target)
 }
 
 pub(crate) fn open_url(url: &str) {
