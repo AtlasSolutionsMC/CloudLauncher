@@ -3911,27 +3911,33 @@ impl eframe::App for LauncherApp {
                         LogLevel::Warn
                     },
                     LogTarget::Connectivity,
-                    &format!(
-                        "Connectivity check {}: {}{}",
-                        service.id,
-                        if service.reachable {
-                            "reachable"
-                        } else {
-                            "unreachable"
-                        },
-                        if service.hosts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", service.hosts.join(", "))
-                        }
-                    ),
+                    &tr("rust.log.connectivity.check")
+                        .replace("%0", service.id)
+                        .replace(
+                            "%1",
+                            &tr(if service.reachable {
+                                "rust.log.connectivity.reachable"
+                            } else {
+                                "rust.log.connectivity.unreachable"
+                            }),
+                        )
+                        .replace(
+                            "%2",
+                            &if service.hosts.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", service.hosts.join(", "))
+                            },
+                        ),
                 );
                 for detail in &service.failure_details {
                     record_launcher_log_event(
                         &self.launcher_log,
                         LogLevel::Warn,
                         LogTarget::Connectivity,
-                        &format!("Connectivity failure for {}: {detail}", service.id),
+                        &tr("rust.log.connectivity.failure")
+                            .replace("%0", service.id)
+                            .replace("%1", detail),
                     );
                 }
             }
@@ -8504,9 +8510,9 @@ fn spawn_connectivity_check() -> Receiver<connectivity::Report> {
             .build()
         {
             Ok(runtime) => runtime.block_on(connectivity::check()),
-            Err(error) => connectivity::unavailable_report(&format!(
-                "Could not start connectivity-check runtime: {error}"
-            )),
+            Err(error) => connectivity::unavailable_report(
+                &tr("rust.error.runtime.connectivity-check").replace("%0", &error.to_string()),
+            ),
         };
         let _ = sender.send(report);
     });

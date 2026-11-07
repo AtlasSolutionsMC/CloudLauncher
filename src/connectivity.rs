@@ -65,7 +65,9 @@ pub async fn check() -> Report {
     {
         Ok(client) => client,
         Err(error) => {
-            return unavailable_report(&format!("Could not create HTTP client: {error}"));
+            return unavailable_report(
+                &crate::tr("rust.error.connectivity.client").replace("%0", &error.to_string()),
+            );
         }
     };
 
@@ -196,7 +198,11 @@ async fn fetch_doomsday_message(client: &Client) -> Option<String> {
 }
 
 fn failure_detail(host: &str, result: Result<(), String>) -> Option<String> {
-    result.err().map(|error| format!("{host}: {error}"))
+    result.err().map(|error| {
+        crate::tr("rust.error.connectivity.host-detail")
+            .replace("%0", host)
+            .replace("%1", &error)
+    })
 }
 
 fn failures<const N: usize>(details: [Option<String>; N]) -> Vec<String> {
@@ -208,14 +214,16 @@ async fn check_json(client: &Client, url: &str) -> Result<(), String> {
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            crate::tr("rust.error.connectivity.request").replace("%0", &error.to_string())
+        })?
         .error_for_status()
-        .map_err(|error| error.to_string())?;
-    response
-        .json::<Value>()
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("Invalid JSON: {error}"))
+        .map_err(|error| {
+            crate::tr("rust.error.connectivity.http").replace("%0", &error.to_string())
+        })?;
+    response.json::<Value>().await.map(|_| ()).map_err(|error| {
+        crate::tr("rust.error.connectivity.invalid-json").replace("%0", &error.to_string())
+    })
 }
 
 async fn check_http(client: &Client, url: &str) -> Result<(), String> {
@@ -223,10 +231,14 @@ async fn check_http(client: &Client, url: &str) -> Result<(), String> {
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| {
+            crate::tr("rust.error.connectivity.request").replace("%0", &error.to_string())
+        })?
         .error_for_status()
         .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            crate::tr("rust.error.connectivity.http").replace("%0", &error.to_string())
+        })
 }
 
 pub fn unavailable_report(reason: &str) -> Report {
