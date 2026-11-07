@@ -1261,6 +1261,16 @@ impl LauncherApp {
         self.open_path_with_status(path, target);
     }
 
+    fn open_url_with_status(&mut self, url: &str, target: LogTarget) -> bool {
+        match open_url(url) {
+            Ok(()) => true,
+            Err(error) => {
+                self.set_logged_status(LogLevel::Error, target, error);
+                false
+            }
+        }
+    }
+
     fn game_dir_path(&self) -> PathBuf {
         let configured = PathBuf::from(self.settings.game_directory.trim());
         if configured.is_absolute() {
@@ -2035,7 +2045,9 @@ impl LauncherApp {
 
     fn perform_notice_action(&mut self, action: notices::NoticeAction, _ctx: &Context) {
         match action {
-            notices::NoticeAction::Url { url, .. } => open_url(&url),
+            notices::NoticeAction::Url { url, .. } => {
+                self.open_url_with_status(&url, LogTarget::Notices);
+            }
             notices::NoticeAction::Server {
                 label,
                 address,
@@ -2137,7 +2149,7 @@ impl LauncherApp {
                 ..
             } => {
                 if let Some(url) = download_url {
-                    open_url(&url);
+                    self.open_url_with_status(&url, LogTarget::Update);
                 } else {
                     self.set_logged_status(
                         LogLevel::Warn,
@@ -4602,7 +4614,10 @@ impl eframe::App for LauncherApp {
                                 .button(tr("account.manager.multipane.add-account.buy-minecraft"))
                                 .clicked()
                             {
-                                open_url("https://minecraft.net/store/minecraft");
+                                self.open_url_with_status(
+                                    "https://minecraft.net/store/minecraft",
+                                    LogTarget::Authentication,
+                                );
                             }
                             if ui.button(tr("loginform.button.settings.account")).clicked() {
                                 self.settings_page = Some("Manage accounts");
@@ -4796,9 +4811,10 @@ impl eframe::App for LauncherApp {
             })
             .inner;
             if clicked {
-                open_url(&notification.url);
-                self.bootstrap_notification = None;
-                self.bootstrap_notification_texture = None;
+                if self.open_url_with_status(&notification.url, LogTarget::Bootstrap) {
+                    self.bootstrap_notification = None;
+                    self.bootstrap_notification_texture = None;
+                }
             }
         }
 
@@ -4866,8 +4882,12 @@ impl eframe::App for LauncherApp {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(220.0);
                         if ui.button(tr("loginform.button.support.discord")).clicked() {
-                            open_url("https://llaun.ch/discord/intl");
-                            self.show_support_menu = false;
+                            if self.open_url_with_status(
+                                "https://llaun.ch/discord/intl",
+                                LogTarget::Diagnostics,
+                            ) {
+                                self.show_support_menu = false;
+                            }
                         }
                         ui.separator();
                         if ui.button(tr("loginform.button.support")).clicked() {
@@ -4894,10 +4914,16 @@ impl eframe::App for LauncherApp {
                     ui.label(tr("support.contact.body"));
                     ui.horizontal(|ui| {
                         if ui.button(tr("support.contact.buttons.discord")).clicked() {
-                            open_url("https://llaun.ch/support/discord/intl");
+                            self.open_url_with_status(
+                                "https://llaun.ch/support/discord/intl",
+                                LogTarget::Diagnostics,
+                            );
                         }
                         if ui.button(tr("support.contact.buttons.mail")).clicked() {
-                            open_url("mailto:support@llaun.ch");
+                            self.open_url_with_status(
+                                "mailto:support@llaun.ch",
+                                LogTarget::Diagnostics,
+                            );
                         }
                     });
                     if ui.button(tr("support.pre.diag.send")).clicked() {
@@ -4945,7 +4971,7 @@ impl eframe::App for LauncherApp {
                         ui.hyperlink(url);
                         ui.horizontal(|ui| {
                             if ui.button(tr("support.sending.open")).clicked() {
-                                open_url(url);
+                                self.open_url_with_status(url, LogTarget::Diagnostics);
                             }
                             if ui.button(tr("support.sending.copy")).clicked() {
                                 ctx.copy_text(url.clone());
@@ -4981,7 +5007,10 @@ impl eframe::App for LauncherApp {
                             // The user can opt out before continuing to the regular contact links.
                         }
                         if ui.button(tr("support.pre.diag.whatisit")).clicked() {
-                            open_url(tr("support.pre.diag.url"));
+                            self.open_url_with_status(
+                                &tr("support.pre.diag.url"),
+                                LogTarget::Diagnostics,
+                            );
                         }
                         ui.horizontal(|ui| {
                             if ui.button(tr("support.pre.continue")).clicked() {
@@ -5020,10 +5049,9 @@ impl eframe::App for LauncherApp {
                     ui.label(tr("feedback.body"));
                     ui.horizontal(|ui| {
                         if ui.button(tr("feedback.button.okay")).clicked() {
-                            if let Some(url) = &feedback_url {
-                                open_url(url);
-                            }
-                            close_launcher = true;
+                            close_launcher = feedback_url.as_ref().is_none_or(|url| {
+                                self.open_url_with_status(url, LogTarget::Bootstrap)
+                            });
                         }
                         if ui.button(tr("feedback.button.no")).clicked() {
                             close_launcher = true;
@@ -5118,7 +5146,7 @@ impl eframe::App for LauncherApp {
                                 start_install = true;
                             }
                             if ui.button(tr("update.download")).clicked() {
-                                open_url(&release.html_url);
+                                self.open_url_with_status(&release.html_url, LogTarget::Update);
                             }
                             if ui
                                 .add_enabled(
@@ -5372,11 +5400,12 @@ impl eframe::App for LauncherApp {
                             };
                             ui.label(localized_html_to_plain_text(&tr(body_key)));
                             if ui.link(tr("connectivity.warning.body.link")).clicked() {
-                                open_url(if no_connection {
+                                let url = if no_connection {
                                     "https://wiki.llaun.ch/en:connectivity:none"
                                 } else {
                                     "https://wiki.llaun.ch/en:connectivity:some"
-                                });
+                                };
+                                self.open_url_with_status(url, LogTarget::Connectivity);
                             }
                             ui.separator();
                             let official_repo_unavailable = report
@@ -6177,10 +6206,13 @@ impl eframe::App for LauncherApp {
                 });
             self.show_account_help = open && !close;
             if open_minecraft_store {
-                open_url("https://minecraft.net/store/minecraft");
+                self.open_url_with_status(
+                    "https://minecraft.net/store/minecraft",
+                    LogTarget::Authentication,
+                );
             }
             if open_ely_registration {
-                open_url("https://ely.by");
+                self.open_url_with_status("https://ely.by", LogTarget::Authentication);
             }
         }
 
@@ -6392,7 +6424,7 @@ impl eframe::App for LauncherApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.label("(by");
                             if ui.link("turikhay").clicked() {
-                                open_url("https://turikhay.com");
+                                self.open_url_with_status("https://turikhay.com", LogTarget::Launcher);
                             }
                             ui.label(") —");
                             ui.label(localized_html_to_plain_text(&tr("about.text")));
@@ -6401,7 +6433,7 @@ impl eframe::App for LauncherApp {
                         ui.separator();
                         ui.horizontal_wrapped(|ui| {
                             if ui.link("Ely.by").clicked() {
-                                open_url("https://ely.by");
+                                self.open_url_with_status("https://ely.by", LogTarget::Launcher);
                             }
                             ui.label("—");
                             ui.label(localized_html_to_plain_text(&tr("about.partners.ely")));
@@ -8108,7 +8140,9 @@ impl eframe::App for LauncherApp {
             }
             if let Some(action) = selected_action {
                 match action {
-                    crash::CrashActionKind::OpenUrl(url) => open_url(&url),
+                    crash::CrashActionKind::OpenUrl(url) => {
+                        self.open_url_with_status(&url, LogTarget::Crash);
+                    }
                     crash::CrashActionKind::OpenFolder(folder) => {
                         if let Err(error) = open_crash_folder(&report.game_directory, &folder) {
                             self.set_logged_status(LogLevel::Error, LogTarget::Crash, error);
@@ -8421,8 +8455,10 @@ impl eframe::App for LauncherApp {
                 });
 
             if install_pack {
-                open_url("https://apps.microsoft.com/detail/9nqpsl29bfff");
-                open = false;
+                open = !self.open_url_with_status(
+                    "https://apps.microsoft.com/detail/9nqpsl29bfff",
+                    LogTarget::Launcher,
+                );
             }
             if open_support {
                 self.show_support_window = true;
@@ -13369,14 +13405,18 @@ fn open_crash_folder(game_directory: &std::path::Path, folder: &str) -> Result<(
     open_path(&target)
 }
 
-pub(crate) fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let result = Command::new("explorer").arg(url).spawn();
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = Command::new("xdg-open").arg(url).spawn();
-    let _ = result;
+    result.map(|_| ()).map_err(|error| {
+        tr("rust.status.url.open-error")
+            .replace("%0", url)
+            .replace("%1", &error.to_string())
+    })
 }
 
 fn main() -> eframe::Result {

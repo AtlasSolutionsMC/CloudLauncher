@@ -423,7 +423,7 @@ fn request_authorization_code(
         ("state", state.as_str()),
         ("prompt", "select_account"),
     ]);
-    crate::open_url(login_url.as_str());
+    crate::open_url(login_url.as_str())?;
 
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {

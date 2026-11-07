@@ -38,7 +38,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Settings and common dialog labels now resolve from the US locale resource.
 - The source SettingsPanel About us tab includes the US copy, Rust clone version, creator and Ely.by links, and source license text.
 - Startup connectivity checks cover Mojang version metadata, Legacy Launcher repository mirrors, both bootstrap hosts, and Ely.by; failures show a warning badge with affected hosts and source help copy.
-- Version filters, notice/account controls, launch/download status labels, and error text for Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server handling, imports, background images, and crash fallbacks now resolve from US locale entries. The ExtraVersionList catalog now also prefers signed-bootstrap `extra_version_repo` mirrors before built-in fallbacks. Dynamic errors and source-provided notice/crash copy still need a full-flow review.
+- Version filters, notice/account controls, launch/download status labels, and error text for Microsoft/Ely.by authentication, catalog, bootstrap, notices, diagnostics, updater, Java/server handling, imports, background images, crash fallbacks, and external-link/OAuth browser-launch failures now resolve from US locale entries. Failed external-link launches are logged by subsystem; notification and first-run notices remain available to retry. The ExtraVersionList catalog now also prefers signed-bootstrap `extra_version_repo` mirrors before built-in fallbacks. Dynamic errors and source-provided notice/crash copy still need a full-flow review.
 - US personal notices and signed bootstrap configuration with US notices, promoted servers, and notification links; Java's separate full-screen notice scene now has previous/next navigation, timed hide/restore, notice actions, and a home action.
 - Separate the Java `notice.enabled` permission from `gui.notices.enabled` panel visibility; signed `allowNoticeDisable` is evaluated against the preserved client UUID using Java's hash rule, and both settings round-trip through legacy properties.
 - Startup and manual GitHub release checks with release notes, bounded executable download, SHA-256 verification, and a Windows replacement/restart handoff; the startup prompt waits until first-run setup is complete. A tag-triggered workflow publishes the assets.
@@ -57,7 +57,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Full user-interface localization and visual checks across common Windows scaling settings.
 - End-to-end runtime comparison against the Java launcher.
 
-See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. The checklist has 104 completed entries and 10 open entries; this is a count of tracked items, not a feature-parity percentage. A reliable parity estimate needs the remaining source and runtime review.
+See [PORTING_PLAN.md](PORTING_PLAN.md) for the tracked checklist. It has 113 completed entries and 8 open entries (93.4% of tracked checklist items); this is a checklist count, not a measured feature-parity percentage. A reliable parity estimate still needs the remaining source and runtime review.
 
 ## Windows build
 
