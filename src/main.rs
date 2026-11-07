@@ -258,6 +258,8 @@ struct LegacySettingsImportSummary {
 struct CrashReport {
     path: Option<PathBuf>,
     game_directory: PathBuf,
+    version: String,
+    loader: String,
     summary: String,
     suggestions: Vec<crash::CrashSuggestion>,
     log: String,
@@ -7841,10 +7843,21 @@ impl eframe::App for LauncherApp {
             let mut request_crash_help = false;
             let mut open_crash_logs = false;
             let mut dismiss_crash = false;
-            let permit_help = report
+            let suggestion_permits_help = report
                 .suggestions
                 .first()
                 .is_none_or(|suggestion| suggestion.permit_help);
+            let crash_build = format!("{} {}", report.version, report.loader).to_ascii_lowercase();
+            let is_forge_or_fabric =
+                crash_build.contains("forge") || crash_build.contains("fabric");
+            let is_local_only_version = !is_forge_or_fabric
+                && self.version_manifest.as_ref().is_some_and(|manifest| {
+                    !manifest
+                        .versions
+                        .iter()
+                        .any(|entry| entry.id == report.version)
+                });
+            let permit_help = suggestion_permits_help && !is_local_only_version;
             egui::Window::new(tr("rust.ui.window.crash"))
                 .open(&mut open)
                 .default_size([660.0, 520.0])
@@ -9684,6 +9697,8 @@ fn collect_crash_report(
     Some(CrashReport {
         path: report_path,
         game_directory: game_dir.to_path_buf(),
+        version: version.to_owned(),
+        loader: loader.to_owned(),
         summary,
         suggestions,
         log,
