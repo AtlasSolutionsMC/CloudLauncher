@@ -21,6 +21,7 @@ static REMOTE_SIGNATURES: OnceLock<RwLock<Option<Value>>> = OnceLock::new();
 pub struct CrashSuggestion {
     pub title: String,
     pub body: String,
+    pub image: Option<String>,
     pub permit_help: bool,
     pub actions: Vec<CrashSuggestionAction>,
 }
@@ -199,6 +200,10 @@ pub fn diagnose(
         let suggestion = CrashSuggestion {
             title,
             body: clean_html(&body),
+            image: signature
+                .get("image")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             permit_help: signature
                 .get("permitHelp")
                 .and_then(Value::as_bool)

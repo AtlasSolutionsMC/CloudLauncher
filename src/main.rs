@@ -600,6 +600,8 @@ struct Assets {
     folder: TextureHandle,
     refresh: TextureHandle,
     settings: TextureHandle,
+    crash_bug: TextureHandle,
+    crash_duke: TextureHandle,
 }
 
 #[derive(Default)]
@@ -835,6 +837,18 @@ impl LauncherApp {
                 "settings",
                 include_bytes!("../assets/icons/bars.png"),
                 true,
+            ),
+            crash_bug: load_texture(
+                &cc.egui_ctx,
+                "crash-bug",
+                include_bytes!("../assets/icons/bug.png"),
+                true,
+            ),
+            crash_duke: load_texture(
+                &cc.egui_ctx,
+                "crash-duke",
+                include_bytes!("../assets/icons/logo-duke.png"),
+                false,
             ),
         };
         let mut settings = load_settings();
@@ -7892,10 +7906,24 @@ impl eframe::App for LauncherApp {
                         ui.heading(tr("rust.ui.crash.matches"));
                         for suggestion in &report.suggestions {
                             ui.group(|ui| {
-                                ui.strong(&suggestion.title);
-                                if !suggestion.body.is_empty() {
-                                    ui.label(&suggestion.body);
-                                }
+                                let crash_icon = self.assets.as_ref().map(|assets| {
+                                    if suggestion.image.as_deref() == Some("logo-duke") {
+                                        &assets.crash_duke
+                                    } else {
+                                        &assets.crash_bug
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    if let Some(icon) = crash_icon {
+                                        ui.image((icon.id(), Vec2::splat(32.0)));
+                                    }
+                                    ui.vertical(|ui| {
+                                        ui.strong(&suggestion.title);
+                                        if !suggestion.body.is_empty() {
+                                            ui.label(&suggestion.body);
+                                        }
+                                    });
+                                });
                                 ui.horizontal_wrapped(|ui| {
                                     for action in &suggestion.actions {
                                         match &action.kind {
@@ -9700,6 +9728,7 @@ fn collect_crash_report(
             vec![crash::CrashSuggestion {
                 title: tr("crash.unknown.title").to_owned(),
                 body: tr("crash.unknown.body").to_owned(),
+                image: None,
                 permit_help: true,
                 actions: Vec::new(),
             }]
@@ -9709,6 +9738,7 @@ fn collect_crash_report(
                 .map(|body| crash::CrashSuggestion {
                     title: tr("rust.ui.crash.fallback-title").to_owned(),
                     body,
+                    image: None,
                     permit_help: true,
                     actions: Vec::new(),
                 })
