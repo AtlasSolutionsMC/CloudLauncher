@@ -1484,26 +1484,39 @@ impl LauncherApp {
     fn update_installed_version_timestamp(&self, version: &str) -> Result<(), String> {
         let root = self
             .installed_version_root(version)
-            .ok_or_else(|| "installed version metadata is missing".to_owned())?;
+            .ok_or_else(|| tr("rust.error.version-metadata.missing").to_owned())?;
         let path = root
             .join("versions")
             .join(version)
             .join(format!("{version}.json"));
-        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let bytes = fs::read(&path).map_err(|error| {
+            tr("rust.error.version-metadata.read")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })?;
         if bytes.len() > 16 * 1024 * 1024 {
-            return Err("installed version metadata exceeds the size limit".to_owned());
+            return Err(tr("rust.error.version-metadata.too-large").to_owned());
         }
-        let mut metadata: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            tr("rust.error.version-metadata.parse").replace("%0", &error.to_string())
+        })?;
         let object = metadata
             .as_object_mut()
-            .ok_or_else(|| "installed version metadata is not a JSON object".to_owned())?;
+            .ok_or_else(|| tr("rust.error.version-metadata.not-object").to_owned())?;
         let timestamp = OffsetDateTime::now_utc()
             .format(&Rfc3339)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                tr("rust.error.version-metadata.timestamp").replace("%0", &error.to_string())
+            })?;
         object.insert("time".to_owned(), serde_json::Value::String(timestamp));
-        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| error.to_string())?;
-        fs::write(path, bytes).map_err(|error| error.to_string())
+        let bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+            tr("rust.error.version-metadata.serialize").replace("%0", &error.to_string())
+        })?;
+        fs::write(&path, bytes).map_err(|error| {
+            tr("rust.error.version-metadata.write")
+                .replace("%0", &path.display().to_string())
+                .replace("%1", &error.to_string())
+        })
     }
 
     fn installed_versions(&self) -> Vec<String> {
