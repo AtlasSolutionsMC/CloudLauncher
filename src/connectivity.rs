@@ -10,6 +10,7 @@ const EXTRA_REPOSITORIES: [&str; 3] = [
     "https://repo.legacylauncherservices.com/versions/versions.json",
 ];
 const BOOTSTRAP_HOSTS: [&str; 2] = ["bootstrap.llaun.ch", "bootstrap.legacylauncher.ru"];
+const PROXY_HOSTS: [&str; 2] = ["proxy.llaun.ch", "proxy.legacylauncher.ru"];
 const ELY_PROFILE: &str =
     "https://account.ely.by/api/minecraft/session/profile/ffb3378cd561502fa78a08494be68811";
 const DOOMSDAY_URLS: [&str; 2] = [
@@ -68,6 +69,9 @@ pub async fn check() -> Report {
     let brand = option_env!("LEGACYLAUNCHER_SHORT_BRAND").unwrap_or("develop");
     let bootstrap_urls =
         BOOTSTRAP_HOSTS.map(|host| format!("https://{host}/{brand}/bootstrap.json.mgz.signed"));
+    let proxified_manifest_urls = PROXY_HOSTS.map(|host| {
+        format!("https://{host}/launchermeta.mojang.com/mc/game/version_manifest.json")
+    });
     let (mojang, repo_llaunch, repo_ru, repo_services, bootstrap_a, bootstrap_b, ely) = tokio::join!(
         check_json(&client, MOJANG_VERSION_MANIFEST),
         check_json(&client, EXTRA_REPOSITORIES[0]),
@@ -77,6 +81,17 @@ pub async fn check() -> Report {
         check_http(&client, &bootstrap_urls[1]),
         check_json(&client, ELY_PROFILE),
     );
+    let proxy_needed =
+        !mojang || !(repo_llaunch || repo_ru || repo_services) || !(bootstrap_a || bootstrap_b);
+    let (proxified_a, proxified_b) = if proxy_needed {
+        tokio::join!(
+            check_json(&client, &proxified_manifest_urls[0]),
+            check_json(&client, &proxified_manifest_urls[1]),
+        )
+    } else {
+        // Source queues proxy checks only after a normal-priority service fails.
+        (true, true)
+    };
 
     let mut report = Report {
         services: vec![
@@ -85,6 +100,12 @@ pub async fn check() -> Report {
                 hosts: vec!["launchermeta.mojang.com"],
                 reachable: mojang,
                 critical: true,
+            },
+            ServiceCheck {
+                id: "official_repo_proxy",
+                hosts: PROXY_HOSTS.to_vec(),
+                reachable: proxified_a || proxified_b,
+                critical: false,
             },
             ServiceCheck {
                 id: "repo",
@@ -161,6 +182,12 @@ pub fn unavailable_report() -> Report {
                 hosts: vec!["launchermeta.mojang.com"],
                 reachable: false,
                 critical: true,
+            },
+            ServiceCheck {
+                id: "official_repo_proxy",
+                hosts: PROXY_HOSTS.to_vec(),
+                reachable: false,
+                critical: false,
             },
             ServiceCheck {
                 id: "repo",

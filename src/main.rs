@@ -5316,6 +5316,16 @@ impl eframe::App for LauncherApp {
                                 });
                             }
                             ui.separator();
+                            let official_repo_unavailable = report
+                                .services
+                                .iter()
+                                .find(|service| service.id == "official_repo")
+                                .is_some_and(|service| !service.reachable);
+                            let official_repo_proxy_unavailable = report
+                                .services
+                                .iter()
+                                .find(|service| service.id == "official_repo_proxy")
+                                .is_some_and(|service| !service.reachable);
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 for service in report
                                     .services
@@ -5325,7 +5335,19 @@ impl eframe::App for LauncherApp {
                                     let (name_key, hint_key) = match service.id {
                                         "official_repo" => (
                                             "connectivity.warning.list.name.official_repo",
-                                            "rust.connectivity.hint.official_repo",
+                                            if official_repo_proxy_unavailable {
+                                                "connectivity.warning.list.hint.official_repo.not_ok"
+                                            } else {
+                                                "connectivity.warning.list.hint.official_repo.ok"
+                                            },
+                                        ),
+                                        "official_repo_proxy" => (
+                                            "connectivity.warning.list.name.official_repo_proxy",
+                                            if official_repo_unavailable {
+                                                "connectivity.warning.list.hint.official_repo_proxy.not_ok"
+                                            } else {
+                                                "connectivity.warning.list.hint.official_repo_proxy.ok"
+                                            },
                                         ),
                                         "repo" => (
                                             "connectivity.warning.list.name.repo",
