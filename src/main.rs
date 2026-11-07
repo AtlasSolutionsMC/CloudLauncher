@@ -5248,7 +5248,7 @@ impl eframe::App for LauncherApp {
                                         ui.image((texture.id(), size * scale));
                                     }
                                 }
-                                ui.label(&notice.text);
+                                render_notice_text(ui, &notice, true, &mut action);
                                 ui.add_space(5.0);
                                 ui.horizontal_wrapped(|ui| {
                                     if let Some(notice_action) = notice.action.clone() {
@@ -5382,7 +5382,7 @@ impl eframe::App for LauncherApp {
                                         ui.image((texture.id(), size * scale));
                                     }
                                 }
-                                ui.label(&notice.text);
+                                render_notice_text(ui, &notice, true, &mut action);
                                 if let Some(notice_action) = notice.action.clone() {
                                     let label = match &notice_action {
                                         notices::NoticeAction::Url { label, .. }
@@ -5618,7 +5618,12 @@ impl eframe::App for LauncherApp {
                                                                 ui.add_enabled_ui(
                                                                     !selected_is_hidden,
                                                                     |ui| {
-                                                                        ui.label(&notice.text);
+                                                                        render_notice_text(
+                                                                            ui,
+                                                                            notice,
+                                                                            true,
+                                                                            &mut action,
+                                                                        );
                                                                     },
                                                                 );
                                                             });
@@ -9614,6 +9619,57 @@ fn localized_html_to_plain_text(value: &str) -> String {
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+}
+
+fn render_notice_text(
+    ui: &mut egui::Ui,
+    notice: &notices::Notice,
+    enabled: bool,
+    action: &mut Option<notices::NoticeAction>,
+) {
+    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        for line in &notice.text_lines {
+            if line.is_empty() {
+                ui.add_space(8.0);
+                continue;
+            }
+            ui.horizontal_wrapped(|ui| {
+                for span in line {
+                    let mut text = RichText::new(&span.text);
+                    if span.bold {
+                        text = text.strong();
+                    }
+                    if span.italic {
+                        text = text.italics();
+                    }
+                    if span.underline {
+                        text = text.underline();
+                    }
+                    if let Some(url) = &span.link {
+                        text = text.color(ui.visuals().hyperlink_color).underline();
+                        let response =
+                            ui.add_enabled(enabled, egui::Label::new(text).sense(Sense::click()));
+                        let response = response.on_hover_text(tr("rust.notice.action.open-link"));
+                        if response.clicked() {
+                            let label = if span.text.trim().is_empty() {
+                                tr("rust.notice.action.open").to_owned()
+                            } else {
+                                span.text.clone()
+                            };
+                            *action = Some(notices::NoticeAction::Url {
+                                label,
+                                url: url.clone(),
+                            });
+                        }
+                    } else {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.label(text);
+                        });
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn settings_page_title(title: &str) -> &'static str {

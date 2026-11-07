@@ -6,11 +6,20 @@ use url::Url;
 pub struct Notice {
     pub id: String,
     pub order: i64,
-    pub text: String,
+    pub text_lines: Vec<Vec<NoticeTextSpan>>,
     pub promoted: bool,
     pub action: Option<NoticeAction>,
     pub image: Option<Vec<u8>>,
     pub image_load_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoticeTextSpan {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,9 +103,9 @@ pub fn parse_notice(value: &Value) -> Option<(Notice, Option<String>)> {
                 .map(str::to_owned)
         })
     })?;
-    let text = value.get("text")?.as_str()?;
-    let text = strip_html(text);
-    if text.is_empty() {
+    let raw_text = value.get("text")?.as_str()?;
+    let (plain_text, text_lines) = parse_notice_html(raw_text);
+    if plain_text.is_empty() {
         return None;
     }
     let action = value.get("action").and_then(parse_action);
@@ -105,7 +114,7 @@ pub fn parse_notice(value: &Value) -> Option<(Notice, Option<String>)> {
         Notice {
             id,
             order: value.get("pos").and_then(Value::as_i64).unwrap_or(-1),
-            text,
+            text_lines,
             promoted: value
                 .get("promoted")
                 .and_then(Value::as_bool)
@@ -318,37 +327,252 @@ pub fn safe_http_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
-fn strip_html(input: &str) -> String {
+#[derive(Debug, Clone, Default)]
+struct NoticeHtmlStyle {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    link: Option<String>,
+}
+
+fn parse_notice_html(input: &str) -> (String, Vec<Vec<NoticeTextSpan>>) {
     let mut plain = String::with_capacity(input.len());
-    let mut in_tag = false;
-    let mut tag = String::new();
-    for character in input.chars() {
-        match character {
-            '<' if !in_tag => {
-                in_tag = true;
-                tag.clear();
-            }
-            '>' if in_tag => {
-                in_tag = false;
-                let tag = tag.trim().to_ascii_lowercase();
-                if tag.starts_with("br") || tag.starts_with("/p") || tag.starts_with("/div") {
-                    plain.push('\n');
+    let mut lines = vec![Vec::new()];
+    let mut buffer = String::new();
+    let mut style = NoticeHtmlStyle::default();
+    let mut stack: Vec<(String, NoticeHtmlStyle)> = Vec::new();
+    let mut hidden_tag: Option<String> = None;
+    let mut index = 0;
+
+    while index < input.len() {
+        let rest = &input[index..];
+        if rest.starts_with('<')
+            && let Some(offset) = rest.find('>')
+        {
+            let raw_tag = &rest[1..offset];
+            let tag = raw_tag.trim();
+            let is_closing = tag.starts_with('/');
+            let name = tag
+                .trim_start_matches('/')
+                .split(|character: char| character.is_whitespace() || character == '/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            index += offset + 1;
+
+            if let Some(hidden) = hidden_tag.as_deref() {
+                if is_closing && name == hidden {
+                    hidden_tag = None;
                 }
+                continue;
             }
-            _ if in_tag => tag.push(character),
-            _ => plain.push(character),
+            if !is_closing && matches!(name.as_str(), "script" | "style") {
+                flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+                hidden_tag = Some(name);
+                continue;
+            }
+            if name.is_empty() || name.starts_with('!') || name.starts_with('?') {
+                continue;
+            }
+
+            match name.as_str() {
+                "br" => {
+                    flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+                    push_notice_line_break(&mut plain, &mut lines, false);
+                }
+                "p" | "div" => {
+                    flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+                    if is_closing {
+                        push_notice_line_break(&mut plain, &mut lines, true);
+                    } else if lines.last().is_some_and(|line| !line.is_empty()) {
+                        push_notice_line_break(&mut plain, &mut lines, true);
+                    }
+                }
+                "li" => {
+                    flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+                    if is_closing {
+                        push_notice_line_break(&mut plain, &mut lines, false);
+                    } else {
+                        if lines.last().is_some_and(|line| !line.is_empty()) {
+                            push_notice_line_break(&mut plain, &mut lines, false);
+                        }
+                        buffer.push_str("• ");
+                    }
+                }
+                "b" | "strong" | "i" | "em" | "u" | "a" => {
+                    flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+                    if is_closing {
+                        if let Some(position) = stack.iter().rposition(|(tag, _)| tag == &name) {
+                            style = stack[position].1.clone();
+                            stack.truncate(position);
+                        }
+                    } else if !tag.ends_with('/') {
+                        stack.push((name.clone(), style.clone()));
+                        match name.as_str() {
+                            "b" | "strong" => style.bold = true,
+                            "i" | "em" => style.italic = true,
+                            "u" => style.underline = true,
+                            "a" => {
+                                style.link = html_tag_attribute(raw_tag, "href")
+                                    .map(|href| decode_html_entities(&href))
+                                    .and_then(|href| safe_http_url(&href));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        let character = rest.chars().next().unwrap_or_default();
+        buffer.push(character);
+        index += character.len_utf8();
+    }
+    flush_notice_text(&mut buffer, &mut plain, lines.last_mut().unwrap(), &style);
+    while lines.len() > 1 && lines.last().is_some_and(Vec::is_empty) {
+        lines.pop();
+    }
+    (plain.trim().to_owned(), lines)
+}
+
+fn flush_notice_text(
+    buffer: &mut String,
+    plain: &mut String,
+    line: &mut Vec<NoticeTextSpan>,
+    style: &NoticeHtmlStyle,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let text = decode_html_entities(buffer);
+    plain.push_str(&text);
+    if let Some(previous) = line.last_mut()
+        && previous.bold == style.bold
+        && previous.italic == style.italic
+        && previous.underline == style.underline
+        && previous.link == style.link
+    {
+        previous.text.push_str(&text);
+    } else {
+        line.push(NoticeTextSpan {
+            text,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            link: style.link.clone(),
+        });
+    }
+    buffer.clear();
+}
+
+fn push_notice_line_break(
+    plain: &mut String,
+    lines: &mut Vec<Vec<NoticeTextSpan>>,
+    paragraph: bool,
+) {
+    if !paragraph || lines.last().is_some_and(|line| !line.is_empty()) {
+        plain.push('\n');
+        lines.push(Vec::new());
+    }
+}
+
+fn html_tag_attribute(tag: &str, attribute: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut index = tag
+        .find(|character: char| character.is_whitespace())
+        .unwrap_or(tag.len());
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'-' | b'_'))
+        {
+            index += 1;
+        }
+        if name_start == index {
+            index += 1;
+            continue;
+        }
+        let name = &tag[name_start..index];
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let (value_start, value_end) = if matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            index += 1;
+            let start = index;
+            while index < bytes.len() && bytes[index] != quote {
+                index += 1;
+            }
+            let end = index;
+            if index < bytes.len() {
+                index += 1;
+            }
+            (start, end)
+        } else {
+            let start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            (start, index)
+        };
+        if name.eq_ignore_ascii_case(attribute) {
+            return tag.get(value_start..value_end).map(str::to_owned);
         }
     }
-    plain
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .split('\n')
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    None
+}
+
+fn decode_html_entities(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        let rest = &input[index..];
+        if rest.starts_with('&')
+            && let Some(end) = rest.find(';')
+            && end <= 12
+        {
+            let entity = &rest[1..end];
+            let decoded = match entity {
+                "nbsp" => Some(' '),
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" | "#39" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(character) = decoded {
+                output.push(character);
+                index += end + 1;
+                continue;
+            }
+        }
+        let character = rest.chars().next().unwrap_or_default();
+        output.push(character);
+        index += character.len_utf8();
+    }
+    output
 }
