@@ -1905,6 +1905,12 @@ impl LauncherApp {
         );
     }
 
+    fn open_support_flow(&mut self) {
+        self.show_diagnostic_consent = true;
+        self.diagnostic_send_enabled = true;
+        self.diagnostic_error = None;
+    }
+
     fn save_diagnostic_report(&mut self) {
         let Some(report) = self.diagnostic_payload.as_ref() else {
             return;
@@ -4933,7 +4939,7 @@ impl eframe::App for LauncherApp {
                         }
                         ui.separator();
                         if ui.button(tr("loginform.button.support")).clicked() {
-                            self.show_support_window = true;
+                            self.open_support_flow();
                             self.show_support_menu = false;
                         }
                     });
@@ -4947,7 +4953,6 @@ impl eframe::App for LauncherApp {
 
         if self.show_support_window {
             let mut open = true;
-            let mut open_diagnostic_consent = false;
             egui::Window::new(tr("support.contact.title"))
                 .open(&mut open)
                 .collapsible(false)
@@ -4968,16 +4973,7 @@ impl eframe::App for LauncherApp {
                             );
                         }
                     });
-                    if ui.button(tr("support.pre.diag.send")).clicked() {
-                        open_diagnostic_consent = true;
-                    }
                 });
-            if open_diagnostic_consent {
-                open = false;
-                self.show_diagnostic_consent = true;
-                self.diagnostic_send_enabled = true;
-                self.diagnostic_error = None;
-            }
             self.show_support_window = open;
         }
 
@@ -8208,9 +8204,7 @@ impl eframe::App for LauncherApp {
                 }
             }
             if request_crash_help {
-                self.show_diagnostic_consent = true;
-                self.diagnostic_send_enabled = true;
-                self.diagnostic_error = None;
+                self.open_support_flow();
             }
             if open_crash_logs {
                 if let Some(path) = report.path.as_ref().filter(|path| path.is_file()) {
@@ -8542,7 +8536,7 @@ impl eframe::App for LauncherApp {
                 );
             }
             if open_support {
-                self.show_support_window = true;
+                self.open_support_flow();
                 open = false;
             }
             self.show_arm_compat_notice = open;

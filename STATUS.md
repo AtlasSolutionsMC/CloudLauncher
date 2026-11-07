@@ -18,6 +18,7 @@ Implementation is ongoing; feature parity remains incomplete.
 - Pre-launch Fractureiser signature scan of nested mods JARs, matching the Java detector's three bytecode signatures; migrate and persist scan version, offer long-scan continue/skip, and stop launch with a detection dialog when infected.
 - Crash dialogs honor the Java signature catalog's `permitHelp` flag and include help, log, and dismiss actions.
 - Game settings, server list and quick play, Minecraft `servers.dat` integration, promoted servers, crash suggestions, log browsing, and opt-in diagnostics with Windows, model, language, DirectX, CPU/memory, and graphics provider/driver details.
+- The support flow follows the source's diagnostic-consent-first order, with opt-in enabled by default and Discord/email choices shown after opting out; toolbar, crash-help, and ARM compatibility support actions use the same entry point.
 - Source crash-analysis and full-command logging preferences, with legacy settings migration.
 - `connection.ssl` migration and live TLS certificate/hostname verification across launcher and Minecraft download HTTP clients; disabling it is explicit, off by default, and shows a warning.
 - Source-style startup version/platform, working-directory, and settings-file entries in the launcher log.

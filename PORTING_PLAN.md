@@ -19,7 +19,7 @@ The Java project has a separate Bootstrap module. This plan focuses on the deskt
 - [x] Fetch the personal notice feed in US English, render embedded/remote images, display notices from the launcher and a notice manager, persist one-week hides, and handle safe URL/known scene/promoted-server actions.
 - [x] Render optional personal-feed notice banners.
 - [x] Fetch and verify the source's signed bootstrap configuration; show US/global fallback notices and notification links, and merge US/global promoted servers into Minecraft's server list.
-- [x] Add the US support popup and links to the source Discord and support email.
+- [x] Add the US support popup and links to the source Discord and support email. Follow the Java flow order: show the pre-support diagnostic consent first with upload enabled by default; the user's opt-out opens the contact choices, while opt-in starts the diagnostic upload directly. Crash-help and first-run ARM support actions open the same consent flow.
 - [x] Check for newer GitHub releases and show release notes for a newer Rust build.
 - [x] Move settings-page titles/controls and common notice, log, server, account, and update labels into the US locale resource.
 - [x] Port the Java `NoticeScene` as a full-screen notice flow with previous/next navigation, one-week hide/restore, notice actions, and a home action.
