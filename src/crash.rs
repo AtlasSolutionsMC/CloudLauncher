@@ -31,6 +31,13 @@ pub struct CrashSuggestionAction {
     pub kind: CrashActionKind,
 }
 
+#[derive(Debug, Clone)]
+pub enum CrashDiagnosis {
+    Unknown,
+    Fake,
+    Known(CrashSuggestion),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CrashRuntimeInfo {
     pub java_version: Option<String>,
@@ -56,10 +63,10 @@ pub fn diagnose(
     loader: &str,
     exit_code: i32,
     runtime: &CrashRuntimeInfo,
-) -> Vec<CrashSuggestion> {
+) -> CrashDiagnosis {
     let root = current_signature_catalog();
     if !root.is_object() {
-        return Vec::new();
+        return CrashDiagnosis::Unknown;
     }
     let variables = runtime_variables(&root);
     let buttons = root.get("buttons").and_then(Value::as_array);
@@ -76,14 +83,6 @@ pub fn diagnose(
     signatures.sort_by_key(|signature| requires_windows_system_info(signature));
 
     for signature in signatures {
-        if signature
-            .get("fake")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
         if let Some(signature_exit_code) = signature.get("exitCode").and_then(Value::as_i64)
             && signature_exit_code != 0
             && signature_exit_code != i64::from(exit_code)
@@ -163,6 +162,16 @@ pub fn diagnose(
             }
         }
 
+        if signature
+            .get("fake")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // The Java crash manager stops scanning and suppresses the dialog
+            // when a capable fake signature matches.
+            return CrashDiagnosis::Fake;
+        }
+
         let name = signature
             .get("name")
             .and_then(Value::as_str)
@@ -198,9 +207,9 @@ pub fn diagnose(
         };
 
         // Java chooses the first capable signature after its system-info sort.
-        return vec![suggestion];
+        return CrashDiagnosis::Known(suggestion);
     }
-    Vec::new()
+    CrashDiagnosis::Unknown
 }
 
 fn localized_catalog_field(

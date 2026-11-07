@@ -9693,7 +9693,11 @@ fn collect_crash_report(
     if log.trim().is_empty() {
         return None;
     }
-    let mut suggestions = crash::diagnose(&log, version, loader, exit_code, runtime);
+    let mut suggestions = match crash::diagnose(&log, version, loader, exit_code, runtime) {
+        crash::CrashDiagnosis::Fake => return None,
+        crash::CrashDiagnosis::Known(suggestion) => vec![suggestion],
+        crash::CrashDiagnosis::Unknown => Vec::new(),
+    };
     if suggestions.is_empty() {
         suggestions = diagnose_crash_fallback(&log)
             .into_iter()
